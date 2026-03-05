@@ -1912,10 +1912,15 @@ async fn log_llm_event(
     let separator = "=".repeat(80);
     let sub_separator = "-".repeat(80);
 
-    // Truncate excessively long content to 50k chars to prevent disk bloat
-    const MAX_LOG_CHARS: usize = 50_000;
-    let (display_content, truncated) = if content.len() > MAX_LOG_CHARS {
-        (&content[..MAX_LOG_CHARS], true)
+    // Differentiate truncation limits: TOOL_RESULT is smaller to keep logs concise
+    let max_chars = if event_type == "TOOL_RESULT" {
+        10_000
+    } else {
+        50_000
+    };
+
+    let (display_content, truncated) = if content.len() > max_chars {
+        (&content[..max_chars], true)
     } else {
         (content, false)
     };
@@ -1932,7 +1937,7 @@ async fn log_llm_event(
     }
 
     if truncated {
-        let _ = write!(file, "\n[... CONTENT TRUNCATED AT {} CHARS ...]\n", MAX_LOG_CHARS);
+        let _ = write!(file, "\n[... CONTENT TRUNCATED AT {} CHARS ...]\n", max_chars);
     }
 
     if event_type == "TOOL_RESULT" || event_type == "OUTPUT" {
