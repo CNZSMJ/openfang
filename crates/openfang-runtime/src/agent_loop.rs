@@ -53,6 +53,12 @@ const MAX_CONTINUATIONS: u32 = 5;
 /// Maximum message history size before auto-trimming to prevent context overflow.
 const MAX_HISTORY_MESSAGES: usize = 20;
 
+/// Logging: Maximum characters for INPUT/OUTPUT in llm.log.
+const MAX_LLM_IO_LOG_CHARS: usize = 50_000;
+
+/// Logging: Maximum characters for TOOL_RESULT in llm.log (kept small for readability).
+const MAX_TOOL_RESULT_LOG_CHARS: usize = 1000;
+
 /// Strip a provider prefix from a model ID before sending to the API.
 ///
 /// Many models are stored as `provider/org/model` (e.g. `openrouter/google/gemini-2.5-flash`)
@@ -1914,9 +1920,9 @@ async fn log_llm_event(
 
     // Differentiate truncation limits: TOOL_RESULT is smaller to keep logs concise
     let max_chars = if event_type == "TOOL_RESULT" {
-        10_000
+        MAX_TOOL_RESULT_LOG_CHARS
     } else {
-        50_000
+        MAX_LLM_IO_LOG_CHARS
     };
 
     let (display_content, truncated) = if content.len() > max_chars {
