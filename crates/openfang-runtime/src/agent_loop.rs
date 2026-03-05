@@ -25,6 +25,8 @@ use openfang_types::message::{
 };
 use openfang_types::tool::{ToolCall, ToolDefinition};
 use std::collections::HashMap;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -308,7 +310,7 @@ pub async fn run_agent_loop(
         let api_model = strip_provider_prefix(&manifest.model.model, &manifest.model.provider);
 
         let request = CompletionRequest {
-            model: api_model,
+            model: api_model.clone(),
             messages: messages.clone(),
             tools: available_tools.to_vec(),
             max_tokens: manifest.model.max_tokens,
@@ -316,6 +318,13 @@ pub async fn run_agent_loop(
             system: Some(system_prompt.clone()),
             thinking: None,
         };
+
+        // Log LLM Input
+        let input_log = format!(
+            "System: {}\n\nMessages: {:?}",
+            system_prompt, messages
+        );
+        log_llm_event(workspace_root, "INPUT", &api_model, &input_log).await;
 
         // Notify phase: Thinking
         if let Some(cb) = on_phase {
@@ -325,6 +334,13 @@ pub async fn run_agent_loop(
         // Call LLM with retry, error classification, and circuit breaker
         let provider_name = manifest.model.provider.as_str();
         let mut response = call_with_retry(&*driver, request, Some(provider_name), None).await?;
+
+        // Log LLM Output
+        let output_log = format!(
+            "Response: {}\nTool Calls: {:?}\nStop Reason: {:?}\nUsage: {:?}",
+            response.text(), response.tool_calls, response.stop_reason, response.usage
+        );
+        log_llm_event(workspace_root, "OUTPUT", &api_model, &output_log).await;
 
         total_usage.input_tokens += response.usage.input_tokens;
         total_usage.output_tokens += response.usage.output_tokens;
@@ -728,6 +744,11 @@ pub async fn run_agent_loop(
                     role: Role::User,
                     content: MessageContent::Blocks(tool_result_blocks.clone()),
                 };
+
+                // Log Tool Results
+                let tool_log = format!("Results: {:?}", tool_result_blocks);
+                log_llm_event(workspace_root, "TOOL_RESULT", "", &tool_log).await;
+
                 session.messages.push(tool_results_msg.clone());
                 messages.push(tool_results_msg);
 
@@ -1236,7 +1257,7 @@ pub async fn run_agent_loop_streaming(
         let api_model = strip_provider_prefix(&manifest.model.model, &manifest.model.provider);
 
         let request = CompletionRequest {
-            model: api_model,
+            model: api_model.clone(),
             messages: messages.clone(),
             tools: available_tools.to_vec(),
             max_tokens: manifest.model.max_tokens,
@@ -1244,6 +1265,13 @@ pub async fn run_agent_loop_streaming(
             system: Some(system_prompt.clone()),
             thinking: None,
         };
+
+        // Log LLM Input (streaming)
+        let input_log = format!(
+            "System: {}\n\nMessages: {:?}",
+            system_prompt, messages
+        );
+        log_llm_event(workspace_root, "INPUT", &api_model, &input_log).await;
 
         // Notify phase: Streaming (streaming variant always streams)
         if let Some(cb) = on_phase {
@@ -1260,6 +1288,13 @@ pub async fn run_agent_loop_streaming(
             None,
         )
         .await?;
+
+        // Log LLM Output (streaming)
+        let output_log = format!(
+            "Response (concatenated): {}\nTool Calls: {:?}\nStop Reason: {:?}\nUsage: {:?}",
+            response.text(), response.tool_calls, response.stop_reason, response.usage
+        );
+        log_llm_event(workspace_root, "OUTPUT", &api_model, &output_log).await;
 
         total_usage.input_tokens += response.usage.input_tokens;
         total_usage.output_tokens += response.usage.output_tokens;
@@ -1667,6 +1702,11 @@ pub async fn run_agent_loop_streaming(
                     role: Role::User,
                     content: MessageContent::Blocks(tool_result_blocks.clone()),
                 };
+
+                // Log Tool Results (streaming)
+                let tool_log = format!("Results: {:?}", tool_result_blocks);
+                log_llm_event(workspace_root, "TOOL_RESULT", "", &tool_log).await;
+
                 session.messages.push(tool_results_msg.clone());
                 messages.push(tool_results_msg);
 
@@ -2000,6 +2040,70 @@ fn recover_text_tool_calls(text: &str, available_tools: &[ToolDefinition]) -> Ve
     }
 
     calls
+}
+
+/// Log an LLM event (input, output, or tool result) to the agent's workspace.
+async fn log_llm_event(
+    workspace_root: Option<&Path>,
+    event_type: &str,
+    model: &str,
+    content: &str,
+) {
+    // Check if logging is explicitly disabled via environment variable
+    if let Ok(val) = std::env::var("OPENFANG_LLM_LOG") {
+        if val == "0" || val.to_lowercase() == "false" {
+            return;
+        }
+    }
+
+    let Some(root) = workspace_root else { return };
+    let log_dir = root.join("logs");
+    if let Err(e) = std::fs::create_dir_all(&log_dir) {
+        warn!("Failed to create logs directory: {e}");
+        return;
+    }
+
+    let log_path = log_dir.join("llm.log");
+    let mut file = match OpenOptions::new().create(true).append(true).open(&log_path) {
+        Ok(f) => f,
+        Err(e) => {
+            warn!("Failed to open llm.log for writing: {e}");
+            return;
+        }
+    };
+
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let separator = "=".repeat(80);
+    let sub_separator = "-".repeat(80);
+
+    // Truncate excessively long content to 50k chars to prevent disk bloat
+    const MAX_LOG_CHARS: usize = 50_000;
+    let (display_content, truncated) = if content.len() > MAX_LOG_CHARS {
+        (&content[..MAX_LOG_CHARS], true)
+    } else {
+        (content, false)
+    };
+
+    let header = match event_type {
+        "INPUT" => format!("\n{}\n[{}] >>> INPUT (Model: {})\n{}\n", separator, timestamp, model, sub_separator),
+        "OUTPUT" => format!("\n[{}] <<< OUTPUT\n{}\n", timestamp, sub_separator),
+        "TOOL_RESULT" => format!("\n[{}] === TOOL RESULT\n{}\n", timestamp, sub_separator),
+        _ => format!("\n[{}] EVENT: {}\n{}\n", timestamp, event_type, sub_separator),
+    };
+
+    if let Err(e) = write!(file, "{}{}", header, display_content) {
+        warn!("Failed to write to llm.log: {e}");
+    }
+
+    if truncated {
+        let _ = write!(file, "\n[... CONTENT TRUNCATED AT {} CHARS ...]\n", MAX_LOG_CHARS);
+    }
+
+    if event_type == "TOOL_RESULT" || event_type == "OUTPUT" {
+        let _ = write!(file, "\n{}\n", separator);
+    } else {
+        let _ = write!(file, "\n");
+    }
 }
 
 #[cfg(test)]
