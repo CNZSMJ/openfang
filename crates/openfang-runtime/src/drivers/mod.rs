@@ -240,6 +240,23 @@ pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmErr
         return Ok(Arc::new(anthropic::AnthropicDriver::new(api_key, base_url)));
     }
 
+    // MiniMax uses Anthropic's API format for its /anthropic endpoints
+    if provider == "minimax" {
+        let api_key = config
+            .api_key
+            .clone()
+            .or_else(|| std::env::var("MINIMAX_API_KEY").ok())
+            .ok_or_else(|| {
+                LlmError::MissingApiKey("Set MINIMAX_API_KEY environment variable".to_string())
+            })?;
+        let base_url = config
+            .base_url
+            .clone()
+            .unwrap_or_else(|| MINIMAX_BASE_URL.to_string());
+        tracing::warn!("MiniMax driver init: config.base_url = {:?}, MINIMAX_BASE_URL = {}, resolved base_url = {}", config.base_url, MINIMAX_BASE_URL, base_url);
+        return Ok(Arc::new(anthropic::AnthropicDriver::new(api_key, base_url)));
+    }
+
     // Gemini uses a different API format — special case
     if provider == "gemini" || provider == "google" {
         let api_key = config
