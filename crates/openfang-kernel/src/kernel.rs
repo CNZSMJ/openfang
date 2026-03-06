@@ -1006,7 +1006,8 @@ impl OpenFangKernel {
                                             || disk_manifest.model.system_prompt != entry.manifest.model.system_prompt
                                             || disk_manifest.model.provider != entry.manifest.model.provider
                                             || disk_manifest.model.model != entry.manifest.model.model
-                                            || disk_manifest.capabilities.tools != entry.manifest.capabilities.tools;
+                                            || disk_manifest.capabilities.tools != entry.manifest.capabilities.tools
+                                            || disk_manifest.resources != entry.manifest.resources;
                                         if changed {
                                             info!(
                                                 agent = %name,
@@ -1059,11 +1060,7 @@ impl OpenFangKernel {
                             Some(kernel.config.exec_policy.clone());
                     }
 
-                    // Apply global budget defaults to restored agents
-                    apply_budget_defaults(
-                        &kernel.config.budget,
-                        &mut restored_entry.manifest.resources,
-                    );
+
 
                     // Apply default_model to restored agents.
                     //
@@ -1225,8 +1222,7 @@ impl OpenFangKernel {
             manifest.model.model = normalized;
         }
 
-        // Apply global budget defaults to agent resource quotas
-        apply_budget_defaults(&self.config.budget, &mut manifest.resources);
+
 
         // Create workspace directory for the agent (name-based, so SOUL.md survives recreation)
         let workspace_dir = manifest.workspace.clone().unwrap_or_else(|| {
@@ -1988,6 +1984,9 @@ impl OpenFangKernel {
         kernel_handle: Option<Arc<dyn KernelHandle>>,
     ) -> KernelResult<AgentLoopResult> {
         // Check metering quota before starting
+        self.metering
+            .check_global_budget(&self.config.budget)
+            .map_err(KernelError::OpenFang)?;
         self.metering
             .check_quota(agent_id, &entry.manifest.resources)
             .map_err(KernelError::OpenFang)?;
@@ -4712,27 +4711,6 @@ fn manifest_to_capabilities(manifest: &AgentManifest) -> Vec<Capability> {
     }
 
     caps
-}
-
-/// Apply global budget defaults to an agent's resource quota.
-///
-/// When the global budget config specifies limits and the agent still has
-/// the built-in defaults, override them so agents respect the user's config.
-fn apply_budget_defaults(
-    budget: &openfang_types::config::BudgetConfig,
-    resources: &mut ResourceQuota,
-) {
-    // Only override hourly if agent has unlimited (0.0) and global is set
-    if budget.max_hourly_usd > 0.0 && resources.max_cost_per_hour_usd == 0.0 {
-        resources.max_cost_per_hour_usd = budget.max_hourly_usd;
-    }
-    // Only override daily/monthly if agent has unlimited (0.0) and global is set
-    if budget.max_daily_usd > 0.0 && resources.max_cost_per_day_usd == 0.0 {
-        resources.max_cost_per_day_usd = budget.max_daily_usd;
-    }
-    if budget.max_monthly_usd > 0.0 && resources.max_cost_per_month_usd == 0.0 {
-        resources.max_cost_per_month_usd = budget.max_monthly_usd;
-    }
 }
 
 /// Infer provider from a model name when catalog lookup fails.

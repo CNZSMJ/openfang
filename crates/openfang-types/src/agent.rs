@@ -238,7 +238,7 @@ fn default_check_interval() -> u64 {
 }
 
 /// Resource limits for an agent.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct ResourceQuota {
     /// Maximum WASM memory in bytes.
