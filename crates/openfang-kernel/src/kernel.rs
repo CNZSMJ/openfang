@@ -2472,7 +2472,7 @@ impl OpenFangKernel {
                 .take(5)
                 .enumerate()
                 .map(|(i, t)| {
-                    let truncated = if t.len() > 200 { &t[..200] } else { t };
+                    let truncated: String = t.chars().take(200).collect();
                     format!("{}. {}", i + 1, truncated)
                 })
                 .collect::<Vec<_>>()
@@ -3915,8 +3915,13 @@ impl OpenFangKernel {
             let mut chain: Vec<(std::sync::Arc<dyn openfang_runtime::llm_driver::LlmDriver>, String)> =
                 vec![(primary.clone(), String::new())];
             for fb in &manifest.fallback_models {
+                let fb_provider = if fb.provider == "default" {
+                    self.config.clone().default_model.provider
+                } else {
+                    fb.provider.clone()
+                };
                 let config = DriverConfig {
-                    provider: fb.provider.clone(),
+                    provider: fb_provider,
                     api_key: fb
                         .api_key_env
                         .as_ref()

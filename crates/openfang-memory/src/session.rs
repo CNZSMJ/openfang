@@ -585,10 +585,9 @@ impl SessionStore {
                                 text_parts.push(format!("[image: {media_type}]"));
                             }
                             ContentBlock::Thinking { thinking } => {
-                                text_parts.push(format!(
-                                    "[thinking: {}]",
-                                    &thinking[..thinking.len().min(200)]
-                                ));
+                                // Safely truncate to 200 characters, not bytes
+                                let truncated: String = thinking.chars().take(200).collect();
+                                text_parts.push(format!("[thinking: {}]", truncated));
                             }
                             ContentBlock::Unknown => {}
                         }

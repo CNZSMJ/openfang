@@ -186,7 +186,8 @@ pub async fn probe_model(
     } else {
         let status = resp.status().as_u16();
         let body = resp.text().await.unwrap_or_default();
-        Err(format!("HTTP {status}: {}", &body[..body.len().min(200)]))
+        let truncated = body.chars().take(200).collect::<String>();
+        Err(format!("HTTP {status}: {}", truncated))
     }
 }
 
