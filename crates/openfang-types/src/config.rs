@@ -1087,7 +1087,7 @@ pub struct BudgetConfig {
 impl Default for BudgetConfig {
     fn default() -> Self {
         Self {
-            max_hourly_usd: 0.0,
+            max_hourly_usd: 1.0,
             max_daily_usd: 0.0,
             max_monthly_usd: 0.0,
             alert_threshold: 0.8,
