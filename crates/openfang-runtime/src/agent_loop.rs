@@ -2089,10 +2089,12 @@ async fn log_llm_event(
         MAX_LLM_IO_LOG_CHARS
     };
 
+    // Use char boundary for UTF-8 truncation
     let (display_content, truncated) = if content.len() > max_chars {
-        (&content[..max_chars], true)
+        let truncated_str: String = content.chars().take(max_chars).collect();
+        (truncated_str, true)
     } else {
-        (content, false)
+        (content.to_string(), false)
     };
 
     let header = match event_type {
