@@ -1343,6 +1343,7 @@ fn provider_list() -> Vec<(&'static str, &'static str, &'static str, &'static st
             "openrouter/anthropic/claude-sonnet-4",
             "OpenRouter",
         ),
+        ("minimax", "MINIMAX_API_KEY", "MiniMax-M2.5", "MiniMax"),
     ]
 }
 
@@ -2308,6 +2309,7 @@ decay_rate = 0.05
         ("DEEPSEEK_API_KEY", "DeepSeek", "deepseek"),
         ("GEMINI_API_KEY", "Gemini", "gemini"),
         ("GOOGLE_API_KEY", "Google", "google"),
+        ("MINIMAX_API_KEY", "MiniMax", "minimax"),
         ("TOGETHER_API_KEY", "Together", "together"),
         ("MISTRAL_API_KEY", "Mistral", "mistral"),
         ("FIREWORKS_API_KEY", "Fireworks", "fireworks"),
@@ -2626,7 +2628,7 @@ decay_rate = 0.05
                         }
                         checks.push(serde_json::json!({"check": "daemon_agents", "status": "ok", "count": agents}));
                     }
-                    if let Some(uptime) = body.get("uptime_secs").and_then(|v| v.as_u64()) {
+                    if let Some(uptime) = body.get("uptime_seconds").or_else(|| body.get("uptime_secs")).and_then(|v| v.as_u64()) {
                         let hours = uptime / 3600;
                         let mins = (uptime % 3600) / 60;
                         if !json {
@@ -2721,18 +2723,19 @@ decay_rate = 0.05
                             })
                             .count();
                         let total = arr.len();
-                        if healthy == total {
-                            if !json {
-                                ui::check_ok(&format!(
+                        if total > 0 {
+                            if healthy == total {
+                                if !json {
+                                    ui::check_ok(&format!(
+                                    "Integration health: {healthy}/{total} healthy"
+                                ));
+                            } else if !json {
+                                ui::check_warn(&format!(
                                     "Integration health: {healthy}/{total} healthy"
                                 ));
                             }
-                        } else if !json {
-                            ui::check_warn(&format!(
-                                "Integration health: {healthy}/{total} healthy"
-                            ));
+                            checks.push(serde_json::json!({"check": "integration_health", "status": if healthy == total { "ok" } else { "warn" }, "healthy": healthy, "total": total}));
                         }
-                        checks.push(serde_json::json!({"check": "integration_health", "status": if healthy == total { "ok" } else { "warn" }, "healthy": healthy, "total": total}));
                     }
                 }
             }

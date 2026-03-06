@@ -149,6 +149,14 @@ const PROVIDERS: &[ProviderInfo] = &[
         hint: "",
     },
     ProviderInfo {
+        name: "minimax",
+        display: "MiniMax",
+        env_var: "MINIMAX_API_KEY",
+        default_model: "minimax",
+        needs_key: true,
+        hint: "",
+    },
+    ProviderInfo {
         name: "huggingface",
         display: "Hugging Face",
         env_var: "HUGGINGFACE_API_KEY",
