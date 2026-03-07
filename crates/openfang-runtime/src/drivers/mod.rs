@@ -240,7 +240,7 @@ pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmErr
         return Ok(Arc::new(anthropic::AnthropicDriver::new(api_key, base_url)));
     }
 
-    // MiniMax uses Anthropic's API format for its /anthropic endpoints
+    // MiniMax uses Anthropic API format
     if provider == "minimax" {
         let api_key = config
             .api_key
@@ -253,7 +253,6 @@ pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmErr
             .base_url
             .clone()
             .unwrap_or_else(|| MINIMAX_BASE_URL.to_string());
-        tracing::warn!("MiniMax driver init: config.base_url = {:?}, MINIMAX_BASE_URL = {}, resolved base_url = {}", config.base_url, MINIMAX_BASE_URL, base_url);
         return Ok(Arc::new(anthropic::AnthropicDriver::new(api_key, base_url)));
     }
 
