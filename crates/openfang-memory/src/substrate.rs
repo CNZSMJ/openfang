@@ -424,7 +424,7 @@ impl MemorySubstrate {
 
         tokio::task::spawn_blocking(move || {
             let id = uuid::Uuid::new_v4().to_string();
-            let now = chrono::Utc::now().to_rfc3339();
+            let now = chrono::Local::now().to_rfc3339();
             let db = conn.lock().map_err(|e| OpenFangError::Internal(e.to_string()))?;
             db.execute(
                 "INSERT INTO task_queue (id, agent_id, task_type, payload, status, priority, created_at, title, description, assigned_to, created_by)
@@ -498,7 +498,7 @@ impl MemorySubstrate {
         let result = result.to_string();
 
         tokio::task::spawn_blocking(move || {
-            let now = chrono::Utc::now().to_rfc3339();
+            let now = chrono::Local::now().to_rfc3339();
             let db = conn.lock().map_err(|e| OpenFangError::Internal(e.to_string()))?;
             let rows = db.execute(
                 "UPDATE task_queue SET status = 'completed', result = ?2, completed_at = ?3 WHERE id = ?1",

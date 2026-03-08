@@ -2129,7 +2129,7 @@ async fn log_llm_event(
         }
     };
 
-    let timestamp = chrono::Utc::now().to_rfc3339();
+    let timestamp = chrono::Local::now().to_rfc3339();
     let separator = "=".repeat(80);
     let sub_separator = "-".repeat(80);
 
