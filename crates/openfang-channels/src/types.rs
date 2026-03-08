@@ -2,6 +2,7 @@
 
 use chrono::{DateTime, Utc};
 use openfang_types::agent::AgentId;
+use openfang_types::inbound::InboundAttachment;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -84,7 +85,11 @@ pub struct ChannelMessage {
     /// Thread ID for threaded conversations (platform-specific).
     #[serde(default)]
     pub thread_id: Option<String>,
+    /// Raw attachments received from the channel ingress.
+    #[serde(default)]
+    pub attachments: Vec<InboundAttachment>,
     /// Arbitrary platform metadata.
+    #[serde(default)]
     pub metadata: HashMap<String, serde_json::Value>,
 }
 
@@ -311,6 +316,7 @@ mod tests {
             timestamp: Utc::now(),
             is_group: false,
             thread_id: None,
+            attachments: vec![],
             metadata: HashMap::new(),
         };
 

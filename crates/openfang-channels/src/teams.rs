@@ -265,6 +265,7 @@ fn parse_teams_activity(
         timestamp: Utc::now(),
         is_group,
         thread_id: None,
+        attachments: vec![],
         metadata,
     })
 }

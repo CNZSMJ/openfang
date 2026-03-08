@@ -202,6 +202,7 @@ impl ChannelAdapter for SignalAdapter {
                         timestamp: Utc::now(),
                         is_group: false,
                         thread_id: None,
+                        attachments: vec![],
                         metadata: HashMap::new(),
                     };
 

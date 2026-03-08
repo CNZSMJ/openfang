@@ -332,6 +332,7 @@ impl ChannelAdapter for LinkedInAdapter {
                         timestamp: Utc::now(),
                         is_group: false,
                         thread_id,
+                        attachments: vec![],
                         metadata: {
                             let mut m = HashMap::new();
                             m.insert(

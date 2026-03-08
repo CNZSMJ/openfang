@@ -414,6 +414,7 @@ impl ChannelAdapter for EmailAdapter {
                         timestamp: Utc::now(),
                         is_group: false,
                         thread_id: None,
+                        attachments: vec![],
                         metadata: std::collections::HashMap::new(),
                     };
 

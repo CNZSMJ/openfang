@@ -1557,10 +1557,16 @@ pub struct TelegramConfig {
     /// Accepts strings for consistency; numeric TOML integers are coerced to strings.
     #[serde(default, deserialize_with = "deserialize_string_or_int_vec")]
     pub allowed_users: Vec<String>,
+    /// Telegram chat IDs allowed to interact (empty = allow all).
+    /// Accepts strings for consistency; numeric TOML integers are coerced to strings.
+    #[serde(default, deserialize_with = "deserialize_string_or_int_vec")]
+    pub allowed_chats: Vec<String>,
     /// Default agent name to route messages to.
     pub default_agent: Option<String>,
     /// Polling interval in seconds.
     pub poll_interval_secs: u64,
+    /// Max Telegram image size to download per attachment.
+    pub max_image_bytes: u64,
     /// Per-channel behavior overrides.
     #[serde(default)]
     pub overrides: ChannelOverrides,
@@ -1571,8 +1577,10 @@ impl Default for TelegramConfig {
         Self {
             bot_token_env: "TELEGRAM_BOT_TOKEN".to_string(),
             allowed_users: vec![],
+            allowed_chats: vec![],
             default_agent: None,
             poll_interval_secs: 1,
+            max_image_bytes: crate::media::MAX_IMAGE_BYTES,
             overrides: ChannelOverrides::default(),
         }
     }

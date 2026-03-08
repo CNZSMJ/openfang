@@ -2688,7 +2688,7 @@ fn builtin_models() -> Vec<ModelCatalogEntry> {
             input_cost_per_m: 1.10,
             output_cost_per_m: 4.40,
             supports_tools: true,
-            supports_vision: true,
+            supports_vision: false,
             supports_streaming: true,
             aliases: vec!["minimax-m2.5".into()],
         },

@@ -255,6 +255,7 @@ impl ChannelAdapter for GotifyAdapter {
                                             timestamp: Utc::now(),
                                             is_group: false,
                                             thread_id: None,
+                                            attachments: vec![],
                                             metadata: {
                                                 let mut m = HashMap::new();
                                                 m.insert(

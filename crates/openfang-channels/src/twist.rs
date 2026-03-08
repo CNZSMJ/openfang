@@ -458,6 +458,7 @@ impl ChannelAdapter for TwistAdapter {
                                 timestamp: Utc::now(),
                                 is_group: true,
                                 thread_id: Some(thread_title.clone()),
+                                attachments: vec![],
                                 metadata: {
                                     let mut m = HashMap::new();
                                     m.insert(

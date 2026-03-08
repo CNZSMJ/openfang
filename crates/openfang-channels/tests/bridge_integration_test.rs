@@ -162,6 +162,7 @@ fn make_text_msg(channel: ChannelType, user_id: &str, text: &str) -> ChannelMess
         timestamp: chrono::Utc::now(),
         is_group: false,
         thread_id: None,
+        attachments: vec![],
         metadata: HashMap::new(),
     }
 }
@@ -188,6 +189,7 @@ fn make_command_msg(
         timestamp: chrono::Utc::now(),
         is_group: false,
         thread_id: None,
+        attachments: vec![],
         metadata: HashMap::new(),
     }
 }

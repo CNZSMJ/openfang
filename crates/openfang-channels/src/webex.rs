@@ -413,6 +413,7 @@ impl ChannelAdapter for WebexAdapter {
                         timestamp: Utc::now(),
                         is_group,
                         thread_id: None,
+                        attachments: vec![],
                         metadata: {
                             let mut m = HashMap::new();
                             m.insert(

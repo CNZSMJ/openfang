@@ -222,6 +222,7 @@ fn parse_mattermost_event(
         timestamp: Utc::now(),
         is_group,
         thread_id,
+        attachments: vec![],
         metadata: HashMap::new(),
     })
 }

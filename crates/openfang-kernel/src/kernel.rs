@@ -15,7 +15,8 @@ use crate::workflow::{StepAgent, Workflow, WorkflowEngine, WorkflowId, WorkflowR
 
 use openfang_memory::MemorySubstrate;
 use openfang_runtime::agent_loop::{
-    run_agent_loop, run_agent_loop_streaming, strip_provider_prefix, AgentLoopResult,
+    run_agent_loop_streaming, run_agent_loop_with_session_message, strip_provider_prefix,
+    AgentLoopResult,
 };
 use openfang_runtime::audit::AuditLog;
 use openfang_runtime::drivers;
@@ -32,10 +33,14 @@ use openfang_types::capability::Capability;
 use openfang_types::config::KernelConfig;
 use openfang_types::error::OpenFangError;
 use openfang_types::event::*;
+use openfang_types::inbound::{AttachmentScope, InboundAttachment, InboundMessage, StoredAttachment};
 use openfang_types::memory::Memory;
+use openfang_types::message::{ContentBlock, Message, MessageContent, Role};
+use openfang_types::media::{MediaAttachment, MediaSource, MediaType};
 use openfang_types::tool::ToolDefinition;
 
 use async_trait::async_trait;
+use base64::Engine;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, Weak};
 use tracing::{debug, info, warn};
@@ -1351,6 +1356,61 @@ impl OpenFangKernel {
             .await
     }
 
+    /// Send a rich inbound message to an agent and get a response.
+    pub async fn send_message_rich(
+        &self,
+        agent_id: AgentId,
+        message: InboundMessage,
+    ) -> KernelResult<AgentLoopResult> {
+        let handle: Option<Arc<dyn KernelHandle>> = self
+            .self_handle
+            .get()
+            .and_then(|w| w.upgrade())
+            .map(|arc| arc as Arc<dyn KernelHandle>);
+        self.send_message_rich_with_handle(agent_id, message, handle)
+            .await
+    }
+
+    /// Send a rich inbound message with an optional kernel handle for inter-agent tools.
+    pub async fn send_message_rich_with_handle(
+        &self,
+        agent_id: AgentId,
+        message: InboundMessage,
+        kernel_handle: Option<Arc<dyn KernelHandle>>,
+    ) -> KernelResult<AgentLoopResult> {
+        let entry = self.registry.get(agent_id).ok_or_else(|| {
+            KernelError::OpenFang(OpenFangError::AgentNotFound(agent_id.to_string()))
+        })?;
+        let stored_attachments = self.import_inbound_attachments(&message)?;
+        let text = message.text.unwrap_or_default();
+
+        if stored_attachments.is_empty() {
+            return self
+                .send_message_with_handle(agent_id, &text, kernel_handle)
+                .await;
+        }
+
+        let supports_vision = self.model_supports_vision(&entry.manifest.model.model);
+        if supports_vision
+            && !entry.manifest.module.starts_with("wasm:")
+            && !entry.manifest.module.starts_with("python:")
+        {
+            let session_user_message = self.build_vision_user_message(&stored_attachments, &text)?;
+            self.execute_llm_agent_with_session_message(
+                &entry,
+                agent_id,
+                &text,
+                session_user_message,
+                kernel_handle,
+            )
+            .await
+        } else {
+            let attachment_text = self.build_attachment_reference_text(&stored_attachments, &text);
+            self.send_message_with_handle(agent_id, &attachment_text, kernel_handle)
+                .await
+        }
+    }
+
     /// Send a message with an optional kernel handle for inter-agent tools.
     pub async fn send_message_with_handle(
         &self,
@@ -1414,6 +1474,216 @@ impl OpenFangKernel {
                 warn!(agent_id = %agent_id, error = %e, "Agent loop failed — recorded in supervisor");
                 Err(e)
             }
+        }
+    }
+
+    fn model_supports_vision(&self, model_name: &str) -> bool {
+        self.model_catalog
+            .read()
+            .ok()
+            .and_then(|catalog| catalog.find_model(model_name).map(|entry| entry.supports_vision))
+            .unwrap_or(false)
+    }
+
+    fn attachment_store_root(&self) -> PathBuf {
+        self.config.home_dir.join("data").join("attachments")
+    }
+
+    fn import_inbound_attachments(
+        &self,
+        message: &InboundMessage,
+    ) -> KernelResult<Vec<StoredAttachment>> {
+        let source_channel = message
+            .metadata
+            .get("source_channel")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        message
+            .attachments
+            .iter()
+            .map(|attachment| self.import_inbound_attachment(attachment, &source_channel))
+            .collect()
+    }
+
+    fn import_inbound_attachment(
+        &self,
+        attachment: &InboundAttachment,
+        source_channel: &str,
+    ) -> KernelResult<StoredAttachment> {
+        let media_attachment = MediaAttachment {
+            media_type: attachment.kind,
+            mime_type: attachment.mime_type.clone(),
+            source: attachment.source.clone(),
+            size_bytes: attachment.size_bytes,
+        };
+        media_attachment.validate().map_err(|e| {
+            KernelError::OpenFang(OpenFangError::Config(format!(
+                "Invalid inbound attachment: {e}"
+            )))
+        })?;
+
+        let root = self.attachment_store_root();
+        std::fs::create_dir_all(&root).map_err(|e| {
+            KernelError::OpenFang(OpenFangError::Internal(format!(
+                "Failed to create attachment store: {e}"
+            )))
+        })?;
+
+        let attachment_id = format!("att_{}", uuid::Uuid::new_v4().simple());
+        let extension = attachment
+            .filename
+            .as_deref()
+            .and_then(|name| Path::new(name).extension().and_then(|ext| ext.to_str()))
+            .map(String::from)
+            .or_else(|| match attachment.mime_type.as_str() {
+                "image/jpeg" => Some("jpg".to_string()),
+                "image/png" => Some("png".to_string()),
+                "image/webp" => Some("webp".to_string()),
+                "image/gif" => Some("gif".to_string()),
+                _ => None,
+            });
+        let stored_name = extension
+            .map(|ext| format!("{attachment_id}.{ext}"))
+            .unwrap_or_else(|| attachment_id.clone());
+        let stored_path = root.join(stored_name);
+
+        match &attachment.source {
+            MediaSource::FilePath { path } => {
+                std::fs::copy(path, &stored_path).map_err(|e| {
+                    KernelError::OpenFang(OpenFangError::Internal(format!(
+                        "Failed to import staged attachment: {e}"
+                    )))
+                })?;
+                let _ = std::fs::remove_file(path);
+            }
+            MediaSource::Base64 { data, .. } => {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .map_err(|e| {
+                        KernelError::OpenFang(OpenFangError::Internal(format!(
+                            "Failed to decode attachment base64: {e}"
+                        )))
+                    })?;
+                std::fs::write(&stored_path, bytes).map_err(|e| {
+                    KernelError::OpenFang(OpenFangError::Internal(format!(
+                        "Failed to persist attachment bytes: {e}"
+                    )))
+                })?;
+            }
+            MediaSource::Url { url } => {
+                return Err(KernelError::OpenFang(OpenFangError::Internal(format!(
+                    "URL attachments are not supported by the kernel attachment store yet: {url}"
+                ))));
+            }
+        }
+
+        let now = chrono::Utc::now();
+        Ok(StoredAttachment {
+            id: attachment_id,
+            kind: attachment.kind,
+            mime_type: attachment.mime_type.clone(),
+            filename: attachment.filename.clone(),
+            stored_path: stored_path.display().to_string(),
+            size_bytes: attachment.size_bytes,
+            source_channel: source_channel.to_string(),
+            scope: AttachmentScope::Turn,
+            created_at: now,
+            expires_at: Some(now + chrono::Duration::hours(24)),
+            metadata: attachment.metadata.clone(),
+        })
+    }
+
+    fn build_vision_user_message(
+        &self,
+        attachments: &[StoredAttachment],
+        text: &str,
+    ) -> KernelResult<Message> {
+        let mut blocks = Vec::new();
+        if !text.trim().is_empty() {
+            blocks.push(ContentBlock::Text {
+                text: text.to_string(),
+            });
+        } else {
+            blocks.push(ContentBlock::Text {
+                text: self.image_only_instruction(true),
+            });
+        }
+        for attachment in attachments {
+            if attachment.kind != MediaType::Image {
+                continue;
+            }
+            let data = std::fs::read(&attachment.stored_path).map_err(|e| {
+                KernelError::OpenFang(OpenFangError::Internal(format!(
+                    "Failed to read stored attachment: {e}"
+                )))
+            })?;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+            openfang_types::message::validate_image(&attachment.mime_type, &b64).map_err(|e| {
+                KernelError::OpenFang(OpenFangError::Internal(format!(
+                    "Invalid stored image attachment: {e}"
+                )))
+            })?;
+            blocks.push(ContentBlock::Image {
+                media_type: attachment.mime_type.clone(),
+                data: b64,
+            });
+        }
+
+        if blocks.is_empty() {
+            return Err(KernelError::OpenFang(OpenFangError::Internal(
+                "Vision path selected without any image attachments".to_string(),
+            )));
+        }
+
+        Ok(Message {
+            role: Role::User,
+            content: MessageContent::Blocks(blocks),
+        })
+    }
+
+    fn build_attachment_reference_text(
+        &self,
+        attachments: &[StoredAttachment],
+        text: &str,
+    ) -> String {
+        let mut rendered = String::from(
+            "[Attachment Context]\n\
+             The current model cannot directly inspect binary attachments.\n\
+             If you have an installed tool that accepts attachment_id, you may use it.\n\
+             Otherwise explain that you cannot inspect the attachment directly.\n\n\
+             [Attachments]\n",
+        );
+        for (index, attachment) in attachments.iter().enumerate() {
+            rendered.push_str(&format!(
+                "{}. kind={}\n   attachment_id={}\n   mime_type={}\n   source={}\n   local_path={}\n",
+                index + 1,
+                attachment.kind,
+                attachment.id,
+                attachment.mime_type,
+                attachment.source_channel,
+                attachment.stored_path
+            ));
+            if let Some(filename) = &attachment.filename {
+                rendered.push_str(&format!("   filename={filename}\n"));
+            }
+        }
+        rendered.push_str("[/Attachments]");
+        if !text.trim().is_empty() {
+            rendered.push_str("\n\n");
+            rendered.push_str(text);
+        } else {
+            rendered.push_str("\n\n");
+            rendered.push_str(&self.image_only_instruction(false));
+        }
+        rendered
+    }
+
+    fn image_only_instruction(&self, can_directly_view_image: bool) -> String {
+        if can_directly_view_image {
+            "The user sent one or more images without any accompanying text. Infer the most likely intent from the attached images and respond to that intent directly. If the image content is ambiguous, explain what you can observe and ask a concise clarifying question. If you cannot actually inspect the image, say so explicitly instead of continuing the previous conversation.".to_string()
+        } else {
+            "The user sent one or more images without any accompanying text. You cannot directly inspect binary attachments in this path. If you have an installed tool that can inspect the provided attachment_id values, use it to understand the user's likely intent. If no such tool is available or the intent remains ambiguous, tell the user you need either an image-capable model or a compatible tool, and ask a concise clarifying question instead of continuing the previous conversation.".to_string()
         }
     }
 
@@ -1983,6 +2253,25 @@ impl OpenFangKernel {
         message: &str,
         kernel_handle: Option<Arc<dyn KernelHandle>>,
     ) -> KernelResult<AgentLoopResult> {
+        self.execute_llm_agent_with_session_message(
+            entry,
+            agent_id,
+            message,
+            Message::user(message),
+            kernel_handle,
+        )
+        .await
+    }
+
+    /// Execute the default LLM-based agent loop with a caller-provided user message.
+    async fn execute_llm_agent_with_session_message(
+        &self,
+        entry: &AgentEntry,
+        agent_id: AgentId,
+        message: &str,
+        session_user_message: Message,
+        kernel_handle: Option<Arc<dyn KernelHandle>>,
+    ) -> KernelResult<AgentLoopResult> {
         // Check metering quota before starting
         self.metering
             .check_global_budget(&self.config.budget)
@@ -2217,9 +2506,10 @@ impl OpenFangKernel {
             message.to_string()
         };
 
-        let result = run_agent_loop(
+        let result = run_agent_loop_with_session_message(
             &manifest,
             &message_with_links,
+            session_user_message,
             &mut session,
             &self.memory,
             driver,

@@ -52,6 +52,7 @@ use openfang_channels::ntfy::NtfyAdapter;
 use openfang_channels::webhook::WebhookAdapter;
 use openfang_kernel::OpenFangKernel;
 use openfang_types::agent::AgentId;
+use openfang_types::inbound::InboundMessage;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
@@ -68,6 +69,19 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
         let result = self
             .kernel
             .send_message(agent_id, message)
+            .await
+            .map_err(|e| format!("{e}"))?;
+        Ok(result.response)
+    }
+
+    async fn send_message_rich(
+        &self,
+        agent_id: AgentId,
+        message: InboundMessage,
+    ) -> Result<String, String> {
+        let result = self
+            .kernel
+            .send_message_rich(agent_id, message)
             .await
             .map_err(|e| format!("{e}"))?;
         Ok(result.response)
@@ -1029,7 +1043,9 @@ pub async fn start_channel_bridge_with_config(
             let adapter = Arc::new(TelegramAdapter::new(
                 token,
                 tg_config.allowed_users.clone(),
+                tg_config.allowed_chats.clone(),
                 poll_interval,
+                tg_config.max_image_bytes,
             ));
             adapters.push((adapter, tg_config.default_agent.clone()));
         }

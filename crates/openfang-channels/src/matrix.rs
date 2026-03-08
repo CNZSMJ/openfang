@@ -258,6 +258,7 @@ impl ChannelAdapter for MatrixAdapter {
                                     timestamp: Utc::now(),
                                     is_group: true,
                                     thread_id: None,
+                                    attachments: vec![],
                                     metadata: HashMap::new(),
                                 };
 

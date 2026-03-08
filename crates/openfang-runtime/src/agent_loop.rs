@@ -143,6 +143,57 @@ pub async fn run_agent_loop(
     context_window_tokens: Option<usize>,
     process_manager: Option<&crate::process_manager::ProcessManager>,
 ) -> OpenFangResult<AgentLoopResult> {
+    run_agent_loop_with_session_message(
+        manifest,
+        user_message,
+        Message::user(user_message),
+        session,
+        memory,
+        driver,
+        available_tools,
+        kernel,
+        skill_registry,
+        mcp_connections,
+        web_ctx,
+        browser_ctx,
+        embedding_driver,
+        workspace_root,
+        on_phase,
+        media_engine,
+        tts_engine,
+        docker_config,
+        hooks,
+        context_window_tokens,
+        process_manager,
+    )
+    .await
+}
+
+/// Run the agent loop, allowing the caller to control the exact user message persisted in session.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_agent_loop_with_session_message(
+    manifest: &AgentManifest,
+    user_message: &str,
+    session_user_message: Message,
+    session: &mut Session,
+    memory: &MemorySubstrate,
+    driver: Arc<dyn LlmDriver>,
+    available_tools: &[ToolDefinition],
+    kernel: Option<Arc<dyn KernelHandle>>,
+    skill_registry: Option<&SkillRegistry>,
+    mcp_connections: Option<&tokio::sync::Mutex<Vec<McpConnection>>>,
+    web_ctx: Option<&WebToolsContext>,
+    browser_ctx: Option<&crate::browser::BrowserManager>,
+    embedding_driver: Option<&(dyn EmbeddingDriver + Send + Sync)>,
+    workspace_root: Option<&Path>,
+    on_phase: Option<&PhaseCallback>,
+    media_engine: Option<&crate::media_understanding::MediaEngine>,
+    tts_engine: Option<&crate::tts::TtsEngine>,
+    docker_config: Option<&openfang_types::config::DockerSandboxConfig>,
+    hooks: Option<&crate::hooks::HookRegistry>,
+    context_window_tokens: Option<usize>,
+    process_manager: Option<&crate::process_manager::ProcessManager>,
+) -> OpenFangResult<AgentLoopResult> {
     info!(agent = %manifest.name, "Starting agent loop");
 
     // Extract hand-allowed env vars from manifest metadata (set by kernel for hand settings)
@@ -226,8 +277,8 @@ pub async fn run_agent_loop(
         system_prompt.push_str(&crate::prompt_builder::build_memory_section(&mem_pairs));
     }
 
-    // Add the user message to session history
-    session.messages.push(Message::user(user_message));
+    // Add the user message to session history.
+    session.messages.push(session_user_message);
 
     // Build the messages for the LLM, filtering system messages
     // System prompt goes into the separate `system` field
