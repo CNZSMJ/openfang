@@ -4737,6 +4737,12 @@ impl OpenFangKernel {
         all_tools
             .into_iter()
             .filter(|tool| {
+                // MCP tools are already filtered by server allowlist earlier (lines 4614-4635).
+                // We allow them here if they are in the all_tools vector.
+                if tool.name.starts_with("mcp_") {
+                    return true;
+                }
+
                 caps.iter().any(|c| match c {
                     Capability::ToolInvoke(name) => name == &tool.name || name == "*",
                     _ => false,
@@ -4763,8 +4769,8 @@ impl OpenFangKernel {
             .collect();
 
         // Group tools by MCP server prefix (mcp_{server}_{tool})
-        let mut servers: std::collections::HashMap<String, Vec<String>> =
-            std::collections::HashMap::new();
+        let mut servers: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
         let mut tool_count = 0usize;
         for tool in &tools {
             let parts: Vec<&str> = tool.name.splitn(3, '_').collect();
@@ -4777,7 +4783,7 @@ impl OpenFangKernel {
                 servers
                     .entry(server)
                     .or_default()
-                    .push(parts[2..].join("_"));
+                    .push(tool.name.clone());
                 tool_count += 1;
             } else {
                 servers
@@ -4790,24 +4796,26 @@ impl OpenFangKernel {
         if tool_count == 0 {
             return String::new();
         }
-        let mut summary = format!("\n\n--- Connected MCP Servers ({} tools) ---\n", tool_count);
+
+        let mut summary = String::new();
         for (server, tool_names) in &servers {
             summary.push_str(&format!(
-                "- {server}: {} tools ({})\n",
+                "- **{}**: {} tools available\n  - full names: {}\n",
+                server,
                 tool_names.len(),
-                tool_names.join(", ")
+                tool_names.iter().map(|n| format!("`{n}`")).collect::<Vec<_>>().join(", ")
             ));
         }
-        summary.push_str("MCP tools are prefixed with mcp_{server}_ and work like regular tools.\n");
+        summary.push_str("\nTo use these tools, call them by their FULL name exactly as shown above.\n");
+
         // Add filesystem-specific guidance when a filesystem MCP server is connected
         let has_filesystem = servers.keys().any(|s| s.contains("filesystem"));
         if has_filesystem {
             summary.push_str(
-                "IMPORTANT: For accessing files OUTSIDE your workspace directory, you MUST use \
-                 the MCP filesystem tools (e.g. mcp_filesystem_read_file, mcp_filesystem_list_directory) \
-                 instead of the built-in file_read/file_list/file_write tools, which are restricted to \
-                 the workspace. The MCP filesystem server has been granted access to specific directories \
-                 by the user.",
+                "\n**IMPORTANT (Filesystem MCP)**: For accessing files OUTSIDE your workspace directory, \
+                 you MUST use the MCP filesystem tools (e.g., `mcp_filesystem_read_file`) instead of \
+                 built-in `file_read` tools which are restricted. The user has explicitly granted \
+                 this MCP server access to these external paths."
             );
         }
         summary

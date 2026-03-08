@@ -449,7 +449,22 @@ impl McpConnection {
         if let Ok(path) = std::env::var("PATH") {
             cmd.env("PATH", path);
         }
-        // On Windows, npm/node need APPDATA, USERPROFILE, LOCALAPPDATA, and SystemRoot
+        // Ensure basic environment variables are passed for all platforms
+        for var in &[
+            "HOME",
+            "USER",
+            "TMPDIR",
+            "SHELL",
+            "LANG",
+            "LC_ALL",
+            "LC_CTYPE",
+        ] {
+            if let Ok(val) = std::env::var(var) {
+                cmd.env(var, val);
+            }
+        }
+
+        // On Windows, npm/node need additional variables
         if cfg!(windows) {
             for var in &[
                 "APPDATA",
@@ -458,7 +473,6 @@ impl McpConnection {
                 "SystemRoot",
                 "TEMP",
                 "TMP",
-                "HOME",
                 "HOMEDRIVE",
                 "HOMEPATH",
             ] {
