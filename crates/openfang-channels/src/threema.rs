@@ -170,6 +170,7 @@ fn parse_threema_webhook(
         timestamp: Utc::now(),
         is_group: false, // Threema Gateway simple mode is 1:1
         thread_id: None,
+        attachments: vec![],
         metadata,
     })
 }

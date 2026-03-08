@@ -398,6 +398,7 @@ impl ChannelAdapter for ZulipAdapter {
                         timestamp: Utc::now(),
                         is_group,
                         thread_id: if !topic.is_empty() { Some(topic) } else { None },
+                        attachments: vec![],
                         metadata: {
                             let mut m = HashMap::new();
                             m.insert(

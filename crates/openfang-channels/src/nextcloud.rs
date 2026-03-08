@@ -370,6 +370,7 @@ impl ChannelAdapter for NextcloudAdapter {
                             timestamp: Utc::now(),
                             is_group: true,
                             thread_id: reference_id,
+                            attachments: vec![],
                             metadata: {
                                 let mut m = HashMap::new();
                                 m.insert(

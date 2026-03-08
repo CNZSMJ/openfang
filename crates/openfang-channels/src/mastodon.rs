@@ -257,6 +257,7 @@ fn parse_mastodon_notification(
         timestamp: Utc::now(),
         is_group: false, // Mentions are treated as DM-like interactions
         thread_id: in_reply_to,
+        attachments: vec![],
         metadata,
     })
 }

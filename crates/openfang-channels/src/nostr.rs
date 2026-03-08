@@ -348,6 +348,7 @@ impl ChannelAdapter for NostrAdapter {
                             timestamp: Utc::now(),
                             is_group: kind != 4, // DMs are 1:1, other kinds are public
                             thread_id: None,
+                            attachments: vec![],
                             metadata: {
                                 let mut m = HashMap::new();
                                 m.insert(

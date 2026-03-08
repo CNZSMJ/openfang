@@ -4035,6 +4035,7 @@ name = "openfang-kernel"
 version = "0.3.24"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "cron",
  "crossbeam",

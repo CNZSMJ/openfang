@@ -259,6 +259,7 @@ impl ChannelAdapter for WebhookAdapter {
                                     timestamp: Utc::now(),
                                     is_group,
                                     thread_id,
+                                    attachments: vec![],
                                     metadata,
                                 };
 

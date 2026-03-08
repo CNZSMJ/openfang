@@ -11,6 +11,7 @@ use dashmap::DashMap;
 use futures::StreamExt;
 use openfang_types::agent::AgentId;
 use openfang_types::config::{ChannelOverrides, DmPolicy, GroupPolicy, OutputFormat};
+use openfang_types::inbound::InboundMessage;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::watch;
@@ -24,6 +25,19 @@ use tracing::{debug, error, info, warn};
 pub trait ChannelBridgeHandle: Send + Sync {
     /// Send a message to an agent and get the text response.
     async fn send_message(&self, agent_id: AgentId, message: &str) -> Result<String, String>;
+
+    /// Send a rich inbound message to an agent and get the text response.
+    async fn send_message_rich(
+        &self,
+        agent_id: AgentId,
+        message: InboundMessage,
+    ) -> Result<String, String> {
+        if !message.attachments.is_empty() {
+            return Err("Rich message handling not implemented".to_string());
+        }
+        self.send_message(agent_id, message.text.as_deref().unwrap_or(""))
+            .await
+    }
 
     /// Find an agent by name, returning its ID.
     async fn find_agent_by_name(&self, name: &str) -> Result<Option<AgentId>, String>;
@@ -453,7 +467,7 @@ async fn dispatch_message(
             send_response(adapter, &message.sender, result, thread_id, output_format).await;
             return;
         }
-        _ => {
+        _ if message.attachments.is_empty() => {
             send_response(
                 adapter,
                 &message.sender,
@@ -464,6 +478,7 @@ async fn dispatch_message(
             .await;
             return;
         }
+        _ => String::new(),
     };
 
     // Check if it's a slash command embedded in text (e.g. "/agents")
@@ -649,7 +664,27 @@ async fn dispatch_message(
     let _ = adapter.send_typing(&message.sender).await;
 
     // Send to agent and relay response
-    match handle.send_message(agent_id, &text).await {
+    let mut inbound = InboundMessage {
+        text: if text.is_empty() { None } else { Some(text.clone()) },
+        attachments: message.attachments.clone(),
+        metadata: message.metadata.clone(),
+    };
+    inbound.metadata.insert(
+        "source_channel".to_string(),
+        serde_json::Value::String(ct_str.to_string()),
+    );
+    inbound.metadata.insert(
+        "sender_platform_id".to_string(),
+        serde_json::Value::String(message.sender.platform_id.clone()),
+    );
+
+    let result = if inbound.attachments.is_empty() {
+        handle.send_message(agent_id, &text).await
+    } else {
+        handle.send_message_rich(agent_id, inbound).await
+    };
+
+    match result {
         Ok(response) => {
             send_response(adapter, &message.sender, response, thread_id, output_format).await;
             handle

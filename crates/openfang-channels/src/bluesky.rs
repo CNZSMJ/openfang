@@ -331,6 +331,7 @@ fn parse_bluesky_notification(
         timestamp: Utc::now(),
         is_group: false, // Bluesky mentions are treated as direct interactions
         thread_id: None,
+        attachments: vec![],
         metadata,
     })
 }

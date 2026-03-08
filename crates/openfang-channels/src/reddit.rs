@@ -302,6 +302,7 @@ fn parse_reddit_comment(comment: &serde_json::Value, own_username: &str) -> Opti
         timestamp: Utc::now(),
         is_group: true, // Subreddit comments are inherently public/group
         thread_id: Some(subreddit),
+        attachments: vec![],
         metadata,
     })
 }

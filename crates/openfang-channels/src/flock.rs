@@ -226,6 +226,7 @@ fn parse_flock_event(event: &serde_json::Value, own_user_id: &str) -> Option<Cha
         timestamp: Utc::now(),
         is_group,
         thread_id: None,
+        attachments: vec![],
         metadata,
     })
 }

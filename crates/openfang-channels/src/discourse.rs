@@ -307,6 +307,7 @@ impl ChannelAdapter for DiscourseAdapter {
                         timestamp: Utc::now(),
                         is_group: true,
                         thread_id: Some(format!("topic-{}", topic_id)),
+                        attachments: vec![],
                         metadata: {
                             let mut m = HashMap::new();
                             m.insert(

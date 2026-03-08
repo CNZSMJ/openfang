@@ -537,6 +537,7 @@ async fn parse_discord_message(
         timestamp,
         is_group,
         thread_id: None,
+        attachments: vec![],
         metadata,
     })
 }

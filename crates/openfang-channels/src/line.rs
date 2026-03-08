@@ -322,6 +322,7 @@ fn parse_line_event(event: &serde_json::Value) -> Option<ChannelMessage> {
         timestamp: Utc::now(),
         is_group,
         thread_id: None,
+        attachments: vec![],
         metadata,
     })
 }

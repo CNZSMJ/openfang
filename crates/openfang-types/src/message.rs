@@ -88,8 +88,8 @@ pub enum ContentBlock {
 /// Allowed image media types.
 const ALLOWED_IMAGE_TYPES: &[&str] = &["image/png", "image/jpeg", "image/gif", "image/webp"];
 
-/// Maximum decoded image size (5 MB).
-const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
+/// Maximum decoded image size (10 MB).
+const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 
 /// Validate an image content block.
 ///

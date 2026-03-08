@@ -426,6 +426,7 @@ async fn parse_slack_event(
         timestamp,
         is_group: true,
         thread_id: None,
+        attachments: vec![],
         metadata: HashMap::new(),
     })
 }

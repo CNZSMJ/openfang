@@ -274,6 +274,7 @@ impl ChannelAdapter for NtfyAdapter {
                                                     timestamp: Utc::now(),
                                                     is_group: true,
                                                     thread_id: None,
+                                                    attachments: vec![],
                                                     metadata: {
                                                         let mut m = HashMap::new();
                                                         m.insert(

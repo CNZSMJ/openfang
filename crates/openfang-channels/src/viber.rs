@@ -293,6 +293,7 @@ fn parse_viber_event(event: &serde_json::Value) -> Option<ChannelMessage> {
         timestamp: Utc::now(),
         is_group: false, // Viber bot API messages are always 1:1
         thread_id: None,
+        attachments: vec![],
         metadata,
     })
 }

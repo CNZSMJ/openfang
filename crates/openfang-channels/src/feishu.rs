@@ -365,6 +365,7 @@ fn parse_feishu_event(event: &serde_json::Value) -> Option<ChannelMessage> {
         timestamp: Utc::now(),
         is_group,
         thread_id: root_id,
+        attachments: vec![],
         metadata,
     })
 }
@@ -485,6 +486,7 @@ impl ChannelAdapter for FeishuAdapter {
                                             timestamp: Utc::now(),
                                             is_group,
                                             thread_id: None,
+                                            attachments: vec![],
                                             metadata: HashMap::new(),
                                         };
 

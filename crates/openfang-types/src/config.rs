@@ -1531,10 +1531,15 @@ pub struct TelegramConfig {
     pub bot_token_env: String,
     /// Telegram user IDs allowed to interact (empty = allow all).
     pub allowed_users: Vec<i64>,
+    /// Telegram chat IDs allowed to interact (empty = allow all).
+    #[serde(default)]
+    pub allowed_chats: Vec<i64>,
     /// Default agent name to route messages to.
     pub default_agent: Option<String>,
     /// Polling interval in seconds.
     pub poll_interval_secs: u64,
+    /// Max Telegram image size to download per attachment.
+    pub max_image_bytes: u64,
     /// Per-channel behavior overrides.
     #[serde(default)]
     pub overrides: ChannelOverrides,
@@ -1545,8 +1550,10 @@ impl Default for TelegramConfig {
         Self {
             bot_token_env: "TELEGRAM_BOT_TOKEN".to_string(),
             allowed_users: vec![],
+            allowed_chats: vec![],
             default_agent: None,
             poll_interval_secs: 1,
+            max_image_bytes: crate::media::MAX_IMAGE_BYTES,
             overrides: ChannelOverrides::default(),
         }
     }

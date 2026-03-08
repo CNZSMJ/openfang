@@ -252,6 +252,7 @@ impl ChannelAdapter for TwitchAdapter {
                             timestamp: Utc::now(),
                             is_group: true, // Twitch channels are always group
                             thread_id: None,
+                            attachments: vec![],
                             metadata: HashMap::new(),
                         };
 

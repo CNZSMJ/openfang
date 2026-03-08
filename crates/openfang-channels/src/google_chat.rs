@@ -313,6 +313,7 @@ impl ChannelAdapter for GoogleChatAdapter {
                         timestamp: Utc::now(),
                         is_group,
                         thread_id: thread_name,
+                        attachments: vec![],
                         metadata: {
                             let mut m = HashMap::new();
                             m.insert(

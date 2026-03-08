@@ -202,6 +202,7 @@ fn parse_pumble_event(event: &serde_json::Value, own_bot_id: &str) -> Option<Cha
         timestamp: Utc::now(),
         is_group,
         thread_id: thread_ts,
+        attachments: vec![],
         metadata,
     })
 }

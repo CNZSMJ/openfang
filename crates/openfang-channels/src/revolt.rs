@@ -287,6 +287,7 @@ fn parse_revolt_message(
         timestamp: Utc::now(),
         is_group: true, // Revolt channels are inherently group-based
         thread_id: None,
+        attachments: vec![],
         metadata,
     })
 }

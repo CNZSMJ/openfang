@@ -213,6 +213,7 @@ fn parse_privmsg(line: &IrcLine, bot_nick: &str) -> Option<ChannelMessage> {
         timestamp: Utc::now(),
         is_group,
         thread_id: None,
+        attachments: vec![],
         metadata: HashMap::new(),
     })
 }
