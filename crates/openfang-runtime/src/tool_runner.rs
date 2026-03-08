@@ -409,13 +409,56 @@ pub async fn execute_tool(
         // Canvas / A2UI tool
         "canvas_present" => tool_canvas_present(input, workspace_root).await,
 
+        // Skill documentation tool
+        "skill_get_instructions" => {
+            let name = input["skill_name"].as_str().unwrap_or("");
+            if let Some(registry) = skill_registry {
+                if let Some(skill) = registry.get(name) {
+                    if let Some(ref ctx) = skill.manifest.prompt_context {
+                        Ok(ctx.clone())
+                    } else {
+                        Ok(format!("Skill '{}' has no additional instructions.", name))
+                    }
+                } else {
+                    Err(format!("Skill '{}' not found.", name))
+                }
+            } else {
+                Err("Skill registry not available.".to_string())
+            }
+        }
+
+        "skill_install" => {
+            let source = input["source"].as_str().unwrap_or("");
+            let scope = input["scope"].as_str();
+            if let Some(kh) = kernel {
+                kh.skill_install(source, caller_agent_id, scope).await
+            } else {
+                Err("Kernel handle not available for skill installation.".to_string())
+            }
+        }
+
+        "skill_create" => {
+            let name = input["name"].as_str().unwrap_or("");
+            let description = input["description"].as_str().unwrap_or("");
+            let prompt = input["prompt"].as_str().unwrap_or("");
+            let scope = input["scope"].as_str();
+            if let Some(kh) = kernel {
+                kh.skill_create(name, description, prompt, caller_agent_id, scope).await
+            } else {
+                Err("Kernel handle not available for skill creation.".to_string())
+            }
+        }
+
         other => {
             // Fallback 1: MCP tools (mcp_{server}_{tool} prefix)
             if mcp::is_mcp_tool(other) {
                 if let Some(mcp_conns) = mcp_connections {
                     if let Some(server_name) = mcp::extract_mcp_server(other) {
                         let mut conns = mcp_conns.lock().await;
-                        if let Some(conn) = conns.iter_mut().find(|c| c.name() == server_name) {
+                        if let Some(conn) = conns
+                            .iter_mut()
+                            .find(|c| mcp::normalize_name(c.name()) == server_name)
+                        {
                             debug!(
                                 tool = other,
                                 server = server_name,
@@ -796,6 +839,43 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     "prompt": { "type": "string", "description": "Optional prompt for vision analysis (e.g., 'Describe what you see')" }
                 },
                 "required": ["path"]
+            }),
+        },
+        ToolDefinition {
+            name: "skill_get_instructions".to_string(),
+            description: "Retrieve comprehensive rules and documentation for a specific skill. Use this when the skill summary is insufficient to understand how to use its tools effectively.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "skill_name": { "type": "string", "description": "The name of the skill to get instructions for" }
+                },
+                "required": ["skill_name"]
+            }),
+        },
+        ToolDefinition {
+            name: "skill_install".to_string(),
+            description: "Install a new skill. Source can be a FangHub slug ('agent-reach'), an arbitrary GitHub repo ('owner/repo'), a direct ZIP/TAR URL, or a local absolute directory path. Note: Use scope='workspace' for agent-specific tools, or 'global' (default) to make it available to the entire fleet in ~/.openfang/skills/.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "source": { "type": "string", "description": "The skill source (slug, owner/repo, URL, or local path)" },
+                    "scope": { "type": "string", "enum": ["global", "workspace"], "description": "Installation scope (default: global)" }
+                },
+                "required": ["source"]
+            }),
+        },
+        ToolDefinition {
+            name: "skill_create".to_string(),
+            description: "Install a new prompt-only skill natively by providing its prompt context. This is the preferred way to convert instructions from a webpage, document, or tweet into a reusable agent capability.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Name for the skill (lowercase, kebab-case, e.g. 'tweet-reviewer')" },
+                    "description": { "type": "string", "description": "A summary of what this skill adds to the agent fleet" },
+                    "prompt": { "type": "string", "description": "Detailed prompt context instructions captured from the source" },
+                    "scope": { "type": "string", "enum": ["global", "workspace"], "description": "Storage scope (default: global)" }
+                },
+                "required": ["name", "description", "prompt"]
             }),
         },
         // --- Location tool ---
