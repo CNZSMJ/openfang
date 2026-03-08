@@ -58,6 +58,14 @@ const MAX_LLM_IO_LOG_CHARS: usize = 50_000;
 
 /// Logging: Maximum characters for TOOL_RESULT in llm.log (kept small for readability).
 const MAX_TOOL_RESULT_LOG_CHARS: usize = 1000;
+/// Logging: Maximum characters for the rendered system prompt inside an INPUT entry.
+const MAX_SYSTEM_PROMPT_LOG_CHARS: usize = 32_000;
+/// Logging: Maximum characters reserved for rendered messages inside an INPUT entry.
+const MAX_MESSAGES_LOG_CHARS: usize = 12_000;
+/// Logging: Maximum characters for a plain-text message inside an INPUT entry.
+const MAX_MESSAGE_TEXT_LOG_CHARS: usize = 4_000;
+/// Logging: Maximum characters for a single block payload inside an INPUT entry.
+const MAX_BLOCK_TEXT_LOG_CHARS: usize = 1_500;
 
 /// Strip a provider prefix from a model ID before sending to the API.
 ///
@@ -377,10 +385,7 @@ pub async fn run_agent_loop_with_session_message(
         };
 
         // Log LLM Input
-        let input_log = format!(
-            "System: {}\n\nMessages: {:?}",
-            system_prompt, messages
-        );
+        let input_log = format_llm_input_log(&system_prompt, &messages);
         log_llm_event(workspace_root, "INPUT", &api_model, &input_log).await;
 
         // Notify phase: Thinking
@@ -1324,10 +1329,7 @@ pub async fn run_agent_loop_streaming(
         };
 
         // Log LLM Input (streaming)
-        let input_log = format!(
-            "System: {}\n\nMessages: {:?}",
-            system_prompt, messages
-        );
+        let input_log = format_llm_input_log(&system_prompt, &messages);
         log_llm_event(workspace_root, "INPUT", &api_model, &input_log).await;
 
         // Notify phase: Streaming (streaming variant always streams)
@@ -2097,6 +2099,122 @@ fn recover_text_tool_calls(text: &str, available_tools: &[ToolDefinition]) -> Ve
     }
 
     calls
+}
+
+fn format_llm_input_log(system_prompt: &str, messages: &[Message]) -> String {
+    let system_prompt_display = truncate_for_log(system_prompt, MAX_SYSTEM_PROMPT_LOG_CHARS);
+    let messages_display = format_messages_for_log(messages, MAX_MESSAGES_LOG_CHARS);
+    format!(
+        "System Prompt:\n{}\n\nMessages ({} total):\n{}",
+        system_prompt_display,
+        messages.len(),
+        messages_display
+    )
+}
+
+fn format_messages_for_log(messages: &[Message], max_chars: usize) -> String {
+    if messages.is_empty() {
+        return "[none]".to_string();
+    }
+
+    let mut rendered_rev = Vec::new();
+    let mut used_chars = 0usize;
+    let mut omitted = 0usize;
+
+    for (idx, message) in messages.iter().enumerate().rev() {
+        let rendered = format_message_for_log(idx, message);
+        let rendered_len = rendered.chars().count();
+        if !rendered_rev.is_empty() && used_chars + rendered_len > max_chars {
+            omitted = idx + 1;
+            break;
+        }
+        used_chars += rendered_len;
+        rendered_rev.push(rendered);
+    }
+
+    rendered_rev.reverse();
+    let mut out = String::new();
+    if omitted > 0 {
+        out.push_str(&format!(
+            "... [{} earlier message(s) omitted from log] ...\n\n",
+            omitted
+        ));
+    }
+    out.push_str(&rendered_rev.join("\n\n"));
+    out
+}
+
+fn format_message_for_log(index: usize, message: &Message) -> String {
+    let role = match message.role {
+        Role::System => "system",
+        Role::User => "user",
+        Role::Assistant => "assistant",
+    };
+
+    let content = match &message.content {
+        MessageContent::Text(text) => truncate_for_log(text, MAX_MESSAGE_TEXT_LOG_CHARS),
+        MessageContent::Blocks(blocks) => format_blocks_for_log(blocks),
+    };
+
+    format!("[#{index}] {role}\n{content}")
+}
+
+fn format_blocks_for_log(blocks: &[ContentBlock]) -> String {
+    if blocks.is_empty() {
+        return "[no blocks]".to_string();
+    }
+
+    let mut lines = Vec::with_capacity(blocks.len());
+    for (idx, block) in blocks.iter().enumerate() {
+        let line = match block {
+            ContentBlock::Text { text } => format!(
+                "- block[{idx}] text: {}",
+                truncate_for_log(text, MAX_BLOCK_TEXT_LOG_CHARS)
+            ),
+            ContentBlock::Image { media_type, data } => format!(
+                "- block[{idx}] image: media_type={media_type}, base64_chars={}",
+                data.len()
+            ),
+            ContentBlock::ToolUse { id, name, input } => format!(
+                "- block[{idx}] tool_use: id={id}, name={name}, input={}",
+                truncate_for_log(&input.to_string(), MAX_BLOCK_TEXT_LOG_CHARS)
+            ),
+            ContentBlock::ToolResult {
+                tool_use_id,
+                tool_name,
+                content,
+                is_error,
+            } => format!(
+                "- block[{idx}] tool_result: tool_use_id={tool_use_id}, tool_name={tool_name}, is_error={is_error}, content={}",
+                truncate_for_log(content, MAX_BLOCK_TEXT_LOG_CHARS)
+            ),
+            ContentBlock::Thinking { thinking } => format!(
+                "- block[{idx}] thinking: {}",
+                truncate_for_log(thinking, MAX_BLOCK_TEXT_LOG_CHARS)
+            ),
+            ContentBlock::Unknown => format!("- block[{idx}] unknown"),
+        };
+        lines.push(line);
+    }
+    lines.join("\n")
+}
+
+fn truncate_for_log(content: &str, max_chars: usize) -> String {
+    let char_count = content.chars().count();
+    if char_count <= max_chars {
+        return content.to_string();
+    }
+
+    let end = content
+        .char_indices()
+        .nth(max_chars)
+        .map(|(idx, _)| idx)
+        .unwrap_or(content.len());
+    format!(
+        "{}... [truncated, {} total chars]",
+        &content[..end],
+        char_count
+    )
 }
 
 /// Log an LLM event (input, output, or tool result) to the agent's workspace.

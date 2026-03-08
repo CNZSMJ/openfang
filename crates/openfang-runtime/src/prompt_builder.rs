@@ -4,6 +4,20 @@
 //! Replaces the scattered `push_str` prompt injection throughout the codebase
 //! with a single, testable, ordered prompt builder.
 
+
+/// Metadata for an installed skill, used for concise prompt injection.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct SkillInfo {
+    /// Unique skill name.
+    pub name: String,
+    /// One-line description of the skill.
+    pub description: String,
+    /// Tools provided by this skill.
+    pub provided_tools: Vec<String>,
+    /// Whether this skill has detailed prompt_context instructions.
+    pub has_prompt_context: bool,
+}
+
 /// All the context needed to build a system prompt for an agent.
 #[derive(Debug, Clone, Default)]
 pub struct PromptContext {
@@ -17,10 +31,8 @@ pub struct PromptContext {
     pub granted_tools: Vec<String>,
     /// Recalled memories as (key, content) pairs.
     pub recalled_memories: Vec<(String, String)>,
-    /// Skill summary text (from kernel.build_skill_summary()).
-    pub skill_summary: String,
-    /// Prompt context from prompt-only skills.
-    pub skill_prompt_context: String,
+    /// Installed and enabled skills for this agent.
+    pub skills: Vec<SkillInfo>,
     /// MCP server/tool summary text.
     pub mcp_summary: String,
     /// Agent workspace path.
@@ -98,11 +110,8 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
     sections.push(mem_section);
 
     // Section 5 — Skills (only if skills available)
-    if !ctx.skill_summary.is_empty() || !ctx.skill_prompt_context.is_empty() {
-        sections.push(build_skills_section(
-            &ctx.skill_summary,
-            &ctx.skill_prompt_context,
-        ));
+    if !ctx.skills.is_empty() {
+        sections.push(build_skills_section(&ctx.skills));
     }
 
     // Section 6 — MCP Servers (only if summary present)
@@ -294,17 +303,28 @@ pub fn build_memory_section(memories: &[(String, String)]) -> String {
     out
 }
 
-fn build_skills_section(skill_summary: &str, prompt_context: &str) -> String {
+fn build_skills_section(skills: &[SkillInfo]) -> String {
     let mut out = String::from("## Skills\n");
-    if !skill_summary.is_empty() {
-        out.push_str(
-            "You have installed skills. If a request matches a skill, use its tools directly.\n",
-        );
-        out.push_str(skill_summary.trim());
-    }
-    if !prompt_context.is_empty() {
-        out.push('\n');
-        out.push_str(&cap_str(prompt_context, 2000));
+    out.push_str("You have access to the following skills. If a request matches a skill, use its tools. \
+                  To see detailed rules or logic for any skill, call `skill_get_instructions(skill_name)`.\n\n");
+
+    for skill in skills {
+        let tools_hint = if skill.provided_tools.is_empty() {
+            String::new()
+        } else {
+            format!(" [tools: {}]", skill.provided_tools.join(", "))
+        };
+
+        let docs_hint = if skill.has_prompt_context {
+            " [manual available]"
+        } else {
+            ""
+        };
+
+        out.push_str(&format!(
+            "- **{}**: {}{}{}\n",
+            skill.name, skill.description, tools_hint, docs_hint
+        ));
     }
     out
 }
@@ -775,10 +795,18 @@ mod tests {
     #[test]
     fn test_skills_section_present() {
         let mut ctx = basic_ctx();
-        ctx.skill_summary = "- web-search: Search the web\n- git-expert: Git commands".to_string();
+        ctx.skills = vec![SkillInfo {
+            name: "web-search".to_string(),
+            description: "Search the web".to_string(),
+            provided_tools: vec!["mcp_brave_search".to_string()],
+            has_prompt_context: true,
+        }];
         let prompt = build_system_prompt(&ctx);
         assert!(prompt.contains("## Skills"));
         assert!(prompt.contains("web-search"));
+        assert!(prompt.contains("Search the web"));
+        assert!(prompt.contains("manual available"));
+        assert!(prompt.contains("skill_get_instructions"));
     }
 
     #[test]

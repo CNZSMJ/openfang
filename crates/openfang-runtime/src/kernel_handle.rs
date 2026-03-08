@@ -223,4 +223,28 @@ pub trait KernelHandle: Send + Sync {
         let _ = parent_caps;
         self.spawn_agent(manifest_toml, parent_id).await
     }
+
+    /// Install a skill from a remote source (FangHub/ClawHub), local directory, or URL.
+    async fn skill_install(
+        &self,
+        source: &str,
+        agent_id: Option<&str>,
+        scope: Option<&str>,
+    ) -> Result<String, String> {
+        let _ = (source, agent_id, scope);
+        Err("Skill system not available".to_string())
+    }
+
+    /// Create a new prompt-only skill scaffold.
+    async fn skill_create(
+        &self,
+        name: &str,
+        description: &str,
+        prompt: &str,
+        agent_id: Option<&str>,
+        scope: Option<&str>,
+    ) -> Result<String, String> {
+        let _ = (name, description, prompt, agent_id, scope);
+        Err("Skill system not available".to_string())
+    }
 }

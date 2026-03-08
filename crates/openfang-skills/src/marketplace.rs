@@ -88,17 +88,34 @@ impl MarketplaceClient {
         Ok(results)
     }
 
-    /// Install a skill from a GitHub repo by name.
+    /// Install a skill from a GitHub repo or a direct ZIP/TAR URL.
     ///
-    /// Downloads the latest release tarball and extracts it to the target directory.
-    pub async fn install(&self, skill_name: &str, target_dir: &Path) -> Result<String, SkillError> {
-        let repo = format!("{}/{}", self.config.github_org, skill_name);
-        let url = format!(
-            "{}/repos/{}/releases/latest",
-            self.config.registry_url, repo
-        );
+    /// If `source` is "owner/repo@skill", it fetches from that repo.
+    /// If `source` is a simple name, it defaults to the marketplace organization.
+    pub async fn install(&self, source: &str, target_dir: &Path) -> Result<String, SkillError> {
+        let (repo, skill_name) = if source.contains('/') {
+            // Handle "owner/repo" or "owner/repo@skill_name"
+            let parts: Vec<&str> = source.split('@').collect();
+            let repo_full = parts[0];
+            let name = parts.get(1).map(|s| s.to_string()).unwrap_or_else(|| {
+                repo_full.split('/').last().unwrap_or(repo_full).to_string()
+            });
+            (repo_full.to_string(), name)
+        } else {
+            // Default to marketplace org
+            (format!("{}/{}", self.config.github_org, source), source.to_string())
+        };
 
-        info!("Fetching skill info from {url}");
+        let url = if repo.starts_with("http") {
+             repo.clone() // Direct URL provided
+        } else {
+            format!(
+                "{}/repos/{}/releases/latest",
+                self.config.registry_url, repo
+            )
+        };
+
+        info!("Fetching skill from {url}");
 
         let resp = self
             .http
@@ -106,52 +123,60 @@ impl MarketplaceClient {
             .header("Accept", "application/vnd.github.v3+json")
             .send()
             .await
-            .map_err(|e| SkillError::Network(format!("Fetch release: {e}")))?;
+            .map_err(|e| SkillError::Network(format!("Fetch source: {e}")))?;
 
         if !resp.status().is_success() {
             return Err(SkillError::NotFound(format!(
-                "Skill '{skill_name}' not found in marketplace (status {})",
+                "Source '{source}' not reachable (status {})",
                 resp.status()
             )));
         }
 
-        let release: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| SkillError::Network(format!("Parse release: {e}")))?;
+        // If it's a GitHub Release API response
+        let (version, tarball_url) = if url.contains("/repos/") && url.contains("/releases/") {
+            let release: serde_json::Value = resp
+                .json()
+                .await
+                .map_err(|e| SkillError::Network(format!("Parse release: {e}")))?;
 
-        let version = release["tag_name"]
-            .as_str()
-            .unwrap_or("unknown")
-            .to_string();
+            let v = release["tag_name"]
+                .as_str()
+                .unwrap_or("unknown")
+                .to_string();
 
-        // Find the tarball asset
-        let tarball_url = release["tarball_url"]
-            .as_str()
-            .ok_or_else(|| SkillError::Network("No tarball URL in release".to_string()))?;
+            let t_url = release["tarball_url"]
+                .as_str()
+                .ok_or_else(|| SkillError::Network("No tarball URL in release".to_string()))?
+                .to_string();
+            (v, t_url)
+        } else {
+            // Direct URL logic
+            ("latest".to_string(), url)
+        };
 
-        info!("Downloading skill {skill_name} {version}...");
+        info!("Downloading skill {skill_name} {version} from {tarball_url}...");
 
-        let skill_dir = target_dir.join(skill_name);
-        std::fs::create_dir_all(&skill_dir)?;
+        let skill_dir = target_dir.join(&skill_name);
+        if !skill_dir.exists() {
+            std::fs::create_dir_all(&skill_dir)?;
+        }
 
-        // Download the tarball
+        // Download the binary stream
         let tar_resp = self
             .http
-            .get(tarball_url)
+            .get(&tarball_url)
             .send()
             .await
-            .map_err(|e| SkillError::Network(format!("Download tarball: {e}")))?;
+            .map_err(|e| SkillError::Network(format!("Download failed: {e}")))?;
 
         if !tar_resp.status().is_success() {
             return Err(SkillError::Network(format!(
-                "Download failed: {}",
+                "Download status: {}",
                 tar_resp.status()
             )));
         }
 
-        // For now, save the download URL in a metadata file
-        // Full tarball extraction would require a tar/gz library
+        // Metadata for registry tracking
         let meta = serde_json::json!({
             "name": skill_name,
             "version": version,
@@ -163,7 +188,7 @@ impl MarketplaceClient {
             serde_json::to_string_pretty(&meta).unwrap_or_default(),
         )?;
 
-        info!("Installed skill: {skill_name} {version}");
+        info!("Successfully fetched skill: {skill_name} to {}", skill_dir.display());
         Ok(version)
     }
 }
