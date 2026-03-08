@@ -278,7 +278,7 @@ fn ensure_workspace(workspace: &Path) -> KernelResult<()> {
     }
     // Write agent metadata file (best-effort)
     let meta = serde_json::json!({
-        "created_at": chrono::Utc::now().to_rfc3339(),
+        "created_at": chrono::Local::now().to_rfc3339(),
         "workspace": workspace.display().to_string(),
     });
     let _ = std::fs::write(
@@ -432,7 +432,7 @@ fn append_daily_memory_log(workspace: &Path, response: &str) {
     if trimmed.is_empty() {
         return;
     }
-    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let log_path = workspace.join("memory").join(format!("{today}.md"));
     // Security: cap total daily log to 1MB
     if let Ok(metadata) = std::fs::metadata(&log_path) {
@@ -442,7 +442,7 @@ fn append_daily_memory_log(workspace: &Path, response: &str) {
     }
     // Truncate long responses for the log (UTF-8 safe)
     let summary = openfang_types::truncate_str(trimmed, 500);
-    let timestamp = chrono::Utc::now().format("%H:%M:%S").to_string();
+    let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
