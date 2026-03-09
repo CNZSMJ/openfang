@@ -1,8 +1,8 @@
 //! Heartbeat monitor — detects unresponsive agents for 24/7 autonomous operation.
 //!
 //! The heartbeat monitor runs as a background tokio task, periodically checking
-//! each running agent's `last_active` timestamp. If an agent hasn't been active
-//! for longer than 2x its heartbeat interval, a `HealthCheckFailed` event is
+//! each running agent's last confirmed progress timestamp. If an agent hasn't
+//! made progress for longer than 2x its heartbeat interval, a `HealthCheckFailed` event is
 //! published to the event bus.
 
 use crate::registry::AgentRegistry;
@@ -63,7 +63,10 @@ pub fn check_agents(registry: &AgentRegistry, config: &HeartbeatConfig) -> Vec<H
             continue;
         }
 
-        let inactive_secs = (now - entry_ref.last_active).num_seconds();
+        let last_progress = registry
+            .last_progress_at(entry_ref.id)
+            .unwrap_or(entry_ref.last_active);
+        let inactive_secs = (now - last_progress).num_seconds();
 
         // Determine timeout: use agent's autonomous config if set, else default
         let timeout_secs = entry_ref
@@ -179,6 +182,58 @@ pub fn summarize(statuses: &[HeartbeatStatus]) -> HeartbeatSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry::AgentRegistry;
+    use chrono::Duration;
+    use openfang_types::agent::{
+        AgentEntry, AgentManifest, AgentMode, ManifestCapabilities, ModelConfig, Priority,
+        ResourceQuota, ScheduleMode, SessionId,
+    };
+    use std::collections::HashMap;
+
+    fn running_entry_with_last_active(name: &str, inactive_secs: i64) -> AgentEntry {
+        AgentEntry {
+            id: AgentId::new(),
+            name: name.to_string(),
+            manifest: AgentManifest {
+                name: name.to_string(),
+                version: "0.1.0".to_string(),
+                description: "test".to_string(),
+                author: "test".to_string(),
+                module: "builtin:chat".to_string(),
+                schedule: ScheduleMode::default(),
+                model: ModelConfig::default(),
+                fallback_models: vec![],
+                resources: ResourceQuota::default(),
+                priority: Priority::default(),
+                capabilities: ManifestCapabilities::default(),
+                profile: None,
+                tools: HashMap::new(),
+                skills: vec![],
+                mcp_servers: vec![],
+                metadata: HashMap::new(),
+                tags: vec![],
+                routing: None,
+                autonomous: None,
+                pinned_model: None,
+                workspace: None,
+                generate_identity_files: true,
+                exec_policy: None,
+                tool_allowlist: vec![],
+                tool_blocklist: vec![],
+            },
+            state: AgentState::Running,
+            mode: AgentMode::default(),
+            created_at: Utc::now(),
+            last_active: Utc::now() - Duration::seconds(inactive_secs),
+            parent: None,
+            children: vec![],
+            session_id: SessionId::new(),
+            tags: vec![],
+            identity: Default::default(),
+            onboarding_completed: false,
+            onboarding_completed_at: None,
+        }
+    }
 
     #[test]
     fn test_quiet_hours_parsing() {
@@ -241,5 +296,21 @@ mod tests {
         assert_eq!(summary.unresponsive, 1);
         assert_eq!(summary.unresponsive_agents.len(), 1);
         assert_eq!(summary.unresponsive_agents[0].name, "agent-2");
+    }
+
+    #[test]
+    fn test_check_agents_uses_recorded_progress() {
+        let registry = AgentRegistry::new();
+        let entry = running_entry_with_last_active("progress-agent", 120);
+        let id = entry.id;
+        registry.register(entry).unwrap();
+
+        let before = check_agents(&registry, &HeartbeatConfig::default());
+        assert!(before[0].unresponsive);
+
+        registry.record_progress(id).unwrap();
+
+        let after = check_agents(&registry, &HeartbeatConfig::default());
+        assert!(!after[0].unresponsive);
     }
 }

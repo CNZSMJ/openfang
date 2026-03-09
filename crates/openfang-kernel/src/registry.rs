@@ -1,6 +1,7 @@
 //! Agent registry — tracks all agents, their state, and indexes.
 
 use dashmap::DashMap;
+use chrono::{DateTime, Utc};
 use openfang_types::agent::{AgentEntry, AgentId, AgentMode, AgentState};
 use openfang_types::error::{OpenFangError, OpenFangResult};
 
@@ -8,6 +9,8 @@ use openfang_types::error::{OpenFangError, OpenFangResult};
 pub struct AgentRegistry {
     /// Primary index: agent ID → entry.
     agents: DashMap<AgentId, AgentEntry>,
+    /// Last confirmed forward progress in the agent execution loop.
+    progress_index: DashMap<AgentId, DateTime<Utc>>,
     /// Name index: human-readable name → agent ID.
     name_index: DashMap<String, AgentId>,
     /// Tag index: tag → list of agent IDs.
@@ -19,6 +22,7 @@ impl AgentRegistry {
     pub fn new() -> Self {
         Self {
             agents: DashMap::new(),
+            progress_index: DashMap::new(),
             name_index: DashMap::new(),
             tag_index: DashMap::new(),
         }
@@ -34,6 +38,7 @@ impl AgentRegistry {
         for tag in &entry.tags {
             self.tag_index.entry(tag.clone()).or_default().push(id);
         }
+        self.progress_index.insert(id, entry.last_active);
         self.agents.insert(id, entry);
         Ok(())
     }
@@ -72,12 +77,30 @@ impl AgentRegistry {
         Ok(())
     }
 
+    /// Record real forward progress for an agent request.
+    pub fn record_progress(&self, id: AgentId) -> OpenFangResult<()> {
+        let now = Utc::now();
+        self.progress_index.insert(id, now);
+        let mut entry = self
+            .agents
+            .get_mut(&id)
+            .ok_or_else(|| OpenFangError::AgentNotFound(id.to_string()))?;
+        entry.last_active = now;
+        Ok(())
+    }
+
+    /// Get the last recorded progress timestamp for an agent.
+    pub fn last_progress_at(&self, id: AgentId) -> Option<DateTime<Utc>> {
+        self.progress_index.get(&id).map(|e| *e.value())
+    }
+
     /// Remove an agent from the registry.
     pub fn remove(&self, id: AgentId) -> OpenFangResult<AgentEntry> {
         let (_, entry) = self
             .agents
             .remove(&id)
             .ok_or_else(|| OpenFangError::AgentNotFound(id.to_string()))?;
+        self.progress_index.remove(&id);
         self.name_index.remove(&entry.name);
         for tag in &entry.tags {
             if let Some(mut ids) = self.tag_index.get_mut(tag) {
@@ -405,5 +428,23 @@ mod tests {
         registry.register(entry).unwrap();
         registry.remove(id).unwrap();
         assert!(registry.get(id).is_none());
+    }
+
+    #[test]
+    fn test_record_progress_updates_last_active_without_changing_state() {
+        let registry = AgentRegistry::new();
+        let mut entry = test_entry("touchable");
+        entry.state = AgentState::Running;
+        let before = entry.last_active;
+        let id = entry.id;
+        registry.register(entry).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        registry.record_progress(id).unwrap();
+
+        let updated = registry.get(id).unwrap();
+        assert_eq!(updated.state, AgentState::Running);
+        assert!(updated.last_active > before);
+        assert_eq!(registry.last_progress_at(id), Some(updated.last_active));
     }
 }

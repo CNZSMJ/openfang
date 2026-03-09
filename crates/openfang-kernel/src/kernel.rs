@@ -1426,6 +1426,7 @@ impl OpenFangKernel {
         let entry = self.registry.get(agent_id).ok_or_else(|| {
             KernelError::OpenFang(OpenFangError::AgentNotFound(agent_id.to_string()))
         })?;
+        let _ = self.registry.record_progress(agent_id);
 
         // Dispatch based on module type
         let result = if entry.manifest.module.starts_with("wasm:") {
@@ -1712,13 +1713,26 @@ impl OpenFangKernel {
         let entry = self.registry.get(agent_id).ok_or_else(|| {
             KernelError::OpenFang(OpenFangError::AgentNotFound(agent_id.to_string()))
         })?;
+        let _ = self.registry.record_progress(agent_id);
+
+        let (runtime_tx, mut runtime_rx) = tokio::sync::mpsc::channel::<StreamEvent>(64);
+        let (client_tx, client_rx) = tokio::sync::mpsc::channel::<StreamEvent>(64);
+        let progress_kernel = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut client_open = true;
+            while let Some(event) = runtime_rx.recv().await {
+                let _ = progress_kernel.registry.record_progress(agent_id);
+                if client_open && client_tx.send(event).await.is_err() {
+                    client_open = false;
+                }
+            }
+        });
 
         let is_wasm = entry.manifest.module.starts_with("wasm:");
         let is_python = entry.manifest.module.starts_with("python:");
 
         // Non-LLM modules: execute non-streaming and emit results as stream events
         if is_wasm || is_python {
-            let (tx, rx) = tokio::sync::mpsc::channel::<StreamEvent>(64);
             let kernel_clone = Arc::clone(self);
             let message_owned = message.to_string();
             let entry_clone = entry.clone();
@@ -1737,12 +1751,12 @@ impl OpenFangKernel {
                 match result {
                     Ok(result) => {
                         // Emit the complete response as a single text delta
-                        let _ = tx
+                        let _ = runtime_tx
                             .send(StreamEvent::TextDelta {
                                 text: result.response.clone(),
                             })
                             .await;
-                        let _ = tx
+                        let _ = runtime_tx
                             .send(StreamEvent::ContentComplete {
                                 stop_reason: openfang_types::message::StopReason::EndTurn,
                                 usage: result.total_usage,
@@ -1764,7 +1778,7 @@ impl OpenFangKernel {
                 }
             });
 
-            return Ok((rx, handle));
+            return Ok((client_rx, handle));
         }
 
         // LLM agent: true streaming via agent loop
@@ -1815,7 +1829,6 @@ impl OpenFangKernel {
                 .map(|m| m.context_window as usize)
         });
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<StreamEvent>(64);
         let mut manifest = entry.manifest.clone();
 
         // Lazy backfill: create workspace for existing agents spawned before workspaces
@@ -1982,7 +1995,7 @@ impl OpenFangKernel {
             }
 
             // Create a phase callback that emits PhaseChange events to WS/SSE clients
-            let phase_tx = tx.clone();
+            let phase_tx = runtime_tx.clone();
             let phase_cb: openfang_runtime::agent_loop::PhaseCallback =
                 std::sync::Arc::new(move |phase| {
                     use openfang_runtime::agent_loop::LoopPhase;
@@ -2010,7 +2023,7 @@ impl OpenFangKernel {
                 driver,
                 &tools,
                 kernel_handle,
-                tx,
+                runtime_tx,
                 Some(&skill_snapshot),
                 Some(&kernel_clone.mcp_connections),
                 Some(&kernel_clone.web_ctx),
@@ -2095,7 +2108,7 @@ impl OpenFangKernel {
         // Store abort handle for cancellation support
         self.running_tasks.insert(agent_id, handle.abort_handle());
 
-        Ok((rx, handle))
+        Ok((client_rx, handle))
     }
 
     // -----------------------------------------------------------------------
@@ -2504,6 +2517,15 @@ impl OpenFangKernel {
             message.to_string()
         };
 
+        let progress_kernel = self.self_handle.get().and_then(|w| w.upgrade());
+        let phase_cb = progress_kernel.map(|kernel| {
+            let kernel = Arc::clone(&kernel);
+            std::sync::Arc::new(move |_phase| {
+                let _ = kernel.registry.record_progress(agent_id);
+            }) as openfang_runtime::agent_loop::PhaseCallback
+        });
+
+        let _ = self.registry.record_progress(agent_id);
         let result = run_agent_loop_with_session_message(
             &manifest,
             &message_with_links,
@@ -2519,7 +2541,7 @@ impl OpenFangKernel {
             Some(&self.browser_ctx),
             self.embedding_driver.as_deref(),
             manifest.workspace.as_deref(),
-            None, // on_phase callback
+            phase_cb.as_ref(),
             Some(&self.media_engine),
             if self.config.tts.enabled {
                 Some(&self.tts_engine)
