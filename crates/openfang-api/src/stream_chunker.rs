@@ -141,8 +141,13 @@ impl StreamChunker {
 
 /// Find the last occurrence of a pattern within a byte range.
 fn find_last_in_range(text: &str, pattern: &str, range: &std::ops::Range<usize>) -> Option<usize> {
-    let search_text = &text[range.start..range.end.min(text.len())];
-    search_text.rfind(pattern).map(|pos| range.start + pos)
+    let start = openfang_types::truncate_str(text, range.start).len();
+    let end = openfang_types::truncate_str(text, range.end.min(text.len())).len();
+    if start >= end {
+        return None;
+    }
+    let search_text = &text[start..end];
+    search_text.rfind(pattern).map(|pos| start + pos)
 }
 
 #[cfg(test)]
@@ -226,5 +231,12 @@ mod tests {
         let text = chunk.unwrap();
         // Should break at a sentence ending
         assert!(text.ends_with(". ") || text.ends_with(".\n"));
+    }
+
+    #[test]
+    fn test_find_last_in_range_is_utf8_safe() {
+        let text = "你好世界\n下一行";
+        let range = 5..13;
+        assert_eq!(find_last_in_range(text, "\n", &range), Some(12));
     }
 }

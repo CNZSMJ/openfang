@@ -100,7 +100,7 @@ pub async fn create_sandbox(
     let container_name = sanitize_container_name(&format!(
         "{}-{}",
         config.container_prefix,
-        &agent_id[..agent_id.len().min(8)]
+        openfang_types::truncate_str(agent_id, 8)
     ))?;
 
     let mut cmd = tokio::process::Command::new("docker");
@@ -206,7 +206,7 @@ pub async fn exec_in_sandbox(
     let stdout = if stdout.len() > max_output {
         format!(
             "{}... [truncated, {} total bytes]",
-            &stdout[..max_output],
+            openfang_types::truncate_str(&stdout, max_output),
             stdout.len()
         )
     } else {
@@ -215,7 +215,7 @@ pub async fn exec_in_sandbox(
     let stderr = if stderr.len() > max_output {
         format!(
             "{}... [truncated, {} total bytes]",
-            &stderr[..max_output],
+            openfang_types::truncate_str(&stderr, max_output),
             stderr.len()
         )
     } else {
@@ -545,6 +545,18 @@ mod tests {
         };
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.stdout, "hello");
+    }
+
+    #[test]
+    fn test_sanitized_container_name_handles_multibyte_agent_id() {
+        let config = DockerSandboxConfig::default();
+        let container_name = sanitize_container_name(&format!(
+            "{}-{}",
+            config.container_prefix,
+            openfang_types::truncate_str("交易助手-沪深300", 8)
+        ))
+        .expect("container name should be sanitized");
+        assert!(!container_name.is_empty());
     }
 
     // ── Container Pool tests ──────────────────────────────────────────

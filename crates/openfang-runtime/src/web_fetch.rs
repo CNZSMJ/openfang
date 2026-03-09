@@ -133,11 +133,12 @@ impl WebFetchEngine {
         };
 
         // Step 5: Truncate
-        let truncated = if processed.len() > self.config.max_chars {
+        let processed_chars = processed.chars().count();
+        let truncated = if processed_chars > self.config.max_chars {
+            let preview: String = processed.chars().take(self.config.max_chars).collect();
             format!(
                 "{}... [truncated, {} total chars]",
-                &processed[..self.config.max_chars],
-                processed.len()
+                preview, processed_chars
             )
         } else {
             processed
@@ -186,9 +187,7 @@ pub(crate) fn check_ssrf(url: &str) -> Result<(), String> {
     let host = extract_host(url);
     // For IPv6 bracket notation like [::1]:80, extract [::1] as hostname
     let hostname = if host.starts_with('[') {
-        host.find(']')
-            .map(|i| &host[..=i])
-            .unwrap_or(&host)
+        host.find(']').map(|i| &host[..=i]).unwrap_or(&host)
     } else {
         host.split(':').next().unwrap_or(&host)
     };
@@ -345,5 +344,18 @@ mod tests {
 
         let h3 = extract_host("http://[::1]/path");
         assert_eq!(h3, "[::1]:80");
+    }
+
+    #[test]
+    fn test_utf8_preview_truncation() {
+        let processed = "你好世界再见".to_string();
+        let max_chars = 4;
+        let processed_chars = processed.chars().count();
+        let preview: String = processed.chars().take(max_chars).collect();
+        let truncated = format!(
+            "{}... [truncated, {} total chars]",
+            preview, processed_chars
+        );
+        assert_eq!(truncated, "你好世界... [truncated, 6 total chars]");
     }
 }

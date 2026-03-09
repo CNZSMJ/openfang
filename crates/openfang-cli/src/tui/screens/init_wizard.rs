@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use crate::tui::theme;
 use openfang_runtime::model_catalog::ModelCatalog;
 use openfang_types::model_catalog::ModelTier;
+use openfang_types::truncate_str;
 
 // ── Provider metadata ──────────────────────────────────────────────────────
 
@@ -2029,7 +2030,7 @@ fn draw_routing_pick(f: &mut Frame, area: Rect, state: &mut State, tier: usize) 
                 .split('/')
                 .next_back()
                 .unwrap_or(&state.routing_models[t]);
-            let display = openfang_types::truncate_str(short, 14);
+            let display = truncate_str(short, 14);
             summary_spans.push(Span::styled(
                 format!("{name}:{display}"),
                 Style::default().fg(*c),

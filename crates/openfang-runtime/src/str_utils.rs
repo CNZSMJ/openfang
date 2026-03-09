@@ -7,15 +7,7 @@
 /// multi-byte characters (e.g. Chinese, emoji, accented Latin).
 #[inline]
 pub fn safe_truncate_str(s: &str, max_bytes: usize) -> &str {
-    if s.len() <= max_bytes {
-        return s;
-    }
-    let mut end = max_bytes;
-    // Walk backwards to the nearest char boundary
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
+    openfang_types::truncate_str(s, max_bytes)
 }
 
 #[cfg(test)]

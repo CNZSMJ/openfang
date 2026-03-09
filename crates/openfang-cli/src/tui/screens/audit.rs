@@ -274,7 +274,7 @@ pub fn draw(f: &mut Frame, area: Rect, state: &mut AuditState) {
                     Style::default().fg(theme::YELLOW)
                 };
                 let hash_short = if e.tip_hash.len() > 8 {
-                    &e.tip_hash[..8]
+                    openfang_types::truncate_str(&e.tip_hash, 8)
                 } else {
                     &e.tip_hash
                 };
@@ -341,6 +341,9 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}\u{2026}", openfang_types::truncate_str(s, max.saturating_sub(1)))
+        format!(
+            "{}\u{2026}",
+            openfang_types::truncate_str(s, max.saturating_sub(1))
+        )
     }
 }

@@ -207,7 +207,7 @@ pub fn validate_command_allowlist(command: &str, policy: &ExecPolicy) -> Result<
         }
         ExecSecurityMode::Full => {
             tracing::warn!(
-                command = &command[..command.len().min(100)],
+                command = openfang_types::truncate_str(command, 100),
                 "Shell exec in full mode — no restrictions"
             );
             Ok(())
@@ -715,6 +715,16 @@ mod tests {
             ..ExecPolicy::default()
         };
         assert!(validate_command_allowlist("rm -rf /", &policy).is_ok());
+    }
+
+    #[test]
+    fn test_full_mode_logging_is_utf8_safe() {
+        let policy = ExecPolicy {
+            mode: ExecSecurityMode::Full,
+            ..ExecPolicy::default()
+        };
+        let cmd = "python3 -c \"print('测试 stock_zh_index_hist_csindex (沪深300):')\"";
+        assert!(validate_command_allowlist(cmd, &policy).is_ok());
     }
 
     #[test]

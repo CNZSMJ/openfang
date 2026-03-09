@@ -278,7 +278,7 @@ fn describe_event(event: &Event) -> String {
                 tr.tool_id,
                 if tr.success { "succeeded" } else { "failed" },
                 tr.execution_time_ms,
-                &tr.content[..tr.content.len().min(200)]
+                openfang_types::truncate_str(&tr.content, 200)
             )
         }
         EventPayload::MemoryUpdate(delta) => {
@@ -461,6 +461,25 @@ mod tests {
         assert_eq!(engine.evaluate(&event).len(), 1);
         // Third should not
         assert_eq!(engine.evaluate(&event).len(), 0);
+    }
+
+    #[test]
+    fn test_describe_event_truncates_multibyte_tool_output_safely() {
+        let event = Event::new(
+            AgentId::new(),
+            EventTarget::Broadcast,
+            EventPayload::ToolResult(ToolOutput {
+                tool_id: "shell_exec".to_string(),
+                tool_use_id: "toolu_123".to_string(),
+                success: true,
+                content: "测试沪深300数据".repeat(40),
+                execution_time_ms: 12,
+            }),
+        );
+
+        let description = describe_event(&event);
+        assert!(description.contains("shell_exec"));
+        assert!(description.is_char_boundary(description.len()));
     }
 
     #[test]

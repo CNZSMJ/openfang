@@ -57,6 +57,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
+fn short_id(id: impl std::fmt::Display) -> String {
+    let id = id.to_string();
+    openfang_types::truncate_str(&id, 8).to_string()
+}
+
 /// Wraps `OpenFangKernel` to implement `ChannelBridgeHandle`.
 pub struct KernelBridgeAdapter {
     kernel: Arc<OpenFangKernel>,
@@ -365,7 +370,7 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
                 .map(|e| e.name.clone())
                 .unwrap_or_else(|| t.agent_id.to_string());
             let status = if t.enabled { "on" } else { "off" };
-            let id_short = &t.id.0.to_string()[..8];
+            let id_short = short_id(t.id.0);
             msg.push_str(&format!(
                 "  [{}] {} -> {} ({:?}) fires:{} [{}]\n",
                 id_short,
@@ -404,7 +409,7 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
             .kernel
             .triggers
             .register(agent.id, pattern, prompt.to_string(), 0);
-        let id_short = &trigger_id.0.to_string()[..8];
+        let id_short = short_id(trigger_id.0);
         format!("Trigger created [{id_short}] for agent '{agent_name}'.")
     }
 
@@ -419,7 +424,7 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
             1 => {
                 let t = matched[0];
                 if self.kernel.triggers.remove(t.id) {
-                    format!("Trigger [{}] removed.", &t.id.0.to_string()[..8])
+                    format!("Trigger [{}] removed.", short_id(t.id.0))
                 } else {
                     "Failed to remove trigger.".to_string()
                 }
@@ -442,7 +447,7 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
                 .map(|e| e.name.clone())
                 .unwrap_or_else(|| job.agent_id.to_string());
             let status = if job.enabled { "on" } else { "off" };
-            let id_short = &job.id.0.to_string()[..8];
+            let id_short = short_id(job.id.0);
             let sched = match &job.schedule {
                 openfang_types::scheduler::CronSchedule::Cron { expr, .. } => expr.clone(),
                 openfang_types::scheduler::CronSchedule::Every { every_secs } => {
@@ -502,7 +507,7 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
 
                 match self.kernel.cron_scheduler.add_job(job, false) {
                     Ok(id) => {
-                        let id_short = &id.0.to_string()[..8];
+                        let id_short = short_id(id.0);
                         format!("Job [{id_short}] created: '{cron_expr}' -> {agent_name}: \"{message}\"")
                     }
                     Err(e) => format!("Failed to create job: {e}"),
@@ -524,7 +529,7 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
                         let j = matched[0];
                         match self.kernel.cron_scheduler.remove_job(j.id) {
                             Ok(_) => {
-                                format!("Job [{}] '{}' removed.", &j.id.0.to_string()[..8], j.name)
+                                format!("Job [{}] '{}' removed.", short_id(j.id.0), j.name)
                             }
                             Err(e) => format!("Failed to remove job: {e}"),
                         }
@@ -556,7 +561,7 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
                         };
                         match self.kernel.send_message(j.agent_id, &message).await {
                             Ok(result) => {
-                                let id_short = &j.id.0.to_string()[..8];
+                                let id_short = short_id(j.id.0);
                                 format!("Job [{id_short}] ran:\n{}", result.response)
                             }
                             Err(e) => format!("Failed to run job: {e}"),
@@ -576,7 +581,7 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
         }
         let mut msg = format!("Pending approvals ({}):\n", pending.len());
         for req in &pending {
-            let id_short = &req.id.to_string()[..8];
+            let id_short = short_id(req.id);
             let age_secs = (chrono::Utc::now() - req.requested_at).num_seconds();
             let age = if age_secs >= 60 {
                 format!("{}m", age_secs / 60)
@@ -620,7 +625,7 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
                         format!(
                             "{} [{}] {} — {}",
                             verb,
-                            &req.id.to_string()[..8],
+                            short_id(req.id),
                             req.tool_name,
                             req.agent_id
                         )
