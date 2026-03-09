@@ -730,10 +730,10 @@ fn parse_telegram_update_metadata(
     })
 }
 
-fn select_telegram_photo<'a>(
-    photo_sizes: &'a [serde_json::Value],
+fn select_telegram_photo(
+    photo_sizes: &[serde_json::Value],
     max_image_bytes: u64,
-) -> Option<&'a serde_json::Value> {
+) -> Option<&serde_json::Value> {
     photo_sizes.iter().rev().find(|photo| {
         photo["file_size"]
             .as_u64()

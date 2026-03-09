@@ -269,7 +269,7 @@ mod tests {
 
     #[test]
     fn test_validate_image_too_large() {
-        let huge = "A".repeat(8_000_000); // ~6MB base64
+        let huge = "A".repeat(14_000_000); // exceeds 10MB decoded allowance
         let err = validate_image("image/png", &huge).unwrap_err();
         assert!(err.contains("too large"));
     }

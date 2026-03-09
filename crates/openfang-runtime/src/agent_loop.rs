@@ -2284,7 +2284,7 @@ async fn log_llm_event(
     if event_type == "TOOL_RESULT" || event_type == "OUTPUT" {
         let _ = write!(file, "\n{}\n", separator);
     } else {
-        let _ = write!(file, "\n");
+        let _ = writeln!(file);
     }
 }
 
