@@ -66,7 +66,7 @@ model = "gemini-3.1-flash-lite-preview"
 api_key_env = "GEMINI_API_KEY"
 
 [resources]
-max_llm_tokens_per_hour = 300000
+max_llm_tokens_per_hour = 30000000
 max_concurrent_tools = 10
 
 [capabilities]
