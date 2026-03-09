@@ -247,7 +247,7 @@ fn parse_messenger_entry(entry: &serde_json::Value) -> Vec<ChannelMessage> {
             timestamp: Utc::now(),
             is_group: false, // Messenger Bot API is always 1:1
             thread_id: None,
-        attachments: vec![],
+            attachments: vec![],
             metadata,
         });
     }
