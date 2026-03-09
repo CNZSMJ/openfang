@@ -2727,8 +2727,9 @@ decay_rate = 0.05
                             if healthy == total {
                                 if !json {
                                     ui::check_ok(&format!(
-                                    "Integration health: {healthy}/{total} healthy"
-                                ));
+                                        "Integration health: {healthy}/{total} healthy"
+                                    ));
+                                }
                             } else if !json {
                                 ui::check_warn(&format!(
                                     "Integration health: {healthy}/{total} healthy"
