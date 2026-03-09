@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+usage() {
+  echo "usage: $(basename "$0") <branch> [bucket-dir]" >&2
+}
+
+if [[ $# -lt 1 || $# -gt 2 ]]; then
+  usage
+  exit 1
+fi
+
+branch="$1"
+
+git_common_dir="$(git rev-parse --path-format=absolute --git-common-dir)"
+repo_root="$(dirname "$git_common_dir")"
+repo_parent="$(dirname "$repo_root")"
+bucket="${2:-$repo_parent/openfang-0.1.0}"
+dir_name="${branch//\//-}"
+target_dir="$bucket/$dir_name"
+
+git -C "$repo_root" worktree remove "$target_dir"
+git -C "$repo_root" branch -d "$branch"
+
+echo "Removed worktree:"
+echo "  branch: $branch"
+echo "  path:   $target_dir"

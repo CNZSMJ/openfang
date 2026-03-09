@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+usage() {
+  echo "usage: $(basename "$0") [head-branch] [base-branch]" >&2
+}
+
+if [[ $# -gt 2 ]]; then
+  usage
+  exit 1
+fi
+
+git_common_dir="$(git rev-parse --path-format=absolute --git-common-dir)"
+repo_root="$(dirname "$git_common_dir")"
+
+head_branch="${1:-$(git symbolic-ref --quiet --short HEAD)}"
+base_branch="${2:-custom/0.1.0}"
+
+if [[ -z "$head_branch" ]]; then
+  echo "Could not determine current branch." >&2
+  exit 1
+fi
+
+git -C "$repo_root" fetch origin "$base_branch" "$head_branch" >/dev/null 2>&1 || true
+
+gh pr create --base "$base_branch" --head "$head_branch" --fill
