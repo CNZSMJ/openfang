@@ -300,8 +300,8 @@ mod tests {
     #[tokio::test]
     async fn test_prompt_only_execution() {
         use crate::{
-            SkillManifest, SkillMeta, SkillRequirements, SkillRuntimeConfig, SkillToolDef,
-            SkillTools,
+            CommandInvoker, SkillCommandPolicy, SkillManifest, SkillMeta, SkillRequirements,
+            SkillRuntimeConfig, SkillToolDef, SkillTools,
         };
         use tempfile::TempDir;
 
@@ -324,6 +324,10 @@ mod tests {
                     name: "test_tool".to_string(),
                     description: "Test".to_string(),
                     input_schema: serde_json::json!({"type": "object"}),
+                    policy: SkillCommandPolicy {
+                        invoker: CommandInvoker::Model,
+                        ..Default::default()
+                    },
                 }],
             },
             requirements: SkillRequirements::default(),

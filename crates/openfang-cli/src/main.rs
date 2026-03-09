@@ -3338,10 +3338,11 @@ fn cmd_skill_list() {
     let skills_dir = home.join("skills");
 
     let mut registry = openfang_skills::registry::SkillRegistry::new(skills_dir);
+    let bundled = registry.load_bundled();
     match registry.load_all() {
-        Ok(0) => println!("No skills installed."),
+        Ok(0) if bundled == 0 => println!("No skills installed."),
         Ok(count) => {
-            println!("{count} skill(s) installed:\n");
+            println!("{} skill(s) available:\n", count + bundled);
             println!(
                 "{:<20} {:<10} {:<8} DESCRIPTION",
                 "NAME", "VERSION", "TOOLS"

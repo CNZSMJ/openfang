@@ -58,7 +58,10 @@ pub struct MessageResponse {
 /// Request to install a skill from the marketplace.
 #[derive(Debug, Deserialize)]
 pub struct SkillInstallRequest {
+    #[serde(default)]
     pub name: String,
+    #[serde(default)]
+    pub source: String,
 }
 
 /// Request to uninstall a skill.

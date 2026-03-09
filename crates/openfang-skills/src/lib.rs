@@ -12,9 +12,11 @@ pub mod clawhub;
 pub mod loader;
 pub mod marketplace;
 pub mod openclaw_compat;
+pub mod policy;
 pub mod registry;
 pub mod verify;
 
+pub use policy::{CommandDispatchMode, CommandInvoker, SkillCommandPolicy};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -77,6 +79,7 @@ pub enum SkillSource {
 
 /// A tool provided by a skill.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SkillToolDef {
     /// Tool name (must be unique).
     pub name: String,
@@ -84,6 +87,19 @@ pub struct SkillToolDef {
     pub description: String,
     /// JSON Schema for the tool input.
     pub input_schema: serde_json::Value,
+    /// Invocation and host-integration policy for the command.
+    pub policy: SkillCommandPolicy,
+}
+
+impl Default for SkillToolDef {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            description: String::new(),
+            input_schema: serde_json::json!({"type": "object"}),
+            policy: SkillCommandPolicy::default(),
+        }
+    }
 }
 
 /// Requirements declared by a skill.

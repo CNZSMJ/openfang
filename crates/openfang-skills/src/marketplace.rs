@@ -4,7 +4,8 @@
 //! Each skill is a GitHub repo with releases containing the skill bundle.
 
 use crate::SkillError;
-use std::path::Path;
+use std::io::Cursor;
+use std::path::{Component, Path, PathBuf};
 use tracing::info;
 
 /// FangHub registry configuration.
@@ -88,7 +89,7 @@ impl MarketplaceClient {
         Ok(results)
     }
 
-    /// Install a skill from a GitHub repo or a direct ZIP/TAR URL.
+    /// Install a skill from a GitHub repo or a direct ZIP URL.
     ///
     /// If `source` is "owner/repo@skill", it fetches from that repo.
     /// If `source` is a simple name, it defaults to the marketplace organization.
@@ -98,7 +99,11 @@ impl MarketplaceClient {
             let parts: Vec<&str> = source.split('@').collect();
             let repo_full = parts[0];
             let name = parts.get(1).map(|s| s.to_string()).unwrap_or_else(|| {
-                repo_full.split('/').last().unwrap_or(repo_full).to_string()
+                repo_full
+                    .split('/')
+                    .next_back()
+                    .unwrap_or(repo_full)
+                    .to_string()
             });
             (repo_full.to_string(), name)
         } else {
@@ -133,7 +138,7 @@ impl MarketplaceClient {
         }
 
         // If it's a GitHub Release API response
-        let (version, tarball_url) = if url.contains("/repos/") && url.contains("/releases/") {
+        let (version, archive_url) = if url.contains("/repos/") && url.contains("/releases/") {
             let release: serde_json::Value = resp
                 .json()
                 .await
@@ -144,43 +149,68 @@ impl MarketplaceClient {
                 .unwrap_or("unknown")
                 .to_string();
 
-            let t_url = release["tarball_url"]
+            let archive_url = release["zipball_url"]
                 .as_str()
-                .ok_or_else(|| SkillError::Network("No tarball URL in release".to_string()))?
+                .ok_or_else(|| SkillError::Network("No zipball URL in release".to_string()))?
                 .to_string();
-            (v, t_url)
+            (v, archive_url)
         } else {
-            // Direct URL logic
+            // Direct URL logic: currently only ZIP archives are supported.
+            if !url.to_ascii_lowercase().ends_with(".zip") {
+                return Err(SkillError::RuntimeNotAvailable(
+                    "Only ZIP archives are currently supported for direct URL skill installs."
+                        .to_string(),
+                ));
+            }
             ("latest".to_string(), url)
         };
 
-        info!("Downloading skill {skill_name} {version} from {tarball_url}...");
+        info!("Downloading skill {skill_name} {version} from {archive_url}...");
 
         let skill_dir = target_dir.join(&skill_name);
-        if !skill_dir.exists() {
-            std::fs::create_dir_all(&skill_dir)?;
+        if skill_dir.exists() {
+            return Err(SkillError::AlreadyInstalled(skill_name));
         }
+        std::fs::create_dir_all(&skill_dir)?;
 
-        // Download the binary stream
-        let tar_resp = self
+        // Download the archive bytes.
+        let archive_resp = self
             .http
-            .get(&tarball_url)
+            .get(&archive_url)
             .send()
             .await
-            .map_err(|e| SkillError::Network(format!("Download failed: {e}")))?;
+                .map_err(|e| SkillError::Network(format!("Download failed: {e}")))?;
 
-        if !tar_resp.status().is_success() {
+        if !archive_resp.status().is_success() {
             return Err(SkillError::Network(format!(
                 "Download status: {}",
-                tar_resp.status()
+                archive_resp.status()
             )));
+        }
+
+        let archive_bytes = archive_resp
+            .bytes()
+            .await
+            .map_err(|e| SkillError::Network(format!("Read archive bytes: {e}")))?;
+
+        extract_zip_archive(&archive_bytes, &skill_dir)?;
+
+        let manifest_path = skill_dir.join("skill.toml");
+        let skillmd_path = skill_dir.join("SKILL.md");
+        let package_json_path = skill_dir.join("package.json");
+        if !(manifest_path.exists() || skillmd_path.exists() || package_json_path.exists()) {
+            let _ = std::fs::remove_dir_all(&skill_dir);
+            return Err(SkillError::InvalidManifest(
+                "Archive did not contain skill.toml, SKILL.md, or package.json at the skill root."
+                    .to_string(),
+            ));
         }
 
         // Metadata for registry tracking
         let meta = serde_json::json!({
             "name": skill_name,
             "version": version,
-            "source": tarball_url,
+            "source": archive_url,
             "installed_at": chrono::Utc::now().to_rfc3339(),
         });
         std::fs::write(
@@ -190,6 +220,88 @@ impl MarketplaceClient {
 
         info!("Successfully fetched skill: {skill_name} to {}", skill_dir.display());
         Ok(version)
+    }
+}
+
+fn extract_zip_archive(bytes: &[u8], skill_dir: &Path) -> Result<(), SkillError> {
+    let reader = Cursor::new(bytes);
+    let mut archive = zip::ZipArchive::new(reader)
+        .map_err(|e| SkillError::InvalidManifest(format!("Open ZIP archive: {e}")))?;
+    let common_root = common_top_level_dir(&mut archive);
+
+    let mut extracted_any = false;
+    for i in 0..archive.len() {
+        let mut file = archive
+            .by_index(i)
+            .map_err(|e| SkillError::InvalidManifest(format!("Read ZIP entry: {e}")))?;
+        let entry_path = file
+            .enclosed_name()
+            .ok_or_else(|| SkillError::InvalidManifest("ZIP contains invalid path".to_string()))?;
+
+        let relative = strip_common_root(&entry_path, common_root.as_deref());
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+
+        let out_path = skill_dir.join(relative);
+        if file.is_dir() {
+            std::fs::create_dir_all(&out_path)?;
+            continue;
+        }
+
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut out = std::fs::File::create(&out_path)?;
+        std::io::copy(&mut file, &mut out)?;
+        extracted_any = true;
+    }
+
+    if !extracted_any {
+        return Err(SkillError::InvalidManifest(
+            "ZIP archive did not contain any extractable files.".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn common_top_level_dir<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+) -> Option<PathBuf> {
+    let mut root: Option<PathBuf> = None;
+    for i in 0..archive.len() {
+        let file = archive.by_index(i).ok()?;
+        let path = file.enclosed_name()?;
+        let mut components = path.components();
+        let first = match components.next() {
+            Some(Component::Normal(part)) => PathBuf::from(part),
+            _ => continue,
+        };
+        match &root {
+            Some(existing) if existing != &first => return None,
+            Some(_) => {}
+            None => root = Some(first),
+        }
+    }
+    root
+}
+
+fn strip_common_root(path: &Path, common_root: Option<&Path>) -> PathBuf {
+    let mut components = path.components();
+    if common_root.is_some() {
+        let _ = components.next();
+    }
+    let stripped: PathBuf = components
+        .filter_map(|component| match component {
+            Component::Normal(part) => Some(part),
+            _ => None,
+        })
+        .collect();
+    if stripped.as_os_str().is_empty() {
+        path.file_name().map(PathBuf::from).unwrap_or_default()
+    } else {
+        stripped
     }
 }
 

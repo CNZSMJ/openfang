@@ -503,26 +503,66 @@ pub async fn execute_tool(
             }
             // Fallback 2: Skill registry tool providers
             else if let Some(registry) = skill_registry {
-                if let Some(skill) = registry.find_tool_provider(other) {
-                    debug!(tool = other, skill = %skill.manifest.skill.name, "Dispatching to skill");
-                    match openfang_skills::loader::execute_skill_tool(
-                        &skill.manifest,
-                        &skill.path,
-                        other,
-                        input,
-                    )
-                    .await
-                    {
-                        Ok(skill_result) => {
-                            let content = serde_json::to_string(&skill_result.output)
-                                .unwrap_or_else(|_| skill_result.output.to_string());
-                            if skill_result.is_error {
-                                Err(content)
-                            } else {
-                                Ok(content)
+                if let Some((skill, tool_def)) = registry.find_tool_provider_with_def(other) {
+                    if !tool_def.policy.model_invocable() {
+                        Err(format!(
+                            "Skill command '{}' is not invocable by the model.",
+                            other
+                        ))
+                    } else if let Some(allowed) = allowed_tools {
+                        if let Some(missing) = tool_def
+                            .policy
+                            .host_tools
+                            .iter()
+                            .find(|required| !allowed.iter().any(|t| t == *required))
+                        {
+                            Err(format!(
+                                "Skill command '{}' requires unavailable host tool '{}'.",
+                                other, missing
+                            ))
+                        } else {
+                            debug!(tool = other, skill = %skill.manifest.skill.name, "Dispatching to skill");
+                            match openfang_skills::loader::execute_skill_tool(
+                                &skill.manifest,
+                                &skill.path,
+                                other,
+                                input,
+                            )
+                            .await
+                            {
+                                Ok(skill_result) => {
+                                    let content = serde_json::to_string(&skill_result.output)
+                                        .unwrap_or_else(|_| skill_result.output.to_string());
+                                    if skill_result.is_error {
+                                        Err(content)
+                                    } else {
+                                        Ok(content)
+                                    }
+                                }
+                                Err(e) => Err(format!("Skill execution failed: {e}")),
                             }
                         }
-                        Err(e) => Err(format!("Skill execution failed: {e}")),
+                    } else {
+                        debug!(tool = other, skill = %skill.manifest.skill.name, "Dispatching to skill");
+                        match openfang_skills::loader::execute_skill_tool(
+                            &skill.manifest,
+                            &skill.path,
+                            other,
+                            input,
+                        )
+                        .await
+                        {
+                            Ok(skill_result) => {
+                                let content = serde_json::to_string(&skill_result.output)
+                                    .unwrap_or_else(|_| skill_result.output.to_string());
+                                if skill_result.is_error {
+                                    Err(content)
+                                } else {
+                                    Ok(content)
+                                }
+                            }
+                            Err(e) => Err(format!("Skill execution failed: {e}")),
+                        }
                     }
                 } else {
                     Err(format!("Unknown tool: {other}"))

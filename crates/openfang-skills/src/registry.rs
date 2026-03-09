@@ -178,6 +178,25 @@ impl SkillRegistry {
                             continue;
                         }
                     }
+                } else if openclaw_compat::detect_openclaw_skill(&path) {
+                    match openclaw_compat::convert_openclaw_skill(&path) {
+                        Ok(manifest) => {
+                            info!(
+                                skill = %manifest.skill.name,
+                                "Auto-converting package.json skill to OpenFang format"
+                            );
+                            if let Err(e) =
+                                openclaw_compat::write_openfang_manifest(&path, &manifest)
+                            {
+                                warn!("Failed to write skill.toml for {}: {e}", path.display());
+                                continue;
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Failed to convert package.json skill at {}: {e}", path.display());
+                            continue;
+                        }
+                    }
                 } else {
                     continue;
                 }
@@ -270,16 +289,24 @@ impl SkillRegistry {
         self.skills.keys().cloned().collect()
     }
 
+    /// Find which skill and tool definition provide a given tool name.
+    pub fn find_tool_provider_with_def(
+        &self,
+        tool_name: &str,
+    ) -> Option<(&InstalledSkill, &SkillToolDef)> {
+        self.skills.values().filter(|s| s.enabled).find_map(|s| {
+            s.manifest
+                .tools
+                .provided
+                .iter()
+                .find(|t| t.name == tool_name)
+                .map(|tool| (s, tool))
+        })
+    }
+
     /// Find which skill provides a given tool name.
     pub fn find_tool_provider(&self, tool_name: &str) -> Option<&InstalledSkill> {
-        self.skills.values().find(|s| {
-            s.enabled
-                && s.manifest
-                    .tools
-                    .provided
-                    .iter()
-                    .any(|t| t.name == tool_name)
-        })
+        self.find_tool_provider_with_def(tool_name).map(|(skill, _)| skill)
     }
 
     /// Count installed skills.
@@ -547,6 +574,46 @@ input_schema = {{ type = "object" }}
         assert!(manifest.prompt_context.is_some());
 
         // Verify that skill.toml was written
+        assert!(skill_dir.join("skill.toml").exists());
+    }
+
+    #[test]
+    fn test_registry_auto_convert_openclaw_node_skill() {
+        let dir = TempDir::new().unwrap();
+
+        let skill_dir = dir.path().join("node-skill");
+        std::fs::create_dir_all(skill_dir.join("scripts")).unwrap();
+        std::fs::write(
+            skill_dir.join("package.json"),
+            r#"{
+                "name": "node-skill",
+                "version": "0.1.0",
+                "description": "Node-based OpenClaw skill",
+                "openclaw": {
+                    "tools": [
+                        {
+                            "name": "node_skill_run",
+                            "description": "Run the node skill",
+                            "input_schema": { "type": "object" }
+                        }
+                    ]
+                }
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(skill_dir.join("index.js"), "console.log('ok');").unwrap();
+        std::fs::write(skill_dir.join("scripts").join("helper.js"), "module.exports = () => 'ok';")
+            .unwrap();
+
+        let mut registry = SkillRegistry::new(dir.path().to_path_buf());
+        let count = registry.load_all().unwrap();
+        assert_eq!(count, 1, "Should auto-convert and load the Node skill");
+
+        let skill = registry.get("node-skill");
+        assert!(skill.is_some());
+        let manifest = &skill.unwrap().manifest;
+        assert_eq!(manifest.runtime.runtime_type, crate::SkillRuntime::Node);
+        assert_eq!(manifest.runtime.entry, "index.js");
         assert!(skill_dir.join("skill.toml").exists());
     }
 }

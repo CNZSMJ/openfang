@@ -2,13 +2,14 @@
 //!
 //! OpenClaw skills come in two formats:
 //! 1. **Node.js/TypeScript modules** — `package.json` + `index.js` (code skills)
-//! 2. **SKILL.md Markdown files** — YAML frontmatter + Markdown body (prompt-only skills)
+//! 2. **SKILL.md Markdown files** — optional YAML frontmatter + Markdown body
+//!    (prompt-only skills)
 //!
 //! This module detects both formats and converts them to OpenFang `SkillManifest`.
 
 use crate::{
-    SkillError, SkillManifest, SkillMeta, SkillRequirements, SkillRuntime, SkillRuntimeConfig,
-    SkillSource, SkillToolDef, SkillTools,
+    CommandDispatchMode, CommandInvoker, SkillCommandPolicy, SkillError, SkillManifest, SkillMeta,
+    SkillRequirements, SkillRuntime, SkillRuntimeConfig, SkillSource, SkillToolDef, SkillTools,
 };
 use openfang_types::tool_compat;
 use serde::Deserialize;
@@ -78,9 +79,13 @@ pub struct OpenClawCommand {
 #[serde(default, rename_all = "camelCase")]
 pub struct OpenClawDispatch {
     /// Whether the command can be invoked by users directly.
-    pub user_invocable: bool,
+    pub user_invocable: Option<bool>,
     /// Whether to prevent the model from invoking this command.
-    pub disable_model_invocation: bool,
+    pub disable_model_invocation: Option<bool>,
+    /// Preferred dispatch mode for the command.
+    pub command_dispatch: Option<String>,
+    /// Whether args should be passed through as raw text.
+    pub command_arg_mode: Option<String>,
 }
 
 /// Result of converting a SKILL.md into OpenFang format.
@@ -132,13 +137,15 @@ pub fn parse_skillmd(path: &Path) -> Result<(SkillMdFrontmatter, String), SkillE
 pub fn parse_skillmd_str(content: &str) -> Result<(SkillMdFrontmatter, String), SkillError> {
     // Handle both \r\n and \n line endings
     let content = content.replace("\r\n", "\n");
+    let trimmed = content.trim();
 
-    // Find the YAML frontmatter delimiters
-    let trimmed = content.trim_start();
+    if trimmed.is_empty() {
+        return Ok((SkillMdFrontmatter::default(), String::new()));
+    }
+
+    // Anthropic/Claude Code style skills may omit YAML frontmatter entirely.
     if !trimmed.starts_with("---") {
-        return Err(SkillError::YamlParse(
-            "SKILL.md must start with YAML frontmatter (---)".to_string(),
-        ));
+        return Ok((infer_frontmatter_from_body(trimmed), trimmed.to_string()));
     }
 
     // Find the closing ---
@@ -155,6 +162,32 @@ pub fn parse_skillmd_str(content: &str) -> Result<(SkillMdFrontmatter, String), 
         .map_err(|e| SkillError::YamlParse(format!("Invalid YAML frontmatter: {e}")))?;
 
     Ok((frontmatter, body))
+}
+
+fn infer_frontmatter_from_body(body: &str) -> SkillMdFrontmatter {
+    let mut frontmatter = SkillMdFrontmatter::default();
+
+    for line in body.lines().map(str::trim) {
+        if frontmatter.name.is_empty() {
+            if let Some(title) = line.strip_prefix("# ") {
+                if !title.trim().is_empty() {
+                    frontmatter.name = title.trim().to_string();
+                    continue;
+                }
+            }
+        }
+
+        if frontmatter.description.is_empty()
+            && !line.is_empty()
+            && !line.starts_with('#')
+            && !line.starts_with("```")
+        {
+            frontmatter.description = line.to_string();
+            break;
+        }
+    }
+
+    frontmatter
 }
 
 /// Full conversion of a SKILL.md directory to OpenFang format.
@@ -217,6 +250,7 @@ pub fn convert_skillmd(dir: &Path) -> Result<ConvertedSkillMd, SkillError> {
                         "input": { "type": "string", "description": "Input for the command" }
                     }
                 }),
+                policy: command_policy(cmd, &required_bins),
             });
         }
     }
@@ -316,6 +350,7 @@ pub fn convert_skillmd_str(name_hint: &str, content: &str) -> Result<ConvertedSk
                         "input": { "type": "string", "description": "Input for the command" }
                     }
                 }),
+                policy: command_policy(cmd, &required_bins),
             });
         }
     }
@@ -409,6 +444,14 @@ pub fn convert_openclaw_skill(dir: &Path) -> Result<SkillManifest, SkillError> {
                 },
                 "required": ["input"]
             }),
+            policy: SkillCommandPolicy {
+                invoker: CommandInvoker::Both,
+                dispatch_mode: CommandDispatchMode::ModelMediated,
+                requires_confirmation: false,
+                raw_arg_mode: false,
+                host_tools: vec!["shell_exec".to_string()],
+                host_capabilities: Vec::new(),
+            },
         }]
     };
 
@@ -451,11 +494,61 @@ fn extract_tools_from_openclaw_meta(meta: &serde_json::Value) -> Vec<SkillToolDe
                 name,
                 description,
                 input_schema,
+                policy: SkillCommandPolicy {
+                    invoker: CommandInvoker::Both,
+                    dispatch_mode: CommandDispatchMode::ModelMediated,
+                    requires_confirmation: false,
+                    raw_arg_mode: false,
+                    host_tools: vec!["shell_exec".to_string()],
+                    host_capabilities: Vec::new(),
+                },
             });
         }
     }
 
     tools
+}
+
+fn command_policy(cmd: &OpenClawCommand, required_bins: &[String]) -> SkillCommandPolicy {
+    let dispatch = cmd.dispatch.as_ref();
+    let user_invocable = dispatch.and_then(|d| d.user_invocable).unwrap_or(true);
+    let disable_model_invocation = dispatch
+        .and_then(|d| d.disable_model_invocation)
+        .unwrap_or(false);
+
+    let invoker = match (user_invocable, disable_model_invocation) {
+        (true, true) => CommandInvoker::User,
+        (true, false) => CommandInvoker::Both,
+        (false, true) => CommandInvoker::User,
+        (false, false) => CommandInvoker::Model,
+    };
+
+    let dispatch_mode = match dispatch
+        .and_then(|d| d.command_dispatch.as_deref())
+        .unwrap_or("model_mediated")
+    {
+        "direct" | "direct_tool" => CommandDispatchMode::DirectTool,
+        _ => CommandDispatchMode::ModelMediated,
+    };
+
+    let raw_arg_mode = matches!(
+        dispatch.and_then(|d| d.command_arg_mode.as_deref()),
+        Some("raw" | "raw_text" | "passthrough")
+    );
+
+    let mut host_tools = Vec::new();
+    if !required_bins.is_empty() {
+        host_tools.push("shell_exec".to_string());
+    }
+
+    SkillCommandPolicy {
+        invoker,
+        dispatch_mode,
+        requires_confirmation: false,
+        raw_arg_mode,
+        host_tools,
+        host_capabilities: Vec::new(),
+    }
 }
 
 /// Write an OpenFang skill.toml manifest for an OpenClaw skill.
@@ -585,13 +678,17 @@ Use the gh CLI to manage PRs and issues."#;
     }
 
     #[test]
-    fn test_parse_skillmd_missing_delimiters() {
+    fn test_parse_skillmd_without_frontmatter() {
         let dir = TempDir::new().unwrap();
-        std::fs::write(dir.path().join("SKILL.md"), "no frontmatter here").unwrap();
-        let result = parse_skillmd(&dir.path().join("SKILL.md"));
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("must start with YAML frontmatter"));
+        std::fs::write(
+            dir.path().join("SKILL.md"),
+            "# Plain Skill\n\nUse this skill without YAML frontmatter.",
+        )
+        .unwrap();
+        let (fm, body) = parse_skillmd(&dir.path().join("SKILL.md")).unwrap();
+        assert_eq!(fm.name, "Plain Skill");
+        assert_eq!(fm.description, "Use this skill without YAML frontmatter.");
+        assert!(body.contains("without YAML frontmatter"));
     }
 
     #[test]

@@ -21,6 +21,7 @@ Welcome to the OpenFang documentation. OpenFang is the open-source Agent Operati
 | [Agent Templates](agent-templates.md) | 30 pre-built agents across 4 performance tiers |
 | [Workflows](workflows.md) | Multi-agent pipelines with branching, fan-out, loops, and triggers |
 | [Security](security.md) | 16 defense-in-depth security systems |
+| [Skill Compatibility Architecture](skill-compatibility-architecture.md) | Proposed architecture for Anthropic and OpenClaw skill interoperability |
 
 ## Integrations
 

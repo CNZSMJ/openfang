@@ -13,6 +13,7 @@ use openfang_kernel::workflow::{
 use openfang_kernel::OpenFangKernel;
 use openfang_runtime::kernel_handle::KernelHandle;
 use openfang_runtime::tool_runner::builtin_tool_definitions;
+use openfang_skills::{SkillManifest, SkillMeta, SkillRuntime, SkillRuntimeConfig, SkillTools};
 use openfang_types::agent::{AgentId, AgentIdentity, AgentManifest};
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
@@ -2986,6 +2987,7 @@ pub async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl Into
 pub async fn list_skills(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let skills_dir = state.kernel.config.home_dir.join("skills");
     let mut registry = openfang_skills::registry::SkillRegistry::new(skills_dir);
+    let _ = registry.load_bundled();
     let _ = registry.load_all();
 
     let skills: Vec<serde_json::Value> = registry
@@ -3029,20 +3031,26 @@ pub async fn install_skill(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SkillInstallRequest>,
 ) -> impl IntoResponse {
-    let skills_dir = state.kernel.config.home_dir.join("skills");
-    let config = openfang_skills::marketplace::MarketplaceConfig::default();
-    let client = openfang_skills::marketplace::MarketplaceClient::new(config);
+    let source = if !req.source.trim().is_empty() {
+        req.source.trim()
+    } else {
+        req.name.trim()
+    };
+    if source.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Missing skill source or name"})),
+        );
+    }
 
-    match client.install(&req.name, &skills_dir).await {
-        Ok(version) => {
-            // Hot-reload so agents see the new skill immediately
-            state.kernel.reload_skills();
+    match state.kernel.skill_install(source, None, None).await {
+        Ok(message) => {
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
                     "status": "installed",
-                    "name": req.name,
-                    "version": version,
+                    "source": source,
+                    "message": message,
                 })),
             )
         }
@@ -3063,6 +3071,7 @@ pub async fn uninstall_skill(
 ) -> impl IntoResponse {
     let skills_dir = state.kernel.config.home_dir.join("skills");
     let mut registry = openfang_skills::registry::SkillRegistry::new(skills_dir);
+    let _ = registry.load_bundled();
     let _ = registry.load_all();
 
     match registry.remove(&req.name) {
@@ -7075,12 +7084,35 @@ pub async fn create_skill(
         );
     }
 
-    let toml_content = format!(
-        "[skill]\nname = \"{}\"\ndescription = \"{}\"\nruntime = \"prompt_only\"\n\n[prompt]\ncontext = \"\"\"\n{}\n\"\"\"\n",
-        name,
-        description.replace('"', "\\\""),
-        prompt_context
-    );
+    let manifest = SkillManifest {
+        skill: SkillMeta {
+            name: name.clone(),
+            version: "0.1.0".to_string(),
+            description: description.clone(),
+            author: String::new(),
+            license: String::new(),
+            tags: vec!["prompt-only".to_string()],
+        },
+        runtime: SkillRuntimeConfig {
+            runtime_type: SkillRuntime::PromptOnly,
+            entry: String::new(),
+        },
+        tools: SkillTools {
+            provided: Vec::new(),
+        },
+        requirements: Default::default(),
+        prompt_context: Some(prompt_context),
+        source: Some(openfang_skills::SkillSource::Native),
+    };
+    let toml_content = match toml::to_string_pretty(&manifest) {
+        Ok(content) => content,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Failed to serialize skill manifest: {e}")})),
+            );
+        }
+    };
 
     let toml_path = skill_dir.join("skill.toml");
     if let Err(e) = std::fs::write(&toml_path, &toml_content) {
@@ -7090,12 +7122,14 @@ pub async fn create_skill(
         );
     }
 
+    state.kernel.reload_skills();
+
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "status": "created",
             "name": name,
-            "note": "Restart the daemon to load the new skill, or it will be available on next boot."
+            "note": "Skill created and loaded."
         })),
     )
 }

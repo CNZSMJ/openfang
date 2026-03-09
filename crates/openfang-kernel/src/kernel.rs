@@ -4646,6 +4646,7 @@ impl OpenFangKernel {
     /// Get the list of tools available to an agent based on its capabilities.
     fn available_tools(&self, agent_id: AgentId) -> Vec<ToolDefinition> {
         let all_builtins = builtin_tool_definitions();
+        let mut skill_tool_names = std::collections::HashSet::new();
 
         // Look up agent entry for profile, skill/MCP allowlists, and capabilities
         let entry = self.registry.get(agent_id);
@@ -4680,19 +4681,38 @@ impl OpenFangKernel {
             _ => all_builtins,
         };
 
+        let caps = self.capabilities.list(agent_id);
+
         // Add skill-provided tools (filtered by agent's skill allowlist)
         let skill_tools = {
             let registry = self
                 .skill_registry
                 .read()
                 .unwrap_or_else(|e| e.into_inner());
-            if skill_allowlist.is_empty() {
+            let tools = if skill_allowlist.is_empty() {
                 registry.all_tool_definitions()
             } else {
                 registry.tool_definitions_for_skills(&skill_allowlist)
-            }
+            };
+            tools
+                .into_iter()
+                .filter(|tool| tool.policy.model_invocable())
+                .filter(|tool| {
+                    tool.policy
+                        .host_tools
+                        .iter()
+                        .all(|host_tool| {
+                            caps.iter().any(|c| match c {
+                                Capability::ToolAll => true,
+                                Capability::ToolInvoke(name) => name == host_tool || name == "*",
+                                _ => false,
+                            })
+                        })
+                })
+                .collect::<Vec<_>>()
         };
         for skill_tool in skill_tools {
+            skill_tool_names.insert(skill_tool.name.clone());
             all_tools.push(ToolDefinition {
                 name: skill_tool.name.clone(),
                 description: skill_tool.description.clone(),
@@ -4748,8 +4768,6 @@ impl OpenFangKernel {
             all_tools.retain(|t| t.name != "shell_exec");
         }
 
-        let caps = self.capabilities.list(agent_id);
-
         // If agent has ToolAll, return all tools
         if caps.iter().any(|c| matches!(c, Capability::ToolAll)) {
             return all_tools;
@@ -4762,6 +4780,9 @@ impl OpenFangKernel {
                 // MCP tools are already filtered by server allowlist earlier (lines 4614-4635).
                 // We allow them here if they are in the all_tools vector.
                 if tool.name.starts_with("mcp_") {
+                    return true;
+                }
+                if skill_tool_names.contains(&tool.name) {
                     return true;
                 }
 
@@ -4890,6 +4911,7 @@ impl OpenFangKernel {
                     .tools
                     .provided
                     .iter()
+                    .filter(|t| t.policy.model_invocable())
                     .map(|t| t.name.clone())
                     .collect(),
                 has_prompt_context: s
@@ -4977,7 +4999,23 @@ fn manifest_to_capabilities(manifest: &AgentManifest) -> Vec<Capability> {
 
     caps
 }
-
+fn copy_skill_dir_recursive(src: &Path, dest: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dest)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let entry_path = entry.path();
+        let dest_path = dest.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_skill_dir_recursive(&entry_path, &dest_path)?;
+        } else {
+            if let Some(parent) = dest_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(&entry_path, &dest_path)?;
+        }
+    }
+    Ok(())
+}
 /// Infer provider from a model name when catalog lookup fails.
 ///
 /// Uses well-known model name prefixes to map to the correct provider.
@@ -5608,13 +5646,13 @@ impl KernelHandle for OpenFangKernel {
                 if dest.exists() {
                     return Err(format!("Skill '{}' already exists at {}", name, dest.display()));
                 }
-                // Copy or symlink. For reliability across mounts, we'll try a simple directory copy logic
-                // but for this implementation we'll assume the OS can handle it.
-                // In a real OS we might want a recursive copy.
-                std::fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
-                // Minimal implementation: just tell the user we'd copy it. 
-                // In actual deployment we'd use fs_extra or manual recursion.
-                return Ok(format!("Local installation of '{}' to {} is ready (stub).", name, dest.display()));
+                copy_skill_dir_recursive(&src, &dest).map_err(|e| e.to_string())?;
+                self.reload_skills();
+                return Ok(format!(
+                    "Successfully installed local skill '{}' to {}.",
+                    name,
+                    if is_workspace { "workspace" } else { "global home" }
+                ));
             }
         }
 
@@ -5674,24 +5712,29 @@ impl KernelHandle for OpenFangKernel {
 
         std::fs::create_dir_all(&skill_path).map_err(|e| e.to_string())?;
 
-        // Write skill.toml
-        let toml_content = format!(
-            r#"[skill]
-name = "{name}"
-version = "0.1.0"
-description = "{description}"
-tags = ["prompt-only"]
-
-[runtime]
-type = "promptonly"
-entry = ""
-
-[tools]
-provided = []
-"#
-        );
+        let manifest = openfang_skills::SkillManifest {
+            skill: openfang_skills::SkillMeta {
+                name: name.to_string(),
+                version: "0.1.0".to_string(),
+                description: description.to_string(),
+                author: String::new(),
+                license: String::new(),
+                tags: vec!["prompt-only".to_string()],
+            },
+            runtime: openfang_skills::SkillRuntimeConfig {
+                runtime_type: openfang_skills::SkillRuntime::PromptOnly,
+                entry: String::new(),
+            },
+            tools: openfang_skills::SkillTools {
+                provided: Vec::new(),
+            },
+            requirements: openfang_skills::SkillRequirements::default(),
+            prompt_context: Some(prompt.to_string()),
+            source: Some(openfang_skills::SkillSource::Native),
+        };
+        let toml_content = toml::to_string_pretty(&manifest)
+            .map_err(|e| format!("Failed to serialize skill manifest: {e}"))?;
         std::fs::write(skill_path.join("skill.toml"), toml_content).map_err(|e| e.to_string())?;
-        std::fs::write(skill_path.join("prompt_context.md"), prompt).map_err(|e| e.to_string())?;
 
         self.reload_skills();
         Ok(format!(
