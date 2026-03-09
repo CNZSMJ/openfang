@@ -296,13 +296,42 @@ impl BridgeManager {
                     msg = stream.next() => {
                         match msg {
                             Some(message) => {
-                                dispatch_message(
-                                    &message,
-                                    &handle,
-                                    &router,
-                                    adapter_clone.as_ref(),
-                                    &rate_limiter,
-                                ).await;
+                                let message_id = message.platform_message_id.clone();
+                                let sender_platform_id = message.sender.platform_id.clone();
+                                let adapter_for_dispatch = adapter_clone.clone();
+                                let handle_for_dispatch = handle.clone();
+                                let router_for_dispatch = router.clone();
+                                let rate_limiter_for_dispatch = rate_limiter.clone();
+
+                                let dispatch_task = tokio::spawn(async move {
+                                    dispatch_message(
+                                        &message,
+                                        &handle_for_dispatch,
+                                        &router_for_dispatch,
+                                        adapter_for_dispatch.as_ref(),
+                                        &rate_limiter_for_dispatch,
+                                    )
+                                    .await;
+                                });
+
+                                if let Err(join_err) = dispatch_task.await {
+                                    if join_err.is_panic() {
+                                        error!(
+                                            adapter = adapter_clone.name(),
+                                            platform_message_id = %message_id,
+                                            sender_platform_id = %sender_platform_id,
+                                            "Channel dispatch panicked; dropping this message and keeping adapter alive"
+                                        );
+                                    } else {
+                                        warn!(
+                                            adapter = adapter_clone.name(),
+                                            platform_message_id = %message_id,
+                                            sender_platform_id = %sender_platform_id,
+                                            error = %join_err,
+                                            "Channel dispatch task failed unexpectedly"
+                                        );
+                                    }
+                                }
                             }
                             None => {
                                 info!("Channel adapter {} stream ended", adapter_clone.name());
@@ -422,7 +451,9 @@ async fn dispatch_message(
                 }
                 GroupPolicy::MentionOnly => {
                     // Only allow messages where the bot was @mentioned or commands.
-                    let was_mentioned = message.metadata.get("was_mentioned")
+                    let was_mentioned = message
+                        .metadata
+                        .get("was_mentioned")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
                     let is_command = matches!(&message.content, ChannelContent::Command { .. });
@@ -467,17 +498,26 @@ async fn dispatch_message(
             send_response(adapter, &message.sender, result, thread_id, output_format).await;
             return;
         }
-        ChannelContent::Image { ref url, ref caption } => {
+        ChannelContent::Image {
+            ref url,
+            ref caption,
+        } => {
             let desc = match caption {
                 Some(c) => format!("[User sent a photo: {url}]\nCaption: {c}"),
                 None => format!("[User sent a photo: {url}]"),
             };
             desc
         }
-        ChannelContent::File { ref url, ref filename } => {
+        ChannelContent::File {
+            ref url,
+            ref filename,
+        } => {
             format!("[User sent a file ({filename}): {url}]")
         }
-        ChannelContent::Voice { ref url, duration_seconds } => {
+        ChannelContent::Voice {
+            ref url,
+            duration_seconds,
+        } => {
             format!("[User sent a voice message ({duration_seconds}s): {url}]")
         }
         ChannelContent::Location { lat, lon } => {
@@ -669,7 +709,11 @@ async fn dispatch_message(
 
     // Send to agent and relay response
     let mut inbound = InboundMessage {
-        text: if text.is_empty() { None } else { Some(text.clone()) },
+        text: if text.is_empty() {
+            None
+        } else {
+            Some(text.clone())
+        },
         attachments: message.attachments.clone(),
         metadata: message.metadata.clone(),
     };
@@ -997,16 +1041,30 @@ async fn handle_command(
 mod tests {
     use super::*;
     use crate::types::ChannelType;
+    use futures::stream;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use tokio::time::{sleep, Duration};
 
     /// Mock kernel handle for testing.
     struct MockHandle {
         agents: Mutex<Vec<(AgentId, String)>>,
+        panic_on_calls: AtomicUsize,
     }
 
     #[async_trait]
     impl ChannelBridgeHandle for MockHandle {
         async fn send_message(&self, _agent_id: AgentId, message: &str) -> Result<String, String> {
+            if message == "panic please"
+                && self
+                    .panic_on_calls
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                        (remaining > 0).then_some(remaining - 1)
+                    })
+                    .is_ok()
+            {
+                panic!("mock panic while dispatching message");
+            }
             Ok(format!("Echo: {message}"))
         }
         async fn find_agent_by_name(&self, name: &str) -> Result<Option<AgentId>, String> {
@@ -1018,6 +1076,47 @@ mod tests {
         }
         async fn spawn_agent_by_name(&self, _manifest_name: &str) -> Result<AgentId, String> {
             Err("spawn not implemented in mock".to_string())
+        }
+    }
+
+    struct MockAdapter {
+        messages: Mutex<Option<Vec<ChannelMessage>>>,
+        sent: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl ChannelAdapter for MockAdapter {
+        fn name(&self) -> &str {
+            "mock"
+        }
+
+        fn channel_type(&self) -> ChannelType {
+            ChannelType::Telegram
+        }
+
+        async fn start(
+            &self,
+        ) -> Result<
+            std::pin::Pin<Box<dyn futures::Stream<Item = ChannelMessage> + Send>>,
+            Box<dyn std::error::Error>,
+        > {
+            let messages = self.messages.lock().unwrap().take().unwrap_or_default();
+            Ok(Box::pin(stream::iter(messages)))
+        }
+
+        async fn send(
+            &self,
+            _user: &ChannelUser,
+            content: ChannelContent,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            if let ChannelContent::Text(text) = content {
+                self.sent.lock().unwrap().push(text);
+            }
+            Ok(())
+        }
+
+        async fn stop(&self) -> Result<(), Box<dyn std::error::Error>> {
+            Ok(())
         }
     }
 
@@ -1042,6 +1141,7 @@ mod tests {
         let agent_id = AgentId::new();
         let mock = Arc::new(MockHandle {
             agents: Mutex::new(vec![(agent_id, "test-agent".to_string())]),
+            panic_on_calls: AtomicUsize::new(0),
         });
 
         let handle: Arc<dyn ChannelBridgeHandle> = mock;
@@ -1063,6 +1163,7 @@ mod tests {
         let agent_id = AgentId::new();
         let handle: Arc<dyn ChannelBridgeHandle> = Arc::new(MockHandle {
             agents: Mutex::new(vec![(agent_id, "coder".to_string())]),
+            panic_on_calls: AtomicUsize::new(0),
         });
         let router = Arc::new(AgentRouter::new());
         let sender = ChannelUser {
@@ -1083,6 +1184,7 @@ mod tests {
         let agent_id = AgentId::new();
         let handle: Arc<dyn ChannelBridgeHandle> = Arc::new(MockHandle {
             agents: Mutex::new(vec![(agent_id, "coder".to_string())]),
+            panic_on_calls: AtomicUsize::new(0),
         });
         let router = Arc::new(AgentRouter::new());
         let sender = ChannelUser {
@@ -1157,5 +1259,65 @@ mod tests {
             channel_type_str(&ChannelType::Custom("irc".to_string())),
             "irc"
         );
+    }
+
+    #[tokio::test]
+    async fn test_adapter_survives_dispatch_panic() {
+        let agent_id = AgentId::new();
+        let handle: Arc<dyn ChannelBridgeHandle> = Arc::new(MockHandle {
+            agents: Mutex::new(vec![(agent_id, "assistant".to_string())]),
+            panic_on_calls: AtomicUsize::new(1),
+        });
+        let router = Arc::new(AgentRouter::new());
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sender = ChannelUser {
+            platform_id: "user1".to_string(),
+            display_name: "Test".to_string(),
+            openfang_user: None,
+        };
+        let adapter: Arc<dyn ChannelAdapter> = Arc::new(MockAdapter {
+            messages: Mutex::new(Some(vec![
+                ChannelMessage {
+                    channel: ChannelType::Telegram,
+                    platform_message_id: "msg-1".to_string(),
+                    sender: sender.clone(),
+                    content: ChannelContent::Text("panic please".to_string()),
+                    target_agent: None,
+                    timestamp: chrono::Utc::now(),
+                    is_group: false,
+                    thread_id: None,
+                    attachments: Vec::new(),
+                    metadata: Default::default(),
+                },
+                ChannelMessage {
+                    channel: ChannelType::Telegram,
+                    platform_message_id: "msg-2".to_string(),
+                    sender: sender.clone(),
+                    content: ChannelContent::Text("still there?".to_string()),
+                    target_agent: None,
+                    timestamp: chrono::Utc::now(),
+                    is_group: false,
+                    thread_id: None,
+                    attachments: Vec::new(),
+                    metadata: Default::default(),
+                },
+            ])),
+            sent: Arc::clone(&sent),
+        });
+
+        let mut manager = BridgeManager::new(handle, router);
+        manager.start_adapter(adapter).await.unwrap();
+
+        for _ in 0..20 {
+            if sent.lock().unwrap().len() >= 1 {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        manager.stop().await;
+
+        let sent = sent.lock().unwrap().clone();
+        assert_eq!(sent, vec!["Echo: still there?".to_string()]);
     }
 }
