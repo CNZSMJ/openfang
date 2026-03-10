@@ -1908,19 +1908,6 @@ impl OpenFangKernel {
                 .flatten()
                 .and_then(|v| v.as_str().map(String::from));
 
-            let peer_agents: Vec<(String, String, String)> = self
-                .registry
-                .list()
-                .iter()
-                .map(|a| {
-                    (
-                        a.name.clone(),
-                        format!("{:?}", a.state),
-                        a.manifest.model.model.clone(),
-                    )
-                })
-                .collect();
-
             let is_subagent = manifest
                 .metadata
                 .get("is_subagent")
@@ -1947,10 +1934,6 @@ impl OpenFangKernel {
                     .workspace
                     .as_ref()
                     .and_then(|w| read_identity_file(w, "USER.md")),
-                memory_md: manifest
-                    .workspace
-                    .as_ref()
-                    .and_then(|w| read_identity_file(w, "MEMORY.md")),
                 canonical_context: self
                     .memory
                     .canonical_context(agent_id, None)
@@ -1993,8 +1976,11 @@ impl OpenFangKernel {
                 } else {
                     None
                 },
-                peer_agents,
-                current_date: Some(chrono::Local::now().format("%A, %B %d, %Y (%Y-%m-%d %H:%M %Z)").to_string()),
+                current_date: Some(
+                    chrono::Local::now()
+                        .format("%A, %B %d, %Y (%Y-%m-%d)")
+                        .to_string(),
+                ),
             };
             manifest.model.system_prompt =
                 openfang_runtime::prompt_builder::build_system_prompt(&prompt_ctx);
@@ -2407,19 +2393,6 @@ impl OpenFangKernel {
                 .flatten()
                 .and_then(|v| v.as_str().map(String::from));
 
-            let peer_agents: Vec<(String, String, String)> = self
-                .registry
-                .list()
-                .iter()
-                .map(|a| {
-                    (
-                        a.name.clone(),
-                        format!("{:?}", a.state),
-                        a.manifest.model.model.clone(),
-                    )
-                })
-                .collect();
-
             let is_subagent = manifest
                 .metadata
                 .get("is_subagent")
@@ -2446,10 +2419,6 @@ impl OpenFangKernel {
                     .workspace
                     .as_ref()
                     .and_then(|w| read_identity_file(w, "USER.md")),
-                memory_md: manifest
-                    .workspace
-                    .as_ref()
-                    .and_then(|w| read_identity_file(w, "MEMORY.md")),
                 canonical_context: self
                     .memory
                     .canonical_context(agent_id, None)
@@ -2492,8 +2461,11 @@ impl OpenFangKernel {
                 } else {
                     None
                 },
-                peer_agents,
-                current_date: Some(chrono::Local::now().format("%A, %B %d, %Y (%Y-%m-%d %H:%M %Z)").to_string()),
+                current_date: Some(
+                    chrono::Local::now()
+                        .format("%A, %B %d, %Y (%Y-%m-%d)")
+                        .to_string(),
+                ),
             };
             manifest.model.system_prompt =
                 openfang_runtime::prompt_builder::build_system_prompt(&prompt_ctx);

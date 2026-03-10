@@ -125,16 +125,19 @@ impl WorkspaceContext {
 
     /// Build a prompt context section summarizing the workspace.
     pub fn build_context_section(&mut self) -> String {
-        let mut parts = Vec::new();
+        let mut parts = vec![
+            "## Workspace Context".to_string(),
+            format!("- Workspace root: {}", self.workspace_root.display()),
+            "- Run file and shell work inside this workspace unless the user explicitly asks otherwise.".to_string(),
+            "- For substantial tasks, create or choose a dedicated subdirectory in this workspace before generating task-specific files.".to_string(),
+        ];
 
-        parts.push(format!(
-            "## Workspace Context\n- Project: {} ({})",
-            self.workspace_root
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "workspace".to_string()),
-            self.project_type.label(),
-        ));
+        if self.project_type != ProjectType::Unknown {
+            parts.push(format!(
+                "- Detected project type: {}",
+                self.project_type.label()
+            ));
+        }
 
         if self.is_git_repo {
             parts.push("- Git repository: yes".to_string());
@@ -383,8 +386,10 @@ mod tests {
 
         let mut ctx = WorkspaceContext::detect(&dir);
         let section = ctx.build_context_section();
+        assert!(section.contains("Workspace root:"));
         assert!(section.contains("Rust"));
         assert!(section.contains("Git repository: yes"));
+        assert!(section.contains("dedicated subdirectory"));
         assert!(section.contains("cargo build"));
         assert!(section.contains("cargo test"));
         assert!(!section.contains("SOUL.md"));
