@@ -616,6 +616,7 @@ impl StandaloneChat {
                 event::spawn_daemon_agent(
                     base_url.to_string(),
                     t.content.clone(),
+                    t.scaffold.clone(),
                     self.event_tx.clone(),
                 );
                 self.chat.status_msg = Some(format!("Spawning '{}' agent\u{2026}", t.name));
@@ -669,7 +670,7 @@ impl StandaloneChat {
                         }
                     };
                 let name = manifest.name.clone();
-                match kernel.spawn_agent(manifest) {
+                match kernel.spawn_agent_with_scaffold(manifest, t.scaffold.clone()) {
                     Ok(id) => {
                         self.enter_chat_inprocess(id, name);
                     }

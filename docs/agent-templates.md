@@ -1,6 +1,11 @@
 # Agent Templates Catalog
 
-OpenFang ships with **30 pre-built agent templates** organized into 4 performance tiers. Each template is a ready-to-spawn `agent.toml` manifest located in the `agents/` directory. Templates cover software engineering, business operations, personal productivity, and everyday tasks.
+OpenFang ships with **30 pre-built agent templates** organized into 4 performance tiers. 每个模板现在不再只是单个 `agent.toml`，而是一个模板目录：
+
+- 一个较薄的 `agent.toml`
+- 一组 companion prompt files，例如 `AGENTS.md`、`SOUL.md`、`IDENTITY.md`、`USER.md`、`TOOLS.md`、`MEMORY.md`、`BOOTSTRAP.md`
+
+这些文件位于 `agents/<template-name>/` 下，由 CLI / API / dashboard 的创建路径一并加载并写入新 agent workspace。模板覆盖软件工程、业务运营、个人效率和日常助手场景。
 
 ## Quick Start
 
@@ -26,6 +31,20 @@ curl -X POST http://localhost:4200/api/agents \
   -d '{"template": "writer", "model": "gemini-2.5-flash"}'
 ```
 
+创建链路的当前实现：
+
+1. CLI / API 读取 `agents/<name>/agent.toml`
+2. 同时尝试读取同目录下的 companion markdown scaffold
+3. spawn 时把 scaffold 一并传给 kernel
+4. kernel 优先用 scaffold 写入新 workspace 文件
+
+相关代码：
+
+- [crates/openfang-cli/src/templates.rs](/Users/jiahaohuang/workspace_ai/openfang-0.1.0/feature-cyber-soul/crates/openfang-cli/src/templates.rs)
+- [crates/openfang-cli/src/bundled_agents.rs](/Users/jiahaohuang/workspace_ai/openfang-0.1.0/feature-cyber-soul/crates/openfang-cli/src/bundled_agents.rs)
+- [crates/openfang-api/src/routes.rs](/Users/jiahaohuang/workspace_ai/openfang-0.1.0/feature-cyber-soul/crates/openfang-api/src/routes.rs)
+- [crates/openfang-kernel/src/kernel.rs](/Users/jiahaohuang/workspace_ai/openfang-0.1.0/feature-cyber-soul/crates/openfang-kernel/src/kernel.rs)
+
 Send a message to a running agent:
 
 ```bash
@@ -35,6 +54,48 @@ curl -X POST http://localhost:4200/api/agents/{id}/message \
 ```
 
 ---
+
+## 模板文件结构
+
+一个完整模板目录当前建议包含：
+
+```text
+agents/<template-name>/
+├── agent.toml
+├── AGENTS.md
+├── SOUL.md
+├── IDENTITY.md
+├── USER.md
+├── TOOLS.md
+├── MEMORY.md
+└── BOOTSTRAP.md
+```
+
+其中：
+
+- `agent.toml` 只保留顶层身份、模型、能力和薄 `system_prompt`
+- `AGENTS.md` 承担行为规则与边界
+- `SOUL.md` 承担人格、语气与价值观
+- `IDENTITY.md` 承担稳定身份锚点
+- `USER.md` / `TOOLS.md` / `MEMORY.md` 提供用户、环境和长期记忆入口
+- `BOOTSTRAP.md` 只在首次运行时条件注入
+
+注意：
+
+- 若 `USER.md` / `TOOLS.md` 仍然只是默认空壳模板，运行时 prompt builder 可能会跳过它们的注入
+- 因此模板作者不应把高优先级规则仅写在这两个文件里
+
+## 当前基准模板
+
+`assistant` 是当前已经完成迁移的基准模板：
+
+- [agents/assistant/agent.toml](/Users/jiahaohuang/workspace_ai/openfang-0.1.0/feature-cyber-soul/agents/assistant/agent.toml)
+- [agents/assistant/AGENTS.md](/Users/jiahaohuang/workspace_ai/openfang-0.1.0/feature-cyber-soul/agents/assistant/AGENTS.md)
+- [agents/assistant/SOUL.md](/Users/jiahaohuang/workspace_ai/openfang-0.1.0/feature-cyber-soul/agents/assistant/SOUL.md)
+- [agents/assistant/IDENTITY.md](/Users/jiahaohuang/workspace_ai/openfang-0.1.0/feature-cyber-soul/agents/assistant/IDENTITY.md)
+- [agents/assistant/BOOTSTRAP.md](/Users/jiahaohuang/workspace_ai/openfang-0.1.0/feature-cyber-soul/agents/assistant/BOOTSTRAP.md)
+
+后续模板迁移建议优先对齐这一套结构，而不是继续扩大 `system_prompt`。
 
 ## Template Tiers
 

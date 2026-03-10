@@ -288,13 +288,27 @@ fn ensure_workspace(workspace: &Path) -> KernelResult<()> {
     Ok(())
 }
 
+fn scaffold_override(
+    scaffold: Option<&AgentScaffold>,
+    pick: impl FnOnce(&AgentScaffold) -> Option<&String>,
+) -> Option<String> {
+    scaffold
+        .and_then(pick)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// Generate workspace identity files for an agent (SOUL.md, USER.md, TOOLS.md, MEMORY.md).
 /// Uses `create_new` to never overwrite existing files (preserves user edits).
-fn generate_identity_files(workspace: &Path, manifest: &AgentManifest) {
+fn generate_identity_files(
+    workspace: &Path,
+    manifest: &AgentManifest,
+    scaffold: Option<&AgentScaffold>,
+) {
     use std::fs::OpenOptions;
     use std::io::Write;
 
-    let soul_content = format!(
+    let default_soul_content = format!(
         "# Soul\n\
          You are {}. {}\n\
          Be genuinely helpful. Have opinions. Be resourceful before asking.\n\
@@ -306,20 +320,31 @@ fn generate_identity_files(workspace: &Path, manifest: &AgentManifest) {
             &manifest.description
         }
     );
+    let soul_content =
+        scaffold_override(scaffold, |s| s.soul_md.as_ref()).unwrap_or(default_soul_content);
 
-    let user_content = "# User\n\
+    let default_user_content = "# User\n\
          <!-- Updated by the agent as it learns about the user -->\n\
          - Name:\n\
          - Timezone:\n\
-         - Preferences:\n";
+         - Preferences:\n"
+        .to_string();
+    let user_content =
+        scaffold_override(scaffold, |s| s.user_md.as_ref()).unwrap_or(default_user_content);
 
-    let tools_content = "# Tools & Environment\n\
-         <!-- Agent-specific environment notes (not synced) -->\n";
+    let default_tools_content = "# Tools & Environment\n\
+         <!-- Agent-specific environment notes (not synced) -->\n"
+        .to_string();
+    let tools_content =
+        scaffold_override(scaffold, |s| s.tools_md.as_ref()).unwrap_or(default_tools_content);
 
-    let memory_content = "# Long-Term Memory\n\
-         <!-- Curated knowledge the agent preserves across sessions -->\n";
+    let default_memory_content = "# Long-Term Memory\n\
+         <!-- Curated knowledge the agent preserves across sessions -->\n"
+        .to_string();
+    let memory_content =
+        scaffold_override(scaffold, |s| s.memory_md.as_ref()).unwrap_or(default_memory_content);
 
-    let agents_content = "# Agent Behavioral Guidelines\n\n\
+    let default_agents_content = "# Agent Behavioral Guidelines\n\n\
          ## Core Principles\n\
          - Act first, narrate second. Use tools to accomplish tasks rather than describing what you'd do.\n\
          - Batch tool calls when possible \u{2014} don't output reasoning between each call.\n\
@@ -335,9 +360,12 @@ fn generate_identity_files(workspace: &Path, manifest: &AgentManifest) {
          - Lead with the answer or result, not process narration.\n\
          - Keep responses concise unless the user asks for detail.\n\
          - Use formatting (headers, lists, code blocks) for readability.\n\
-         - If a task fails, explain what went wrong and suggest alternatives.\n";
+         - If a task fails, explain what went wrong and suggest alternatives.\n"
+        .to_string();
+    let agents_content =
+        scaffold_override(scaffold, |s| s.agents_md.as_ref()).unwrap_or(default_agents_content);
 
-    let bootstrap_content = format!(
+    let default_bootstrap_content = format!(
         "# First-Run Bootstrap\n\n\
          On your FIRST conversation with a new user, follow this protocol:\n\n\
          1. **Greet** \u{2014} Introduce yourself as {name} with a one-line summary of your specialty.\n\
@@ -348,8 +376,10 @@ fn generate_identity_files(workspace: &Path, manifest: &AgentManifest) {
          After bootstrap, this protocol is complete. Focus entirely on the user's needs.\n",
         name = manifest.name
     );
+    let bootstrap_content = scaffold_override(scaffold, |s| s.bootstrap_md.as_ref())
+        .unwrap_or(default_bootstrap_content);
 
-    let identity_content = format!(
+    let default_identity_content = format!(
         "---\n\
          name: {name}\n\
          archetype: assistant\n\
@@ -363,20 +393,22 @@ fn generate_identity_files(workspace: &Path, manifest: &AgentManifest) {
          <!-- Visual identity and personality at a glance. Edit these fields freely. -->\n",
         name = manifest.name
     );
+    let identity_content = scaffold_override(scaffold, |s| s.identity_md.as_ref())
+        .unwrap_or(default_identity_content);
 
     let files: &[(&str, &str)] = &[
         ("SOUL.md", &soul_content),
-        ("USER.md", user_content),
-        ("TOOLS.md", tools_content),
-        ("MEMORY.md", memory_content),
-        ("AGENTS.md", agents_content),
+        ("USER.md", &user_content),
+        ("TOOLS.md", &tools_content),
+        ("MEMORY.md", &memory_content),
+        ("AGENTS.md", &agents_content),
         ("BOOTSTRAP.md", &bootstrap_content),
         ("IDENTITY.md", &identity_content),
     ];
 
     // Conditionally generate HEARTBEAT.md for autonomous agents
     let heartbeat_content = if manifest.autonomous.is_some() {
-        Some(
+        let default_heartbeat_content =
             "# Heartbeat Checklist\n\
              <!-- Proactive reminders to check during heartbeat cycles -->\n\n\
              ## Every Heartbeat\n\
@@ -386,7 +418,10 @@ fn generate_identity_files(workspace: &Path, manifest: &AgentManifest) {
              - [ ] Summarize today's activity for the user\n\n\
              ## Weekly\n\
              - [ ] Archive old sessions and clean up memory\n"
-                .to_string(),
+                .to_string();
+        Some(
+            scaffold_override(scaffold, |s| s.heartbeat_md.as_ref())
+                .unwrap_or(default_heartbeat_content),
         )
     } else {
         None
@@ -1160,7 +1195,16 @@ impl OpenFangKernel {
 
     /// Spawn a new agent from a manifest, optionally linking to a parent agent.
     pub fn spawn_agent(&self, manifest: AgentManifest) -> KernelResult<AgentId> {
-        self.spawn_agent_with_parent(manifest, None)
+        self.spawn_agent_with_parent_and_scaffold(manifest, None, None)
+    }
+
+    /// Spawn a new agent from a manifest with optional scaffolded workspace file content.
+    pub fn spawn_agent_with_scaffold(
+        &self,
+        manifest: AgentManifest,
+        scaffold: Option<AgentScaffold>,
+    ) -> KernelResult<AgentId> {
+        self.spawn_agent_with_parent_and_scaffold(manifest, None, scaffold)
     }
 
     /// Spawn a new agent with an optional parent for lineage tracking.
@@ -1168,6 +1212,15 @@ impl OpenFangKernel {
         &self,
         manifest: AgentManifest,
         parent: Option<AgentId>,
+    ) -> KernelResult<AgentId> {
+        self.spawn_agent_with_parent_and_scaffold(manifest, parent, None)
+    }
+
+    fn spawn_agent_with_parent_and_scaffold(
+        &self,
+        manifest: AgentManifest,
+        parent: Option<AgentId>,
+        scaffold: Option<AgentScaffold>,
     ) -> KernelResult<AgentId> {
         let agent_id = AgentId::new();
         let session_id = SessionId::new();
@@ -1235,7 +1288,7 @@ impl OpenFangKernel {
         });
         ensure_workspace(&workspace_dir)?;
         if manifest.generate_identity_files {
-            generate_identity_files(&workspace_dir, &manifest);
+            generate_identity_files(&workspace_dir, &manifest, scaffold.as_ref());
         }
         manifest.workspace = Some(workspace_dir);
 
@@ -1868,6 +1921,11 @@ impl OpenFangKernel {
                 })
                 .collect();
 
+            let is_subagent = manifest
+                .metadata
+                .get("is_subagent")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let prompt_ctx = openfang_runtime::prompt_builder::PromptContext {
                 agent_name: manifest.name.clone(),
                 agent_description: manifest.description.clone(),
@@ -1900,11 +1958,11 @@ impl OpenFangKernel {
                     .and_then(|(s, _)| s),
                 user_name,
                 channel_type: None,
-                is_subagent: manifest
-                    .metadata
-                    .get("is_subagent")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false),
+                prompt_mode: if is_subagent {
+                    openfang_runtime::prompt_builder::PromptMode::Minimal
+                } else {
+                    openfang_runtime::prompt_builder::PromptMode::Full
+                },
                 is_autonomous: manifest.autonomous.is_some(),
                 agents_md: manifest
                     .workspace
@@ -1923,6 +1981,10 @@ impl OpenFangKernel {
                     .workspace
                     .as_ref()
                     .and_then(|w| read_identity_file(w, "IDENTITY.md")),
+                tools_md: manifest
+                    .workspace
+                    .as_ref()
+                    .and_then(|w| read_identity_file(w, "TOOLS.md")),
                 heartbeat_md: if manifest.autonomous.is_some() {
                     manifest
                         .workspace
@@ -2358,6 +2420,11 @@ impl OpenFangKernel {
                 })
                 .collect();
 
+            let is_subagent = manifest
+                .metadata
+                .get("is_subagent")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let prompt_ctx = openfang_runtime::prompt_builder::PromptContext {
                 agent_name: manifest.name.clone(),
                 agent_description: manifest.description.clone(),
@@ -2390,11 +2457,11 @@ impl OpenFangKernel {
                     .and_then(|(s, _)| s),
                 user_name,
                 channel_type: None,
-                is_subagent: manifest
-                    .metadata
-                    .get("is_subagent")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false),
+                prompt_mode: if is_subagent {
+                    openfang_runtime::prompt_builder::PromptMode::Minimal
+                } else {
+                    openfang_runtime::prompt_builder::PromptMode::Full
+                },
                 is_autonomous: manifest.autonomous.is_some(),
                 agents_md: manifest
                     .workspace
@@ -2413,6 +2480,10 @@ impl OpenFangKernel {
                     .workspace
                     .as_ref()
                     .and_then(|w| read_identity_file(w, "IDENTITY.md")),
+                tools_md: manifest
+                    .workspace
+                    .as_ref()
+                    .and_then(|w| read_identity_file(w, "TOOLS.md")),
                 heartbeat_md: if manifest.autonomous.is_some() {
                     manifest
                         .workspace
@@ -5937,6 +6008,7 @@ impl openfang_wire::peer::PeerHandle for OpenFangKernel {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use tempfile::tempdir;
 
     #[test]
     fn test_manifest_to_capabilities() {
@@ -6144,5 +6216,27 @@ mod tests {
         assert!(!caps
             .iter()
             .any(|c| matches!(c, Capability::ToolInvoke(name) if name == "shell_exec")));
+    }
+
+    #[test]
+    fn test_generate_identity_files_uses_scaffold_overrides() {
+        let dir = tempdir().unwrap();
+        let manifest = test_manifest("assistant", "A helpful agent", vec![]);
+        let scaffold = AgentScaffold {
+            soul_md: Some("# Soul\nCustom soul".to_string()),
+            agents_md: Some("# Agent Behavioral Guidelines\nCustom rules".to_string()),
+            identity_md: Some("---\nname: assistant\n---\n# Identity\nCustom identity".to_string()),
+            ..Default::default()
+        };
+
+        generate_identity_files(dir.path(), &manifest, Some(&scaffold));
+
+        let soul = std::fs::read_to_string(dir.path().join("SOUL.md")).unwrap();
+        let agents = std::fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
+        let identity = std::fs::read_to_string(dir.path().join("IDENTITY.md")).unwrap();
+
+        assert!(soul.contains("Custom soul"));
+        assert!(agents.contains("Custom rules"));
+        assert!(identity.contains("Custom identity"));
     }
 }

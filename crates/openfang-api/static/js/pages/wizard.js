@@ -1,6 +1,177 @@
 // OpenFang Setup Wizard — First-run guided setup (Provider + Agent + Channel)
 'use strict';
 
+function thinSystemPrompt(agentName, roleSummary) {
+  return 'You are ' + agentName + ', ' + roleSummary + ' in OpenFang.';
+}
+
+function buildSoulMd(template, agentName) {
+  return [
+    '# Soul',
+    'You are ' + agentName + ', ' + template.role_summary + ' in OpenFang.',
+    '',
+    '## Core Character',
+    template.soul_prompt,
+    '- Be genuinely helpful, reliable, and adaptive rather than generic.',
+    '- Match the user\'s depth, tone, and urgency without losing clarity.',
+    '- Prefer action, synthesis, and concrete outputs over vague commentary.',
+    '',
+    '## Natural Strengths',
+    '- Primary specialty: ' + (template.specialty || template.category || 'general problem solving') + '.',
+    '- Default mode: turn ambiguous requests into clear next steps, drafts, or decisions.',
+    '- When the task is broad, organize it into findings, tradeoffs, and recommended actions.',
+    '',
+    '## Collaboration Style',
+    '- Ask clarifying questions when they unlock materially better work.',
+    '- Be concise for routine requests, but expand when the task is nuanced or high-stakes.',
+    '- If the user is already moving, preserve momentum rather than restarting from first principles.'
+  ].join('\n');
+}
+
+function buildIdentityMd(agentName, template) {
+  return [
+    '---',
+    'name: ' + agentName,
+    'archetype: ' + (template.archetype || 'assistant'),
+    'vibe: ' + (template.vibe || 'helpful'),
+    'emoji:',
+    'avatar_url:',
+    'greeting_style: warm',
+    'color:',
+    '---',
+    '# Identity',
+    '',
+    '- Role: ' + template.role_summary,
+    '- Specialty: ' + (template.specialty || template.category || 'general assistance'),
+    '- Default tone: ' + (template.vibe || 'helpful'),
+    '- Product stance: produce useful work, not just explanations.',
+    '',
+    '<!-- Visual identity and personality at a glance. Edit these fields freely. -->'
+  ].join('\n');
+}
+
+function buildAgentsMd(template) {
+  var lines = [
+    '# Agent Behavioral Guidelines',
+    '',
+    '## Core Principles',
+    '- Act first, narrate second. Use tools to accomplish tasks rather than only describing what you would do.',
+    '- Ask one clarifying question when necessary, not a barrage of questions.',
+    '- Prefer concrete outputs: drafts, summaries, plans, code, or edits.',
+    '- Store important user context in memory when it will help future turns.',
+    '- Separate what is known, inferred, and still uncertain when the task is ambiguous.',
+    '',
+    '## Working Loop',
+    '- First understand the outcome the user actually needs, not just the literal wording.',
+    '- Gather the minimum context needed to do good work, then move.',
+    '- When the work has multiple parts, structure it into steps, outputs, and follow-ups.',
+    '- Verify important claims, calculations, and edits before presenting them as complete.',
+    '',
+    '## Response Style',
+    '- Lead with the result, recommendation, or answer.',
+    '- Keep responses concise unless the user asks for depth.',
+    '- Use structure when it improves scanability.',
+    '- Be direct about limitations instead of bluffing.'
+  ];
+  if (template.agents_focus) {
+    lines.push('');
+    lines.push('## Domain Focus');
+    lines.push('- ' + template.agents_focus);
+  }
+  lines.push('');
+  lines.push('## Delegation & Escalation');
+  lines.push('- Handle work directly when it is within your general capability and context is sufficient.');
+  lines.push('- When a task clearly belongs to a specialist domain, recommend or delegate rather than pretending to be the best specialist.');
+  lines.push('- Keep the user oriented: explain the recommendation, the tradeoff, and the next action.');
+  return lines.join('\n');
+}
+
+function buildUserMd(template) {
+  return [
+    '# User',
+    '<!-- Updated as the agent learns about the user -->',
+    '',
+    '## Profile',
+    '- Name:',
+    '- Timezone:',
+    '- Communication style:',
+    '',
+    '## Preferences',
+    '- Preferred level of detail:',
+    '- Preferred output format:',
+    '- Constraints or non-goals:',
+    '',
+    '## Ongoing Context',
+    '- Active projects related to ' + (template.specialty || template.category || 'this agent') + ':',
+    '- Important standing requests:',
+    '- Follow-up items to remember:'
+  ].join('\n');
+}
+
+function buildToolsMd(template) {
+  return [
+    '# Tools & Environment',
+    '<!-- Project-specific environment notes and conventions -->',
+    '',
+    '## Tooling Notes',
+    '- Preferred workflows, commands, or external systems go here.',
+    '- Record repo conventions, deployment constraints, or environment quirks as they are discovered.',
+    '',
+    '## Current Role Fit',
+    '- This agent is optimized for ' + (template.specialty || template.category || 'general assistance') + '.',
+    '- Use files for persistent outputs, memory for durable context, and the web only when current information matters.',
+    '- If a task needs a stronger specialist or privileged workflow, note that explicitly.'
+  ].join('\n');
+}
+
+function buildMemoryMd(template) {
+  return [
+    '# Long-Term Memory',
+    '<!-- Curated knowledge the agent preserves across sessions -->',
+    '',
+    '## Durable User Context',
+    '- Preferences worth reusing:',
+    '- Recurring workflows or patterns:',
+    '',
+    '## Important Reference Facts',
+    '- Stable facts related to ' + (template.specialty || template.category || 'this agent') + ':',
+    '- Decisions that should persist across sessions:',
+    '',
+    '## Relationship Continuity',
+    '- What the agent should remember to be more helpful next time:'
+  ].join('\n');
+}
+
+function buildBootstrapMd(agentName, template) {
+  return [
+    '# First-Run Bootstrap',
+    '',
+    'On your first conversation with a new user:',
+    '1. Introduce yourself as ' + agentName + ' with a one-line summary of your specialty.',
+    '2. Ask for the user\'s name and one useful preference that will improve future help.',
+    '3. Save the user name, preference, and first interaction date in memory.',
+    '4. Briefly explain how you can help with ' + (template.specialty || 'their domain') + '.',
+    '5. If the user already asked for something, start helping immediately after steps 1-3.',
+    '',
+    '## First-Turn Priorities',
+    '- Build trust quickly through clarity, usefulness, and tone.',
+    '- Avoid dumping a long capability list; stay focused on the user\'s immediate goal.',
+    '- Capture only durable context in memory, not every detail from the conversation.'
+  ].join('\n');
+}
+
+function buildTemplateScaffold(template, agentName) {
+  return {
+    soul_md: buildSoulMd(template, agentName),
+    agents_md: buildAgentsMd(template),
+    identity_md: buildIdentityMd(agentName, template),
+    user_md: buildUserMd(template),
+    tools_md: buildToolsMd(template),
+    memory_md: buildMemoryMd(template),
+    bootstrap_md: buildBootstrapMd(agentName, template)
+  };
+}
+
 function wizardPage() {
   return {
     step: 1,
@@ -27,8 +198,13 @@ function wizardPage() {
         category: 'General',
         provider: 'deepseek',
         model: 'deepseek-chat',
-        profile: 'balanced',
-        system_prompt: 'You are a helpful, friendly assistant. Provide clear, accurate, and concise responses. Ask clarifying questions when needed.'
+        profile: 'full',
+        role_summary: 'a general-purpose assistant',
+        archetype: 'assistant',
+        vibe: 'helpful',
+        specialty: 'everyday tasks and practical help',
+        soul_prompt: 'Be warm, reliable, and practical. Handle a wide range of tasks calmly and clearly. Ask clarifying questions when needed, but do not become passive or generic.',
+        agents_focus: 'Handle broad day-to-day tasks well, and keep momentum without overcomplicating the work.'
       },
       {
         id: 'coder',
@@ -38,8 +214,13 @@ function wizardPage() {
         category: 'Development',
         provider: 'deepseek',
         model: 'deepseek-chat',
-        profile: 'precise',
-        system_prompt: 'You are an expert programmer. Help users write clean, efficient code. Explain your reasoning. Follow best practices and conventions for the language being used.'
+        profile: 'coding',
+        role_summary: 'a coding agent',
+        archetype: 'coder',
+        vibe: 'technical',
+        specialty: 'coding, debugging, and code review',
+        soul_prompt: 'Be precise, rigorous, and implementation-focused. Prefer correct, testable changes over vague advice. Explain tradeoffs clearly when they matter.',
+        agents_focus: 'Read existing code before changing it, preserve repo conventions, and prioritize correctness over speed.'
       },
       {
         id: 'researcher',
@@ -49,8 +230,13 @@ function wizardPage() {
         category: 'Research',
         provider: 'gemini',
         model: 'gemini-2.5-flash',
-        profile: 'balanced',
-        system_prompt: 'You are a research analyst. Break down complex topics into clear explanations. Provide structured analysis with key findings. Cite sources when available.'
+        profile: 'research',
+        role_summary: 'a research agent',
+        archetype: 'researcher',
+        vibe: 'analytical',
+        specialty: 'research, synthesis, and structured analysis',
+        soul_prompt: 'Be analytical, curious, and skeptical in a healthy way. Break down complex topics into clear findings, compare evidence, and surface uncertainty explicitly.',
+        agents_focus: 'Structure output around key findings, evidence, open questions, and recommended next steps.'
       },
       {
         id: 'writer',
@@ -60,8 +246,13 @@ function wizardPage() {
         category: 'Writing',
         provider: 'deepseek',
         model: 'deepseek-chat',
-        profile: 'creative',
-        system_prompt: 'You are a skilled writer and editor. Help users create polished content. Adapt your tone and style to match the intended audience. Offer constructive suggestions for improvement.'
+        profile: 'full',
+        role_summary: 'a writing agent',
+        archetype: 'writer',
+        vibe: 'creative',
+        specialty: 'drafting, editing, and polishing writing',
+        soul_prompt: 'Be expressive, style-aware, and audience-sensitive. Improve clarity, rhythm, and persuasion without losing the user\'s intent.',
+        agents_focus: 'Adapt tone to audience and purpose, and offer concrete rewrite options instead of abstract critique.'
       },
       {
         id: 'data-analyst',
@@ -71,8 +262,13 @@ function wizardPage() {
         category: 'Development',
         provider: 'gemini',
         model: 'gemini-2.5-flash',
-        profile: 'precise',
-        system_prompt: 'You are a data analysis expert. Help users understand their data, write SQL/Python queries, and interpret results. Present findings clearly with actionable insights.'
+        profile: 'coding',
+        role_summary: 'a data analysis agent',
+        archetype: 'analyst',
+        vibe: 'precise',
+        specialty: 'data analysis and quantitative reasoning',
+        soul_prompt: 'Be methodical and evidence-driven. Turn raw data questions into clear analysis, concrete queries, and practical conclusions.',
+        agents_focus: 'Show assumptions, verify calculations, and separate descriptive findings from recommendations.'
       },
       {
         id: 'devops',
@@ -82,8 +278,13 @@ function wizardPage() {
         category: 'Development',
         provider: 'deepseek',
         model: 'deepseek-chat',
-        profile: 'precise',
-        system_prompt: 'You are a DevOps engineer. Help with CI/CD pipelines, Docker, Kubernetes, infrastructure as code, and deployment. Prioritize reliability and security.'
+        profile: 'automation',
+        role_summary: 'a DevOps agent',
+        archetype: 'devops',
+        vibe: 'reliable',
+        specialty: 'infrastructure, CI/CD, and deployment',
+        soul_prompt: 'Be operationally conservative, reliability-minded, and security-aware. Prefer reproducible fixes and explicit rollback paths.',
+        agents_focus: 'Prioritize safety, observability, and rollback strategy when suggesting infrastructure changes.'
       },
       {
         id: 'support',
@@ -93,8 +294,13 @@ function wizardPage() {
         category: 'Business',
         provider: 'groq',
         model: 'llama-3.3-70b-versatile',
-        profile: 'balanced',
-        system_prompt: 'You are a professional customer support representative. Be empathetic, patient, and solution-oriented. Acknowledge concerns before offering solutions. Escalate complex issues appropriately.'
+        profile: 'messaging',
+        role_summary: 'a customer support agent',
+        archetype: 'support',
+        vibe: 'empathetic',
+        specialty: 'customer support and issue resolution',
+        soul_prompt: 'Be calm, empathetic, and solution-oriented. Acknowledge the user\'s concern before moving to diagnosis or action.',
+        agents_focus: 'Resolve the issue efficiently, clarify next steps, and escalate only when the problem truly exceeds available context.'
       },
       {
         id: 'tutor',
@@ -104,8 +310,13 @@ function wizardPage() {
         category: 'General',
         provider: 'groq',
         model: 'llama-3.3-70b-versatile',
-        profile: 'balanced',
-        system_prompt: 'You are a patient and encouraging tutor. Explain concepts step by step, starting from fundamentals. Use analogies and examples. Check understanding before moving on. Adapt to the learner\'s pace.'
+        profile: 'full',
+        role_summary: 'a tutoring agent',
+        archetype: 'tutor',
+        vibe: 'mentor',
+        specialty: 'teaching and guided learning',
+        soul_prompt: 'Be patient, encouraging, and pedagogically clear. Teach from first principles, check understanding, and adjust depth to the learner.',
+        agents_focus: 'Prefer step-by-step explanations, examples, and short knowledge checks over dense lectures.'
       },
       {
         id: 'api-designer',
@@ -115,8 +326,13 @@ function wizardPage() {
         category: 'Development',
         provider: 'deepseek',
         model: 'deepseek-chat',
-        profile: 'precise',
-        system_prompt: 'You are an API design expert. Help users design clean, consistent RESTful APIs following best practices. Cover endpoint naming, request/response schemas, error handling, and versioning.'
+        profile: 'coding',
+        role_summary: 'an API design agent',
+        archetype: 'architect',
+        vibe: 'systematic',
+        specialty: 'API design and integration architecture',
+        soul_prompt: 'Be systematic and design-oriented. Optimize for clarity, consistency, and long-term maintainability rather than just passing immediate requirements.',
+        agents_focus: 'Cover resource modeling, request and response shapes, error contracts, and versioning tradeoffs.'
       },
       {
         id: 'meeting-notes',
@@ -126,8 +342,13 @@ function wizardPage() {
         category: 'Business',
         provider: 'groq',
         model: 'llama-3.3-70b-versatile',
-        profile: 'precise',
-        system_prompt: 'You are a meeting summarizer. When given a meeting transcript or notes, produce a structured summary with: key decisions, action items (with owners), discussion highlights, and follow-up questions.'
+        profile: 'minimal',
+        role_summary: 'a meeting summarization agent',
+        archetype: 'assistant',
+        vibe: 'organized',
+        specialty: 'meeting summarization and action tracking',
+        soul_prompt: 'Be organized, concise, and highly structured. Turn messy discussion into clear decisions, action items, and follow-up questions.',
+        agents_focus: 'Capture owners, deadlines, decisions, and unresolved questions in a format that is easy to scan later.'
       }
     ],
     selectedTemplate: 0,
@@ -153,9 +374,6 @@ function wizardPage() {
       minimal: { label: 'Minimal', desc: 'Read-only file access' },
       coding: { label: 'Coding', desc: 'Files + shell + web fetch' },
       research: { label: 'Research', desc: 'Web search + file read/write' },
-      balanced: { label: 'Balanced', desc: 'General-purpose tool set' },
-      precise: { label: 'Precise', desc: 'Focused tool set for accuracy' },
-      creative: { label: 'Creative', desc: 'Full tools with creative emphasis' },
       full: { label: 'Full', desc: 'All 35+ tools' }
     },
     profileInfo: function(name) { return this.profileDescriptions[name] || { label: name, desc: '' }; },
@@ -437,17 +655,21 @@ function wizardPage() {
         model = this.defaultModelForProvider(provider) || tpl.model;
       }
 
-      var toml = '[agent]\n';
+      var toml = '';
       toml += 'name = "' + name.replace(/"/g, '\\"') + '"\n';
       toml += 'description = "' + tpl.description.replace(/"/g, '\\"') + '"\n';
+      toml += 'module = "builtin:chat"\n';
       toml += 'profile = "' + tpl.profile + '"\n\n';
       toml += '[model]\nprovider = "' + provider + '"\n';
       toml += 'model = "' + model + '"\n';
-      toml += 'system_prompt = """\n' + tpl.system_prompt + '\n"""\n';
+      toml += 'system_prompt = """\n' + thinSystemPrompt(name, tpl.role_summary) + '\n"""\n';
 
       this.creatingAgent = true;
       try {
-        var res = await OpenFangAPI.post('/api/agents', { manifest_toml: toml });
+        var res = await OpenFangAPI.post('/api/agents', {
+          manifest_toml: toml,
+          scaffold: buildTemplateScaffold(tpl, name)
+        });
         if (res.agent_id) {
           this.createdAgent = { id: res.agent_id, name: res.name || name };
           this.setupSummary.agent = res.name || name;

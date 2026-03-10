@@ -1820,7 +1820,10 @@ fn spawn_template_agent(config: Option<PathBuf>, template: &templates::AgentTemp
         let body = daemon_json(
             client
                 .post(format!("{base}/api/agents"))
-                .json(&serde_json::json!({"manifest_toml": template.content}))
+                .json(&serde_json::json!({
+                    "manifest_toml": template.content,
+                    "scaffold": template.scaffold,
+                }))
                 .send(),
         );
         if let Some(id) = body["agent_id"].as_str() {
@@ -1849,7 +1852,7 @@ fn spawn_template_agent(config: Option<PathBuf>, template: &templates::AgentTemp
             std::process::exit(1);
         });
         let kernel = boot_kernel(config);
-        match kernel.spawn_agent(manifest) {
+        match kernel.spawn_agent_with_scaffold(manifest, template.scaffold.clone()) {
             Ok(id) => {
                 ui::blank();
                 ui::success(&format!("Agent '{}' spawned (in-process)", template.name));

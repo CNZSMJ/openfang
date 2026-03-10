@@ -140,18 +140,33 @@ impl WorkspaceContext {
             parts.push("- Git repository: yes".to_string());
         }
 
-        // Include context file summaries
-        let file_names: Vec<String> = self.cache.keys().cloned().collect();
-        for name in file_names {
-            if let Some(content) = self.get_file(&name) {
-                // Take first 200 chars as preview
-                let preview = if content.len() > 200 {
-                    format!("{}...", crate::str_utils::safe_truncate_str(content, 200))
-                } else {
-                    content.to_string()
-                };
-                parts.push(format!("### {}\n{}", name, preview));
+        if self.has_openfang_dir {
+            parts.push("- .openfang state: present".to_string());
+        }
+
+        match self.project_type {
+            ProjectType::Rust => {
+                parts.push("- Likely build command: cargo build".to_string());
+                parts.push("- Likely test command: cargo test".to_string());
             }
+            ProjectType::Node => {
+                parts.push("- Inspect package.json for build/test scripts".to_string());
+            }
+            ProjectType::Python => {
+                parts.push("- Inspect pyproject.toml / requirements for project commands".to_string());
+            }
+            ProjectType::Go => {
+                parts.push("- Likely build command: go build ./...".to_string());
+                parts.push("- Likely test command: go test ./...".to_string());
+            }
+            ProjectType::Java => {
+                parts.push("- Inspect pom.xml or build.gradle for build/test tasks".to_string());
+            }
+            ProjectType::DotNet => {
+                parts.push("- Likely build command: dotnet build".to_string());
+                parts.push("- Likely test command: dotnet test".to_string());
+            }
+            ProjectType::Unknown => {}
         }
 
         parts.join("\n")
@@ -370,8 +385,10 @@ mod tests {
         let section = ctx.build_context_section();
         assert!(section.contains("Rust"));
         assert!(section.contains("Git repository: yes"));
-        assert!(section.contains("SOUL.md"));
-        assert!(section.contains("Be nice"));
+        assert!(section.contains("cargo build"));
+        assert!(section.contains("cargo test"));
+        assert!(!section.contains("SOUL.md"));
+        assert!(!section.contains("Be nice"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

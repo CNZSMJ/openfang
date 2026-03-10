@@ -1309,7 +1309,7 @@ mod tests {
         manager.start_adapter(adapter).await.unwrap();
 
         for _ in 0..20 {
-            if sent.lock().unwrap().len() >= 1 {
+            if !sent.lock().unwrap().is_empty() {
                 break;
             }
             sleep(Duration::from_millis(10)).await;

@@ -2,6 +2,7 @@
 //! Overhauled with search/filter, state badges, detail view, and new actions.
 
 use crate::templates::{self, AgentTemplate};
+use openfang_types::agent::AgentScaffold;
 use crate::tui::theme;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
@@ -140,7 +141,7 @@ pub enum AgentAction {
     /// No action yet, keep rendering.
     Continue,
     /// User created a new agent manifest (TOML).
-    CreatedManifest(String),
+    CreatedManifest(String, Option<AgentScaffold>),
     /// User pressed Esc from the top-level list.
     Back,
     /// User wants to chat with a specific agent (from detail view).
@@ -562,7 +563,8 @@ impl AgentSelectState {
                 if let Some(idx) = self.template_list.selected() {
                     if idx < self.templates.len() {
                         let toml = self.templates[idx].content.clone();
-                        return AgentAction::CreatedManifest(toml);
+                        let scaffold = self.templates[idx].scaffold.clone();
+                        return AgentAction::CreatedManifest(toml, scaffold);
                     }
                 }
             }
@@ -724,7 +726,7 @@ impl AgentSelectState {
             }
             KeyCode::Enter => {
                 let toml = self.build_custom_toml();
-                return AgentAction::CreatedManifest(toml);
+                return AgentAction::CreatedManifest(toml, None);
             }
             _ => {}
         }
