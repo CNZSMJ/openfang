@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+usage() {
+  echo "usage: $(basename "$0") <branch> [bucket-dir] [remote]" >&2
+}
+
+if [[ $# -lt 1 || $# -gt 3 ]]; then
+  usage
+  exit 1
+fi
+
+branch="$1"
+
+git_common_dir="$(git rev-parse --path-format=absolute --git-common-dir)"
+repo_root="$(dirname "$git_common_dir")"
+repo_parent="$(dirname "$repo_root")"
+bucket="${2:-$repo_parent/openfang-0.1.0}"
+remote="${3:-origin}"
+dir_name="${branch//\//-}"
+target_dir="$bucket/$dir_name"
+
+mkdir -p "$bucket"
+
+if [[ -e "$target_dir" ]]; then
+  echo "Target path already exists: $target_dir" >&2
+  exit 1
+fi
+
+if git -C "$repo_root" show-ref --verify --quiet "refs/heads/$branch"; then
+  git -C "$repo_root" worktree add "$target_dir" "$branch"
+  echo "Opened worktree from local branch:"
+  echo "  branch: $branch"
+  echo "  path:   $target_dir"
+  exit 0
+fi
+
+if ! git -C "$repo_root" ls-remote --exit-code --heads "$remote" "$branch" >/dev/null 2>&1; then
+  echo "Remote branch not found: $remote/$branch" >&2
+  exit 1
+fi
+
+git -C "$repo_root" fetch "$remote" "$branch"
+git -C "$repo_root" branch --track "$branch" "$remote/$branch"
+git -C "$repo_root" worktree add "$target_dir" "$branch"
+
+echo "Opened worktree from remote branch:"
+echo "  branch: $branch"
+echo "  remote: $remote"
+echo "  path:   $target_dir"
