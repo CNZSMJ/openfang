@@ -2,6 +2,8 @@
 
 set -euo pipefail
 
-git_common_dir="$(git rev-parse --path-format=absolute --git-common-dir)"
-repo_root="$(dirname "$git_common_dir")"
-git -C "$repo_root" worktree list
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=bin/wt-lib
+source "$script_dir/wt-lib"
+
+git -C "$wt_repo_root" worktree list
