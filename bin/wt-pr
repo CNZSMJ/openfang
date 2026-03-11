@@ -2,26 +2,45 @@
 
 set -euo pipefail
 
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=bin/wt-lib
+source "$script_dir/wt-lib"
+
 usage() {
   echo "usage: $(basename "$0") [head-branch] [base-branch]" >&2
 }
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
 
 if [[ $# -gt 2 ]]; then
   usage
   exit 1
 fi
 
-git_common_dir="$(git rev-parse --path-format=absolute --git-common-dir)"
-repo_root="$(dirname "$git_common_dir")"
-
 head_branch="${1:-$(git symbolic-ref --quiet --short HEAD)}"
-base_branch="${2:-custom/0.1.0}"
+base_branch="${2:-$(wt_default_base_branch)}"
+remote="$(wt_default_remote)"
 
 if [[ -z "$head_branch" ]]; then
   echo "Could not determine current branch." >&2
   exit 1
 fi
 
-git -C "$repo_root" fetch origin "$base_branch" "$head_branch" >/dev/null 2>&1 || true
+repo_slug="$(wt_repo_slug_from_remote "$remote")"
 
-gh pr create --base "$base_branch" --head "$head_branch" --fill
+git -C "$wt_repo_root" fetch "$remote" "$base_branch" "$head_branch" >/dev/null 2>&1 || true
+
+if ! git -C "$wt_repo_root" rev-parse --verify --quiet "refs/remotes/$remote/$head_branch" >/dev/null; then
+  git -C "$wt_repo_root" push -u "$remote" "$head_branch"
+fi
+
+gh_args=(pr create --base "$base_branch" --head "$head_branch" --fill)
+
+if [[ -n "$repo_slug" ]]; then
+  gh_args+=(-R "$repo_slug")
+fi
+
+gh "${gh_args[@]}"

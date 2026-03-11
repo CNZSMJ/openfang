@@ -16,6 +16,9 @@ pub struct SpawnRequest {
     /// When present, the signature is verified before spawning.
     #[serde(default)]
     pub signed_manifest: Option<String>,
+    /// Optional structured seed content for initial workspace prompt files.
+    #[serde(default)]
+    pub scaffold: Option<openfang_types::agent::AgentScaffold>,
 }
 
 /// Response after spawning an agent.

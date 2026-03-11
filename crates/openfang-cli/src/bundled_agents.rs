@@ -4,6 +4,8 @@
 //! This ensures `openfang agent new` works immediately after install — no filesystem
 //! discovery needed.
 
+use openfang_types::agent::AgentScaffold;
+
 /// Returns all bundled agent templates as `(name, toml_content)` pairs.
 pub fn bundled_agents() -> Vec<(&'static str, &'static str)> {
     vec![
@@ -40,17 +42,91 @@ pub fn bundled_agents() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
+/// Returns embedded scaffold prompt files for bundled templates that define them.
+pub fn bundled_scaffold(name: &str) -> Option<AgentScaffold> {
+    match name {
+        "assistant" => Some(AgentScaffold {
+            soul_md: Some(include_str!("../../../agents/assistant/SOUL.md").trim().to_string()),
+            user_md: Some(include_str!("../../../agents/assistant/USER.md").trim().to_string()),
+            tools_md: Some(include_str!("../../../agents/assistant/TOOLS.md").trim().to_string()),
+            memory_md: Some(include_str!("../../../agents/assistant/MEMORY.md").trim().to_string()),
+            agents_md: Some(include_str!("../../../agents/assistant/AGENTS.md").trim().to_string()),
+            bootstrap_md: Some(
+                include_str!("../../../agents/assistant/BOOTSTRAP.md")
+                    .trim()
+                    .to_string(),
+            ),
+            identity_md: Some(
+                include_str!("../../../agents/assistant/IDENTITY.md")
+                    .trim()
+                    .to_string(),
+            ),
+            heartbeat_md: None,
+        }),
+        _ => None,
+    }
+}
+
 /// Install bundled agent templates to `~/.openfang/agents/`.
 /// Skips any template that already exists on disk (user customization preserved).
 pub fn install_bundled_agents(agents_dir: &std::path::Path) {
     for (name, content) in bundled_agents() {
         let dest_dir = agents_dir.join(name);
         let dest_file = dest_dir.join("agent.toml");
-        if dest_file.exists() {
-            continue; // Preserve user customization
-        }
         if std::fs::create_dir_all(&dest_dir).is_ok() {
-            let _ = std::fs::write(&dest_file, content);
+            if !dest_file.exists() {
+                let _ = std::fs::write(&dest_file, content);
+            }
+            if let Some(scaffold) = bundled_scaffold(name) {
+                if let Some(content) = scaffold.soul_md {
+                    let path = dest_dir.join("SOUL.md");
+                    if !path.exists() {
+                        let _ = std::fs::write(path, content);
+                    }
+                }
+                if let Some(content) = scaffold.user_md {
+                    let path = dest_dir.join("USER.md");
+                    if !path.exists() {
+                        let _ = std::fs::write(path, content);
+                    }
+                }
+                if let Some(content) = scaffold.tools_md {
+                    let path = dest_dir.join("TOOLS.md");
+                    if !path.exists() {
+                        let _ = std::fs::write(path, content);
+                    }
+                }
+                if let Some(content) = scaffold.memory_md {
+                    let path = dest_dir.join("MEMORY.md");
+                    if !path.exists() {
+                        let _ = std::fs::write(path, content);
+                    }
+                }
+                if let Some(content) = scaffold.agents_md {
+                    let path = dest_dir.join("AGENTS.md");
+                    if !path.exists() {
+                        let _ = std::fs::write(path, content);
+                    }
+                }
+                if let Some(content) = scaffold.bootstrap_md {
+                    let path = dest_dir.join("BOOTSTRAP.md");
+                    if !path.exists() {
+                        let _ = std::fs::write(path, content);
+                    }
+                }
+                if let Some(content) = scaffold.identity_md {
+                    let path = dest_dir.join("IDENTITY.md");
+                    if !path.exists() {
+                        let _ = std::fs::write(path, content);
+                    }
+                }
+                if let Some(content) = scaffold.heartbeat_md {
+                    let path = dest_dir.join("HEARTBEAT.md");
+                    if !path.exists() {
+                        let _ = std::fs::write(path, content);
+                    }
+                }
+            }
         }
     }
 }

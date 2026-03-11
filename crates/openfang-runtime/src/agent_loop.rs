@@ -212,7 +212,7 @@ pub async fn run_agent_loop_with_session_message(
         .unwrap_or_default();
 
     // Recall relevant memories — prefer vector similarity search when embedding driver is available
-    let memories = if let Some(emb) = embedding_driver {
+    let _memories = if let Some(emb) = embedding_driver {
         match emb.embed_one(user_message).await {
             Ok(query_vec) => {
                 debug!("Using vector recall (dims={})", query_vec.len());
@@ -273,17 +273,8 @@ pub async fn run_agent_loop_with_session_message(
         let _ = hook_reg.fire(&ctx);
     }
 
-    // Build the system prompt — base prompt comes from kernel (prompt_builder),
-    // we append recalled memories here since they are resolved at loop time.
-    let mut system_prompt = manifest.model.system_prompt.clone();
-    if !memories.is_empty() {
-        let mem_pairs: Vec<(String, String)> = memories
-            .iter()
-            .map(|m| (String::new(), m.content.clone()))
-            .collect();
-        system_prompt.push_str("\n\n");
-        system_prompt.push_str(&crate::prompt_builder::build_memory_section(&mem_pairs));
-    }
+    // Build the system prompt. Recalled memories are already injected by prompt_builder.
+    let system_prompt = manifest.model.system_prompt.clone();
 
     // Add the user message to session history.
     session.messages.push(session_user_message);
@@ -1150,7 +1141,7 @@ pub async fn run_agent_loop_streaming(
         .unwrap_or_default();
 
     // Recall relevant memories — prefer vector similarity search when embedding driver is available
-    let memories = if let Some(emb) = embedding_driver {
+    let _memories = if let Some(emb) = embedding_driver {
         match emb.embed_one(user_message).await {
             Ok(query_vec) => {
                 debug!("Using vector recall (streaming, dims={})", query_vec.len());
@@ -1211,17 +1202,8 @@ pub async fn run_agent_loop_streaming(
         let _ = hook_reg.fire(&ctx);
     }
 
-    // Build the system prompt — base prompt comes from kernel (prompt_builder),
-    // we append recalled memories here since they are resolved at loop time.
-    let mut system_prompt = manifest.model.system_prompt.clone();
-    if !memories.is_empty() {
-        let mem_pairs: Vec<(String, String)> = memories
-            .iter()
-            .map(|m| (String::new(), m.content.clone()))
-            .collect();
-        system_prompt.push_str("\n\n");
-        system_prompt.push_str(&crate::prompt_builder::build_memory_section(&mem_pairs));
-    }
+    // Build the system prompt. Recalled memories are already injected by prompt_builder.
+    let system_prompt = manifest.model.system_prompt.clone();
 
     // Add the user message to session history
     session.messages.push(Message::user(user_message));

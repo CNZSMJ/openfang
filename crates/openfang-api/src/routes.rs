@@ -39,11 +39,39 @@ pub struct AppState {
     pub clawhub_cache: DashMap<String, (Instant, serde_json::Value)>,
 }
 
+fn read_template_scaffold(dir: &std::path::Path) -> Option<openfang_types::agent::AgentScaffold> {
+    fn read_optional(path: &std::path::Path) -> Option<String> {
+        std::fs::read_to_string(path)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    let scaffold = openfang_types::agent::AgentScaffold {
+        soul_md: read_optional(&dir.join("SOUL.md")),
+        user_md: read_optional(&dir.join("USER.md")),
+        tools_md: read_optional(&dir.join("TOOLS.md")),
+        memory_md: read_optional(&dir.join("MEMORY.md")),
+        agents_md: read_optional(&dir.join("AGENTS.md")),
+        bootstrap_md: read_optional(&dir.join("BOOTSTRAP.md")),
+        identity_md: read_optional(&dir.join("IDENTITY.md")),
+        heartbeat_md: read_optional(&dir.join("HEARTBEAT.md")),
+    };
+
+    if scaffold == openfang_types::agent::AgentScaffold::default() {
+        None
+    } else {
+        Some(scaffold)
+    }
+}
+
 /// POST /api/agents — Spawn a new agent.
 pub async fn spawn_agent(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SpawnRequest>,
 ) -> impl IntoResponse {
+    let mut resolved_scaffold = req.scaffold.clone();
+
     // Resolve template name → manifest_toml if template is provided and manifest_toml is empty
     let manifest_toml = if req.manifest_toml.trim().is_empty() {
         if let Some(ref tmpl_name) = req.template {
@@ -65,8 +93,14 @@ pub async fn spawn_agent(
                 .join("agents")
                 .join(&safe_name)
                 .join("agent.toml");
+            let tmpl_dir = state.kernel.config.home_dir.join("agents").join(&safe_name);
             match std::fs::read_to_string(&tmpl_path) {
-                Ok(content) => content,
+                Ok(content) => {
+                    if resolved_scaffold.is_none() {
+                        resolved_scaffold = read_template_scaffold(&tmpl_dir);
+                    }
+                    content
+                }
                 Err(_) => {
                     return (
                         StatusCode::NOT_FOUND,
@@ -136,7 +170,10 @@ pub async fn spawn_agent(
     };
 
     let name = manifest.name.clone();
-    match state.kernel.spawn_agent(manifest) {
+    match state
+        .kernel
+        .spawn_agent_with_scaffold(manifest, resolved_scaffold)
+    {
         Ok(id) => (
             StatusCode::CREATED,
             Json(serde_json::json!(SpawnResponse {
