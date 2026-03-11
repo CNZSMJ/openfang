@@ -56,8 +56,15 @@
   - Ran `cargo test --workspace` and fixed follow-on failures in `openfang-migrate` and prompt formatting expectations.
   - Ran `cargo clippy --workspace --all-targets -- -D warnings`.
   - Built the debug CLI binary and started a live daemon with `target/debug/openfang start`.
-  - Verified `/api/health`, `/api/tools`, and `/api/agents` against the configured local API port `50051`.
-  - Confirmed `/api/tools` now exposes builtin discovery tools plus skill-provided executable tools.
+  - Verified `/api/health`, `/api/tools`, `/api/agents`, and dashboard HTML against the configured local API port `4200`.
+  - Confirmed `/api/tools` exposes builtin discovery tools on the live daemon.
+  - Re-ran a real MiniMax-backed live message against `assistant`; the call succeeded and budget usage increased.
+  - Confirmed the default legacy `assistant` manifest still does not authorize `skill_search`, so that specific agent cannot exercise the discovery flow.
+  - Created a temporary live validation skill plus fresh probe agents to verify the new runtime behavior end to end.
+  - Confirmed the canonical single-message flow works live:
+    - `skill_search`
+    - automatic expansion of matching hidden callable skill tools
+    - same-turn tool invocation of the newly visible skill tool
 - Files created/modified:
   - `progress.md`
 
@@ -96,25 +103,83 @@
     - unify internal runtime search over a `ToolCatalog[ToolDefinition]`
     - keep `tool_reference` thin and Anthropic-compatible
     - solve dynamic tool expansion in `agent_loop`
+  - Refined the implementation direction so `available_tools` becomes `authorized_tools`, and a stateful runtime `ToolRunner` owns the current visible tool surface for each agent loop.
+  - Started the runtime refactor:
+    - added a stateful `ToolRunner` wrapper in `openfang-runtime`
+    - updated both non-streaming and streaming agent loops to source request tools and execution allowlists from `ToolRunner`
+    - renamed kernel-side assembly semantics from `available_tools` to `authorized_tools`
+  - Extended the runtime refactor into a working transition flow:
+    - initial visible tools now hide skill-provided callable tools
+    - `ToolRunner` intercepts `skill_search` and automatically expands callable tools from matching skills into later turns
+    - prompt guidance now explains that matching skill tools may appear after `skill_search`
+  - Preserved the external Phase 1 protocol while proving the automatic-expansion mechanism on the existing `skill_search` path.
+  - Formalized deferred exposure in the type system:
+    - added `ToolDefinition.defer_loading`
+    - kernel now marks skill-provided callable tools with `defer_loading = true`
+    - `ToolRunner` now derives initial visibility from `defer_loading` instead of an implicit skill-only visibility rule
+  - Re-validated the runtime behavior live after the `defer_loading` migration:
+    - same-message `skill_search -> auto-expand -> github_comment`
+    - actual tool invocation succeeded and returned the expected prompt-only skill result
+  - Promoted `tool_search` into the public discovery surface while keeping `skill_search` as a compatibility alias:
+    - builtin tool registry now exposes both names
+    - standard tool profiles now grant `tool_search`
+    - prompt guidance now points to `tool_search` as the primary discovery entry
+    - initial live rollout covered skill-backed deferred tools first
+  - Reworked the runtime discovery split further:
+    - `tool_search` now searches `ToolRunner`'s generic deferred-tool map instead of proxying to kernel skill search
+    - `skill_search` remains skill-scoped and keeps the old skill-result payload
+    - the generic `tool_search` result is now tool-centric: `name`, `description`, `source`, `provider`
+  - Extended the deferred rollout to a real non-skill source:
+    - kernel now marks MCP tools with `defer_loading = true`
+    - `tool_search` can discover and expand deferred MCP tools in the same top-level message
+  - Re-validated the renamed public discovery flow live:
+    - same-message `tool_search -> auto-expand -> github_comment`
+    - budget metering recorded the probe agent spend
+    - the discovered prompt-only skill tool executed, but correctly returned its prompt-context note instead of a side-effecting GitHub write
+    - session logs confirmed `tool_search` itself now returned generic tool results rather than legacy skill-search payloads
+  - Re-validated the first real non-skill deferred flow live:
+    - same-message `tool_search -> auto-expand -> mcp_minimax_web_search`
+    - session logs confirmed the generic `tool_search` result returned `{name:"mcp_minimax_web_search", source:"mcp", provider:"minimax"}`
+    - the expanded MCP tool executed successfully and `/api/budget/agents/{id}` recorded `live-mcp-tool-searcher` spend
+  - Tightened the external MCP surface after the runtime refactor:
+    - builtin tools remain `defer_loading = false`
+    - `/mcp` now filters out `tool_search`, `skill_search`, and `skill_get_instructions`
+    - live `tools/list` confirmed normal tools still appear while loop-only discovery helpers do not
+  - Reduced compatibility-surface visibility without removing the old tools yet:
+    - standard `ToolProfile`s now grant `tool_search` and `skill_get_instructions`, but no longer grant `skill_search`
+    - prompt guidance now speaks in terms of `tool_search` as the default discovery action
+    - `skill_search` remains present in the builtin catalog only as a compatibility alias
 - Files created/modified:
   - `docs/skill-progressive-loading-design.md`
   - `progress.md`
   - `task_plan.md`
   - `findings.md`
+  - `crates/openfang-runtime/src/tool_runner.rs`
+  - `crates/openfang-runtime/src/agent_loop.rs`
+  - `crates/openfang-kernel/src/kernel.rs`
+  - `crates/openfang-runtime/src/prompt_builder.rs`
 ## Test Results
 | Test | Input | Expected | Actual | Status |
 |------|-------|----------|--------|--------|
 | Registry search | `cargo test -q -p openfang-skills registry::tests::test_search_matches_name_and_tags -- --exact` | New lexical search test passes | Passed | ✓ |
 | Prompt protocol | `cargo test -q -p openfang-runtime prompt_builder::tests::test_skills_section_present -- --exact` | Prompt advertises protocol instead of catalog | Passed | ✓ |
-| Builtin tool list | `cargo test -q -p openfang-runtime tool_runner::tests::test_builtin_tool_definitions -- --exact` | Builtin tool registry includes `skill_search` | Passed | ✓ |
+| Builtin tool list | `cargo test -q -p openfang-runtime tool_runner::tests::test_builtin_tool_definitions -- --exact` | Builtin tool registry includes `skill_search` and `tool_search` | Passed | ✓ |
 | Workspace build | `cargo build --workspace --lib` | Workspace libraries compile | Passed | ✓ |
 | Workspace tests | `cargo test --workspace` | Full test suite passes | Passed | ✓ |
-| Workspace clippy | `cargo clippy --workspace --all-targets -- -D warnings` | Zero warnings | Passed | ✓ |
-| Live health check | `curl -s http://127.0.0.1:50051/api/health` | API returns healthy status | `{"status":"ok","version":"0.3.34"}` | ✓ |
-| Live tools check | `curl -s http://127.0.0.1:50051/api/tools` | Discovery tools and skill callable tools are visible | Included `skill_search`, `skill_get_instructions`, and skill tool `node_live_check` | ✓ |
-| Live agents check | `curl -s http://127.0.0.1:50051/api/agents` | API responds with agent list | Returned local `assistant` agent with `auth_status:"missing"` | ✓ |
-| MiniMax skill-discovery live check | Fresh `skill-probe` agent on `127.0.0.1:50124` | Model should discover and load a relevant skill before acting | Observed `skill_search`, then `skill_get_instructions("github")`, then execution guided by the skill | ✓ |
-| MiniMax skill-discovery re-check without XML recovery | Fresh `skill-probe-xml-off` agent on `127.0.0.1:50124` | Clean-agent flow should still work if XML recovery is unnecessary | Observed `skill_search`, then `skill_get_instructions("github")`, then `shell_exec` without XML recovery logic present | ✓ |
+| Workspace clippy | `cargo clippy --workspace --all-targets -- -D warnings` | Zero warnings | Failed only on pre-existing `openfang-cli/src/main.rs` `collapsible_else_if` warnings | △ |
+| Live health check | `curl -s http://127.0.0.1:4200/api/health` | API returns healthy status | `{"status":"ok","version":"0.3.34"}` | ✓ |
+| Live tools check | `curl -s http://127.0.0.1:4200/api/tools` | Discovery tools are visible on the daemon | Included builtin `skill_search`, `tool_search`, and `skill_get_instructions` | ✓ |
+| Live agents check | `curl -s http://127.0.0.1:4200/api/agents` | API responds with agent list | Returned configured MiniMax-backed local agents | ✓ |
+| Live dashboard check | `curl -s http://127.0.0.1:4200/ | head` | Dashboard HTML is served | Returned `OpenFang Dashboard` HTML | ✓ |
+| Live assistant LLM check | `POST /api/agents/{assistant}/message` | Real provider call succeeds and usage updates | Response returned, `/api/budget` spend increased | ✓ |
+| Live dynamic-expansion discovery check | Fresh `live-skill-searcher` agent on `127.0.0.1:4200` | Model should discover a hidden skill tool in one request | Response identified newly visible `github_comment` after `skill_search` | ✓ |
+| Live dynamic-expansion single-message execution check | Fresh `live-skill-searcher-2` agent on `127.0.0.1:4200` | Model should search, expand, and invoke the new skill tool in one top-level message | Response quoted `github_comment` tool output after same-turn invocation | ✓ |
+| Live `defer_loading` execution re-check | Fresh `live-skill-searcher-defer` agent on `127.0.0.1:4200` | Explicit `defer_loading` wiring should preserve same-message expansion and invocation | Response returned successful `github_comment` output after `skill_search` | ✓ |
+| Live `tool_search` alias execution check | Fresh `live-tool-searcher` agent on `127.0.0.1:4200` | Model should use `tool_search`, expand the hidden skill tool, and invoke it in one top-level message | Response quoted the exact prompt-only `github_comment` tool result; `/api/budget/agents` recorded `live-tool-searcher` spend | ✓ |
+| Live generic `tool_search` result-shape check | Fresh `live-tool-searcher-generic` agent on `127.0.0.1:4200` after rebuilding `openfang-cli` | `tool_search` should return generic tool-centric results and still expand/invoke the hidden skill tool | Session log showed `tool_search` returning `{name:\"github_comment\", source:\"skill\", provider:\"live-tool-search-helper\"}` before same-message `github_comment` invocation; `/api/budget/agents` recorded spend | ✓ |
+| Live MCP deferred expansion check | Fresh `live-mcp-tool-searcher` agent on `127.0.0.1:4200` with `mcp_servers = [\"MiniMax\"]` | `tool_search` should discover a deferred MCP tool, expand it, and invoke it in the same top-level message | Session log showed `tool_search` returning `mcp_minimax_web_search` with `source:\"mcp\"`, then same-message `mcp_minimax_web_search` returned live web search results; `/api/budget/agents/{id}` recorded `0.0440814` USD spend | ✓ |
+| Live MCP HTTP tools-list filter check | `POST /mcp` `tools/list` on `127.0.0.1:4200` | External MCP surface should still include normal builtin/MCP tools but exclude loop-only discovery helpers | `file_read` and `mcp_minimax_web_search` remained visible while `tool_search`, `skill_search`, and `skill_get_instructions` were absent | ✓ |
+| Live API tools compatibility check | `GET /api/tools` on `127.0.0.1:4200` | Internal API catalog should still expose compatibility tools during migration | `tool_search`, `skill_search`, and `skill_get_instructions` all remained present in `/api/tools` | ✓ |
 
 ## Error Log
 | Timestamp | Error | Attempt | Resolution |
@@ -124,13 +189,21 @@
 | 2026-03-11 | Initial MiniMax failure sample suggested XML-style text tool calls might require recovery | Re-ran the same scenario on a fresh agent after isolating variables | Determined XML recovery was not required for the Phase 1 flow and removed it |
 | 2026-03-11 | Existing legacy `assistant` agent exposed `## Skills` in prompt while missing discovery tools in its actual tool surface | Compared legacy-agent behavior with a fresh agent | Kept prompt/tool-surface gating, but removed legacy full-mode tool backfill from the final change set |
 | 2026-03-11 | Anthropic-style `tool_search` flow did not map cleanly onto the current OpenFang loop | Re-read the tool protocol, MCP behavior, and `agent_loop` iteration model | Confirmed the missing piece is automatic expansion of new `ToolDefinition` values into subsequent LLM requests |
-|-----------|-------|---------|------------|
+| 2026-03-12 | Second top-level live message could not call `github_comment` without re-running discovery | Sent a follow-up message to the same probe agent | Confirmed dynamic expansion is intentionally scoped to a single top-level message / loop lifetime |
+| 2026-03-12 | `defer_loading` could not safely hide arbitrary deferred tools yet | Reviewed the current runtime expansion paths while implementing the field | Kept the current generic field, but only skill-provided deferred tools are hidden/expanded until `tool_search` grows beyond skill-backed sources |
+| 2026-03-12 | First live `tool_search` alias probe did not perform a real GitHub side effect | Sent an explicit same-message discovery/invocation request to a fresh MiniMax-backed probe agent | Confirmed the alias path works and tool invocation happens; the remaining limitation is that the discovered `github_comment` skill is prompt-only, so execution correctly returns instructional output instead of posting |
+| 2026-03-12 | First post-refactor `tool_search` live probe still returned legacy skill-search payloads | Inspected the session log after a successful tool call | Found the daemon was still running a stale CLI binary; rebuilt `openfang-cli`, restarted the daemon, and confirmed the new tool-centric result shape live |
+| 2026-03-12 | Need proof that generic `tool_search` handles a real non-skill deferred source | Marked MCP tools as deferred, rebuilt the CLI binary, and ran a fresh MiniMax-backed probe agent with `mcp_servers = ["MiniMax"]` | Confirmed same-message `tool_search -> mcp_minimax_web_search` works live and records agent spend |
+| 2026-03-12 | External MCP clients could still see discovery helpers even though they require loop-local `ToolRunner` state | Reviewed `/mcp` request handling and validated the live `tools/list` payload | Filtered `tool_search`, `skill_search`, and `skill_get_instructions` out of `/mcp`; live `tools/list` now exposes only externally meaningful tools |
+| 2026-03-12 | `skill_search` was still part of the default discovery surface even though `tool_search` is now the canonical path | Audited profiles, prompt wording, and migration tests | Removed `skill_search` from standard `ToolProfile`s and default prompt guidance while keeping the builtin alias for compatibility |
+| 2026-03-12 | `skill_search` compatibility code was still present in runtime and kernel after the public migration to `tool_search` | Audited builtin registry, `ToolRunner`, `KernelHandle`, and prompt plumbing, then reran live surface checks | Deleted the builtin `skill_search` tool and its runtime/kernel support so `tool_search` is now the only discovery entry; `skill_get_instructions` remains |
+| 2026-03-12 | `skill_get_instructions` was still outside the unified discovery path after `skill_search` removal | Extended `tool_search` to merge prompt-only/manual skill matches with deferred-tool matches, then validated the new flow live | `tool_search` now returns `skill_manual` entries, and a real MiniMax-backed probe agent completed `tool_search -> skill_get_instructions` in one top-level message |
 
 ## 5-Question Reboot Check
 | Question | Answer |
 |----------|--------|
 | Where am I? | Phase 1 discovery with implementation entry points identified |
-| Where am I going? | Next-stage design review for Anthropic-compatible `tool_search` with automatic tool expansion |
-| What's the goal? | Preserve the completed Phase 1 behavior while redesigning the next phase around `tool_search`, `defer_loading`, and dynamic tool expansion |
-| What have I learned? | LLMs already receive unified `ToolDefinition` objects for builtin, skill, and MCP, but the current `agent_loop` cannot dynamically expand the tool set after a search result |
-| What have I done? | Implemented and validated Phase 1, removed non-essential compatibility patches, then updated the design docs to capture the next-stage constraints and the current `agent_loop` gap |
+| Where am I going? | Consolidate the now-live `tool_search` rollout around skill + MCP deferred sources without changing builtin visibility |
+| What's the goal? | Preserve the working skill discovery flow while turning `tool_search` into the single runtime-owned deferred discovery surface |
+| What have I learned? | `ToolRunner` now owns loop-local visibility for both skill and MCP deferred tools; builtin tools should remain `defer_loading = false`, and a separate `skill_search` alias is no longer needed once `tool_search` fully owns discovery |
+| What have I done? | Implemented and validated Phase 1, added loop-local `ToolRunner` ownership, formalized `defer_loading`, introduced `tool_search`, moved it onto a generic hidden-tool search, live-validated same-message expansion for skill and MCP tools, removed `skill_search`, and then folded prompt-only/manual skill loading back into the unified `tool_search -> skill_get_instructions` path |
