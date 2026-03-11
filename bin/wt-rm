@@ -2,9 +2,18 @@
 
 set -euo pipefail
 
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=bin/wt-lib
+source "$script_dir/wt-lib"
+
 usage() {
   echo "usage: $(basename "$0") <branch> [bucket-dir]" >&2
 }
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
 
 if [[ $# -lt 1 || $# -gt 2 ]]; then
   usage
@@ -12,16 +21,12 @@ if [[ $# -lt 1 || $# -gt 2 ]]; then
 fi
 
 branch="$1"
-
-git_common_dir="$(git rev-parse --path-format=absolute --git-common-dir)"
-repo_root="$(dirname "$git_common_dir")"
-repo_parent="$(dirname "$repo_root")"
-bucket="${2:-$repo_parent/openfang-0.1.0}"
+bucket="${2:-$(wt_default_bucket)}"
 dir_name="${branch//\//-}"
 target_dir="$bucket/$dir_name"
 
-git -C "$repo_root" worktree remove "$target_dir"
-git -C "$repo_root" branch -d "$branch"
+git -C "$wt_repo_root" worktree remove "$target_dir"
+git -C "$wt_repo_root" branch -d "$branch"
 
 echo "Removed worktree:"
 echo "  branch: $branch"

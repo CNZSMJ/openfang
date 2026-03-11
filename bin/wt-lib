@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+wt_git_common_dir="$(git rev-parse --path-format=absolute --git-common-dir)"
+wt_repo_root="$(dirname "$wt_git_common_dir")"
+wt_repo_parent="$(dirname "$wt_repo_root")"
+wt_current_root="$(git rev-parse --path-format=absolute --show-toplevel)"
+
+wt_git_config() {
+  git -C "$wt_repo_root" config --get "$1" 2>/dev/null || true
+}
+
+wt_default_remote() {
+  local configured
+  configured="$(wt_git_config openfang.worktree.remote)"
+  if [[ -n "$configured" ]]; then
+    printf '%s\n' "$configured"
+    return
+  fi
+  printf 'origin\n'
+}
+
+wt_default_base_branch() {
+  local configured
+  configured="$(wt_git_config openfang.worktree.base-branch)"
+  if [[ -n "$configured" ]]; then
+    printf '%s\n' "$configured"
+    return
+  fi
+  printf 'custom/0.1.0\n'
+}
+
+wt_default_bucket() {
+  local configured
+  configured="$(wt_git_config openfang.worktree.bucket)"
+  if [[ -n "$configured" ]]; then
+    printf '%s\n' "$configured"
+    return
+  fi
+
+  if [[ "$wt_current_root" != "$wt_repo_root" ]]; then
+    printf '%s\n' "$(dirname "$wt_current_root")"
+    return
+  fi
+
+  printf '%s\n' "$wt_repo_parent/openfang-0.1.0"
+}
+
+wt_repo_slug_from_remote() {
+  local remote="${1:-$(wt_default_remote)}"
+  local remote_url slug
+  remote_url="$(git -C "$wt_repo_root" remote get-url "$remote" 2>/dev/null || true)"
+  slug=""
+
+  if [[ -n "$remote_url" ]]; then
+    case "$remote_url" in
+      git@github.com:*.git)
+        slug="${remote_url#git@github.com:}"
+        slug="${slug%.git}"
+        ;;
+      https://github.com/*)
+        slug="${remote_url#https://github.com/}"
+        slug="${slug%.git}"
+        ;;
+      ssh://git@github.com/*)
+        slug="${remote_url#ssh://git@github.com/}"
+        slug="${slug%.git}"
+        ;;
+    esac
+  fi
+
+  printf '%s\n' "$slug"
+}
