@@ -432,6 +432,35 @@ pub async fn execute_tool(
         // Canvas / A2UI tool
         "canvas_present" => tool_canvas_present(input, workspace_root).await,
 
+        // Skill discovery tool
+        "skill_search" => {
+            let query = input["query"].as_str().unwrap_or("").trim();
+            let top_k = input["top_k"].as_u64().unwrap_or(3) as usize;
+            let results = if let Some(kh) = kernel {
+                match kh.skill_search(query, top_k, caller_agent_id) {
+                    Ok(results) => results,
+                    Err(err) => {
+                        return ToolResult {
+                            tool_use_id: tool_use_id.to_string(),
+                            content: err,
+                            is_error: true,
+                        };
+                    }
+                }
+            } else if let Some(registry) = skill_registry {
+                registry.search(query, top_k, None)
+            } else {
+                return ToolResult {
+                    tool_use_id: tool_use_id.to_string(),
+                    content: "Skill registry not available.".to_string(),
+                    is_error: true,
+                };
+            };
+
+            serde_json::to_string_pretty(&serde_json::json!({ "results": results }))
+                .map_err(|e| format!("Failed to serialize skill search results: {e}"))
+        }
+
         // Skill documentation tool
         "skill_get_instructions" => {
             let name = input["skill_name"].as_str().unwrap_or("");
@@ -902,6 +931,18 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     "prompt": { "type": "string", "description": "Optional prompt for vision analysis (e.g., 'Describe what you see')" }
                 },
                 "required": ["path"]
+            }),
+        },
+        ToolDefinition {
+            name: "skill_search".to_string(),
+            description: "Search locally available skills by natural-language task intent. Use this before loading a skill manual when specialized guidance may help.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Natural-language description of the task or intent" },
+                    "top_k": { "type": "integer", "description": "Maximum number of matches to return (default: 3)" }
+                },
+                "required": ["query"]
             }),
         },
         ToolDefinition {
@@ -3351,6 +3392,9 @@ mod tests {
         assert!(names.contains(&"docker_exec"));
         // Canvas tool
         assert!(names.contains(&"canvas_present"));
+        // Skill discovery tools
+        assert!(names.contains(&"skill_search"));
+        assert!(names.contains(&"skill_get_instructions"));
     }
 
     #[test]

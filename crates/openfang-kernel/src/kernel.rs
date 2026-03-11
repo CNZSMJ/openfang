@@ -1919,7 +1919,8 @@ impl OpenFangKernel {
                 base_system_prompt: manifest.model.system_prompt.clone(),
                 granted_tools: tools.iter().map(|t| t.name.clone()).collect(),
                 recalled_memories: vec![],
-                skills: self.collect_skill_info(&manifest.skills),
+                skills_available: tools.iter().any(|t| t.name == "skill_search")
+                    && self.has_visible_skills(&manifest.skills),
                 mcp_summary: if mcp_tool_count > 0 {
                     self.build_mcp_summary(&manifest.mcp_servers)
                 } else {
@@ -2404,7 +2405,8 @@ impl OpenFangKernel {
                 base_system_prompt: manifest.model.system_prompt.clone(),
                 granted_tools: tools.iter().map(|t| t.name.clone()).collect(),
                 recalled_memories: vec![], // Recalled in agent_loop, not here
-                skills: self.collect_skill_info(&manifest.skills),
+                skills_available: tools.iter().any(|t| t.name == "skill_search")
+                    && self.has_visible_skills(&manifest.skills),
                 mcp_summary: if mcp_tool_count > 0 {
                     self.build_mcp_summary(&manifest.mcp_servers)
                 } else {
@@ -4706,7 +4708,7 @@ impl OpenFangKernel {
 
         // Filter builtin tools by ToolProfile (if set and not Full).
         // This is the primary token-saving mechanism: a chat agent with ToolProfile::Minimal
-        // gets 2 tools instead of 46+, saving ~15-20K tokens of tool definitions.
+        // gets a small builtin surface instead of the full 46+ tool catalog.
         let has_tool_all = entry.as_ref().is_some_and(|_| {
             let caps = self.capabilities.list(agent_id);
             caps.iter().any(|c| matches!(c, Capability::ToolAll))
@@ -4811,7 +4813,6 @@ impl OpenFangKernel {
             all_tools.retain(|t| t.name != "shell_exec");
         }
 
-        // If agent has ToolAll, return all tools
         if caps.iter().any(|c| matches!(c, Capability::ToolAll)) {
             return all_tools;
         }
@@ -4930,41 +4931,16 @@ impl OpenFangKernel {
         *registry = fresh;
     }
 
-    fn collect_skill_info(
-        &self,
-        skill_allowlist: &[String],
-    ) -> Vec<openfang_runtime::prompt_builder::SkillInfo> {
+    fn has_visible_skills(&self, skill_allowlist: &[String]) -> bool {
         let registry = self
             .skill_registry
             .read()
             .unwrap_or_else(|e| e.into_inner());
-        registry
-            .list()
-            .into_iter()
-            .filter(|s| {
-                s.enabled
-                    && (skill_allowlist.is_empty()
-                        || skill_allowlist.contains(&s.manifest.skill.name))
-            })
-            .map(|s| openfang_runtime::prompt_builder::SkillInfo {
-                name: s.manifest.skill.name.clone(),
-                description: s.manifest.skill.description.clone(),
-                provided_tools: s
-                    .manifest
-                    .tools
-                    .provided
-                    .iter()
-                    .filter(|t| t.policy.model_invocable())
-                    .map(|t| t.name.clone())
-                    .collect(),
-                has_prompt_context: s
-                    .manifest
-                    .prompt_context
-                    .as_ref()
-                    .map(|c| !c.is_empty())
-                    .unwrap_or(false),
-            })
-            .collect()
+        registry.list().into_iter().any(|skill| {
+            skill.enabled
+                && (skill_allowlist.is_empty()
+                    || skill_allowlist.contains(&skill.manifest.skill.name))
+        })
     }
 }
 
@@ -5639,6 +5615,32 @@ impl KernelHandle for OpenFangKernel {
             .iter()
             .find(|(_, card)| card.name.to_lowercase() == name_lower)
             .map(|(_, card)| card.url.clone())
+    }
+
+    fn skill_search(
+        &self,
+        query: &str,
+        top_k: usize,
+        agent_id: Option<&str>,
+    ) -> Result<Vec<openfang_skills::SkillSearchResult>, String> {
+        let visible_skills = if let Some(raw_id) = agent_id {
+            let agent_id = raw_id
+                .parse::<AgentId>()
+                .map_err(|_| "Invalid agent ID".to_string())?;
+            let entry = self
+                .registry
+                .get(agent_id)
+                .ok_or_else(|| format!("Agent {} not found", agent_id))?;
+            Some(entry.manifest.skills.clone())
+        } else {
+            None
+        };
+
+        let registry = self
+            .skill_registry
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        Ok(registry.search(query, top_k, visible_skills.as_deref()))
     }
 
     async fn skill_install(

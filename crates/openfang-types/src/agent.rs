@@ -306,16 +306,37 @@ impl ToolProfile {
     /// Expand profile to tool name list.
     pub fn tools(&self) -> Vec<String> {
         match self {
-            Self::Minimal => vec!["file_read", "file_list"],
+            Self::Minimal => vec![
+                "file_read",
+                "file_list",
+                "skill_search",
+                "skill_get_instructions",
+            ],
             Self::Coding => vec![
                 "file_read",
                 "file_write",
                 "file_list",
                 "shell_exec",
                 "web_fetch",
+                "skill_search",
+                "skill_get_instructions",
             ],
-            Self::Research => vec!["web_fetch", "web_search", "file_read", "file_write"],
-            Self::Messaging => vec!["agent_send", "agent_list", "memory_store", "memory_recall"],
+            Self::Research => vec![
+                "web_fetch",
+                "web_search",
+                "file_read",
+                "file_write",
+                "skill_search",
+                "skill_get_instructions",
+            ],
+            Self::Messaging => vec![
+                "agent_send",
+                "agent_list",
+                "memory_store",
+                "memory_recall",
+                "skill_search",
+                "skill_get_instructions",
+            ],
             Self::Automation => vec![
                 "file_read",
                 "file_write",
@@ -327,6 +348,8 @@ impl ToolProfile {
                 "agent_list",
                 "memory_store",
                 "memory_recall",
+                "skill_search",
+                "skill_get_instructions",
             ],
             Self::Full | Self::Custom => vec!["*"],
         }
@@ -801,7 +824,15 @@ mod tests {
     #[test]
     fn test_tool_profile_minimal() {
         let tools = ToolProfile::Minimal.tools();
-        assert_eq!(tools, vec!["file_read", "file_list"]);
+        assert_eq!(
+            tools,
+            vec![
+                "file_read",
+                "file_list",
+                "skill_search",
+                "skill_get_instructions"
+            ]
+        );
     }
 
     #[test]
@@ -810,7 +841,8 @@ mod tests {
         assert!(tools.contains(&"file_read".to_string()));
         assert!(tools.contains(&"shell_exec".to_string()));
         assert!(tools.contains(&"web_fetch".to_string()));
-        assert_eq!(tools.len(), 5);
+        assert!(tools.contains(&"skill_search".to_string()));
+        assert_eq!(tools.len(), 7);
     }
 
     #[test]
@@ -818,7 +850,8 @@ mod tests {
         let tools = ToolProfile::Research.tools();
         assert!(tools.contains(&"web_fetch".to_string()));
         assert!(tools.contains(&"web_search".to_string()));
-        assert_eq!(tools.len(), 4);
+        assert!(tools.contains(&"skill_search".to_string()));
+        assert_eq!(tools.len(), 6);
     }
 
     #[test]
@@ -826,13 +859,14 @@ mod tests {
         let tools = ToolProfile::Messaging.tools();
         assert!(tools.contains(&"agent_send".to_string()));
         assert!(tools.contains(&"memory_recall".to_string()));
-        assert_eq!(tools.len(), 4);
+        assert!(tools.contains(&"skill_get_instructions".to_string()));
+        assert_eq!(tools.len(), 6);
     }
 
     #[test]
     fn test_tool_profile_automation() {
         let tools = ToolProfile::Automation.tools();
-        assert_eq!(tools.len(), 10);
+        assert_eq!(tools.len(), 12);
     }
 
     #[test]

@@ -3,8 +3,8 @@
 use crate::bundled;
 use crate::openclaw_compat;
 use crate::verify::SkillVerifier;
-use crate::{InstalledSkill, SkillError, SkillManifest, SkillToolDef};
-use std::collections::HashMap;
+use crate::{InstalledSkill, SkillError, SkillManifest, SkillSearchResult, SkillToolDef};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
@@ -250,6 +250,38 @@ impl SkillRegistry {
         self.skills.values().collect()
     }
 
+    /// Search installed skills using a lightweight lexical scorer.
+    pub fn search(
+        &self,
+        query: &str,
+        top_k: usize,
+        allowlist: Option<&[String]>,
+    ) -> Vec<SkillSearchResult> {
+        let normalized = NormalizedSkillQuery::new(query);
+        if normalized.is_empty() {
+            return Vec::new();
+        }
+
+        let mut results: Vec<SkillSearchResult> = self
+            .skills
+            .values()
+            .filter(|skill| skill.enabled)
+            .filter(|skill| match allowlist {
+                Some(names) if !names.is_empty() => names.contains(&skill.manifest.skill.name),
+                _ => true,
+            })
+            .filter_map(|skill| score_skill(skill, &normalized))
+            .collect();
+
+        results.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        results.truncate(top_k.clamp(1, 10));
+        results
+    }
+
     /// Remove a skill by name.
     pub fn remove(&mut self, name: &str) -> Result<(), SkillError> {
         let skill = self
@@ -411,6 +443,190 @@ impl SkillRegistry {
     }
 }
 
+const SKILL_SEARCH_STOPWORDS: &[&str] = &[
+    "a", "an", "and", "be", "best", "do", "for", "help", "how", "i", "in", "into", "is", "me",
+    "my", "of", "on", "or", "please", "the", "to", "use", "with",
+];
+
+const SKILL_SEARCH_ALIASES: &[(&str, &[&str])] = &[
+    ("k8s", &["kubernetes"]),
+    ("review", &["code", "reviewer"]),
+    ("pr", &["code", "reviewer"]),
+    ("email", &["email", "writer"]),
+    ("ts", &["typescript"]),
+    ("js", &["javascript"]),
+    ("rag", &["retrieval", "vector", "embeddings"]),
+    ("ml", &["machine", "learning"]),
+];
+
+#[derive(Debug, Clone)]
+struct NormalizedSkillQuery {
+    collapsed: String,
+    terms: Vec<String>,
+    alias_terms: Vec<(String, String)>,
+}
+
+impl NormalizedSkillQuery {
+    fn new(query: &str) -> Self {
+        let base_terms = tokenize_skill_text(query);
+        let mut terms = base_terms.clone();
+        let mut alias_terms = Vec::new();
+
+        for term in &base_terms {
+            for expansion in alias_expansions(term) {
+                alias_terms.push((term.clone(), expansion.clone()));
+                if !terms.iter().any(|existing| existing == &expansion) {
+                    terms.push(expansion);
+                }
+            }
+        }
+
+        Self {
+            collapsed: collapse_skill_text(query),
+            terms,
+            alias_terms,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.collapsed.is_empty() && self.terms.is_empty()
+    }
+}
+
+fn score_skill(skill: &InstalledSkill, query: &NormalizedSkillQuery) -> Option<SkillSearchResult> {
+    let skill_name = &skill.manifest.skill.name;
+    let description = &skill.manifest.skill.description;
+    let skill_name_collapsed = collapse_skill_text(skill_name);
+    let skill_name_tokens: HashSet<String> = tokenize_skill_text(skill_name).into_iter().collect();
+    let description_tokens: HashSet<String> =
+        tokenize_skill_text(description).into_iter().collect();
+    let tag_tokens: HashSet<String> = skill
+        .manifest
+        .skill
+        .tags
+        .iter()
+        .flat_map(|tag| tokenize_skill_text(tag))
+        .collect();
+    let tool_tokens: HashSet<String> = skill
+        .manifest
+        .tools
+        .provided
+        .iter()
+        .flat_map(|tool| {
+            let mut tokens = tokenize_skill_text(&tool.name);
+            tokens.extend(tokenize_skill_text(&tool.description));
+            tokens
+        })
+        .collect();
+
+    let mut score = 0.0f32;
+    let mut reasons = Vec::new();
+
+    if !query.collapsed.is_empty() && query.collapsed == skill_name_collapsed {
+        score += 10.0;
+        reasons.push(format!("name:{skill_name}"));
+    } else if !query.collapsed.is_empty()
+        && (skill_name_collapsed.starts_with(&query.collapsed)
+            || query
+                .terms
+                .iter()
+                .any(|term| !term.is_empty() && skill_name_collapsed.starts_with(term)))
+    {
+        score += 6.0;
+        reasons.push(format!("name_prefix:{skill_name}"));
+    }
+
+    for (alias, expansion) in &query.alias_terms {
+        if skill_name_tokens.contains(expansion) || tag_tokens.contains(expansion) {
+            score += 4.0;
+            reasons.push(format!("alias:{alias}->{expansion}"));
+        }
+    }
+
+    let mut description_hits = 0usize;
+    let mut tag_hits = 0usize;
+    let mut tool_hits = 0usize;
+
+    for term in &query.terms {
+        if description_tokens.contains(term) {
+            description_hits += 1;
+            reasons.push(format!("description:{term}"));
+        }
+        if tag_tokens.contains(term) {
+            tag_hits += 1;
+            reasons.push(format!("tag:{term}"));
+        }
+        if tool_tokens.contains(term) {
+            tool_hits += 1;
+            reasons.push(format!("tool:{term}"));
+        }
+    }
+
+    score += 3.0 * description_hits as f32;
+    score += 2.0 * tag_hits as f32;
+    score += tool_hits as f32;
+
+    let has_prompt_context = skill
+        .manifest
+        .prompt_context
+        .as_ref()
+        .map(|ctx| !ctx.trim().is_empty())
+        .unwrap_or(false);
+    if has_prompt_context {
+        score += 0.5;
+    }
+
+    if score <= 0.0 {
+        return None;
+    }
+
+    let match_reason: Vec<String> = reasons
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .take(5)
+        .collect();
+
+    Some(SkillSearchResult {
+        name: skill_name.clone(),
+        description: description.clone(),
+        tags: skill.manifest.skill.tags.clone(),
+        tools_count: skill.manifest.tools.provided.len(),
+        has_prompt_context,
+        score: (score * 100.0).round() / 100.0,
+        match_reason,
+    })
+}
+
+fn alias_expansions(term: &str) -> Vec<String> {
+    SKILL_SEARCH_ALIASES
+        .iter()
+        .find(|(alias, _)| *alias == term)
+        .map(|(_, expansions)| {
+            expansions
+                .iter()
+                .flat_map(|value| tokenize_skill_text(value))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn tokenize_skill_text(text: &str) -> Vec<String> {
+    text.to_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .filter(|part| !SKILL_SEARCH_STOPWORDS.iter().any(|stopword| stopword == part))
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn collapse_skill_text(text: &str) -> String {
+    text.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -440,6 +656,12 @@ input_schema = {{ type = "object" }}
             ),
         )
         .unwrap();
+    }
+
+    fn create_test_skill_with_manifest(dir: &Path, name: &str, manifest: &str) {
+        let skill_dir = dir.join(name);
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("skill.toml"), manifest).unwrap();
     }
 
     #[test]
@@ -615,5 +837,93 @@ input_schema = {{ type = "object" }}
         assert_eq!(manifest.runtime.runtime_type, crate::SkillRuntime::Node);
         assert_eq!(manifest.runtime.entry, "index.js");
         assert!(skill_dir.join("skill.toml").exists());
+    }
+
+    #[test]
+    fn test_search_matches_name_and_tags() {
+        let dir = TempDir::new().unwrap();
+        create_test_skill_with_manifest(
+            dir.path(),
+            "rust-expert",
+            r#"
+[skill]
+name = "rust-expert"
+description = "Rust expert for ownership, lifetimes, and async code"
+tags = ["rust", "systems"]
+
+[[tools.provided]]
+name = "cargo_check"
+description = "Run cargo check"
+input_schema = { type = "object" }
+"#,
+        );
+
+        let mut registry = SkillRegistry::new(dir.path().to_path_buf());
+        registry.load_all().unwrap();
+
+        let results = registry.search("Need help with Rust ownership", 3, None);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "rust-expert");
+        assert!(results[0].match_reason.iter().any(|reason| reason == "tag:rust"));
+        assert!(results[0].score > 0.0);
+    }
+
+    #[test]
+    fn test_search_uses_alias_expansion() {
+        let dir = TempDir::new().unwrap();
+        create_test_skill_with_manifest(
+            dir.path(),
+            "code-reviewer",
+            r#"
+[skill]
+name = "code-reviewer"
+description = "Review pull requests and flag bugs"
+tags = ["code", "reviewer"]
+"#,
+        );
+
+        let mut registry = SkillRegistry::new(dir.path().to_path_buf());
+        registry.load_all().unwrap();
+
+        let results = registry.search("review this PR", 3, None);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "code-reviewer");
+        assert!(
+            results[0]
+                .match_reason
+                .iter()
+                .any(|reason| reason.starts_with("alias:review->"))
+        );
+    }
+
+    #[test]
+    fn test_search_respects_allowlist() {
+        let dir = TempDir::new().unwrap();
+        create_test_skill_with_manifest(
+            dir.path(),
+            "rust-expert",
+            r#"
+[skill]
+name = "rust-expert"
+description = "Rust expert"
+tags = ["rust"]
+"#,
+        );
+        create_test_skill_with_manifest(
+            dir.path(),
+            "python-expert",
+            r#"
+[skill]
+name = "python-expert"
+description = "Python expert"
+tags = ["python"]
+"#,
+        );
+
+        let mut registry = SkillRegistry::new(dir.path().to_path_buf());
+        registry.load_all().unwrap();
+
+        let results = registry.search("python", 5, Some(&["rust-expert".to_string()]));
+        assert!(results.is_empty());
     }
 }

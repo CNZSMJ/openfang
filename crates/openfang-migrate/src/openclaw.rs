@@ -3959,11 +3959,13 @@ mod tests {
     #[test]
     fn test_tools_for_profile() {
         let minimal = tools_for_profile("minimal");
-        assert_eq!(minimal.len(), 2);
+        assert!(minimal.len() >= 2);
         assert!(minimal.contains(&"file_read".to_string()));
+        assert!(minimal.contains(&"skill_search".to_string()));
 
         let coding = tools_for_profile("coding");
         assert!(coding.contains(&"shell_exec".to_string()));
+        assert!(coding.contains(&"skill_get_instructions".to_string()));
 
         let full = tools_for_profile("full");
         assert!(full.contains(&"*".to_string()));

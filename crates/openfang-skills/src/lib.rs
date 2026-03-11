@@ -190,6 +190,25 @@ pub struct InstalledSkill {
     pub enabled: bool,
 }
 
+/// Ranked local-skill discovery result for runtime search.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SkillSearchResult {
+    /// Unique skill name.
+    pub name: String,
+    /// Human-readable description.
+    pub description: String,
+    /// Declared tags for lightweight reasoning.
+    pub tags: Vec<String>,
+    /// Number of callable tools exposed by this skill.
+    pub tools_count: usize,
+    /// Whether the skill has a prompt manual that can be expanded.
+    pub has_prompt_context: bool,
+    /// Lexical relevance score used for ranking.
+    pub score: f32,
+    /// Short explanation of why the skill matched.
+    pub match_reason: Vec<String>,
+}
+
 /// Result of executing a skill tool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillToolResult {
