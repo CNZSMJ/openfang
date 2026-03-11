@@ -1,5 +1,6 @@
 //! Discover and load agent templates from the agents directory.
 
+use openfang_types::agent::AgentScaffold;
 use std::path::PathBuf;
 
 /// A discovered agent template.
@@ -10,6 +11,33 @@ pub struct AgentTemplate {
     pub description: String,
     /// Raw TOML content.
     pub content: String,
+    /// Optional scaffold content loaded from sibling prompt files.
+    pub scaffold: Option<AgentScaffold>,
+}
+
+fn read_optional_file(path: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn scaffold_from_dir(dir: &std::path::Path) -> Option<AgentScaffold> {
+    let scaffold = AgentScaffold {
+        soul_md: read_optional_file(&dir.join("SOUL.md")),
+        user_md: read_optional_file(&dir.join("USER.md")),
+        tools_md: read_optional_file(&dir.join("TOOLS.md")),
+        memory_md: read_optional_file(&dir.join("MEMORY.md")),
+        agents_md: read_optional_file(&dir.join("AGENTS.md")),
+        bootstrap_md: read_optional_file(&dir.join("BOOTSTRAP.md")),
+        identity_md: read_optional_file(&dir.join("IDENTITY.md")),
+        heartbeat_md: read_optional_file(&dir.join("HEARTBEAT.md")),
+    };
+    if scaffold == AgentScaffold::default() {
+        None
+    } else {
+        Some(scaffold)
+    }
 }
 
 /// Discover template directories. Checks:
@@ -88,6 +116,7 @@ pub fn load_all_templates() -> Vec<AgentTemplate> {
                         name,
                         description,
                         content,
+                        scaffold: scaffold_from_dir(&path),
                     });
                 }
             }
@@ -102,6 +131,7 @@ pub fn load_all_templates() -> Vec<AgentTemplate> {
                 name: name.to_string(),
                 description,
                 content: content.to_string(),
+                scaffold: crate::bundled_agents::bundled_scaffold(name),
             });
         }
     }

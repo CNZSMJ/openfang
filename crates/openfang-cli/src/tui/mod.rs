@@ -1301,8 +1301,8 @@ impl App {
             agents::AgentAction::Back => {
                 // In Main phase, Esc from agents just stays on the tab
             }
-            agents::AgentAction::CreatedManifest(toml_content) => {
-                self.spawn_agent(toml_content);
+            agents::AgentAction::CreatedManifest(toml_content, scaffold) => {
+                self.spawn_agent(toml_content, scaffold);
             }
             agents::AgentAction::ChatWithAgent { id, name } => {
                 // From detail view — enter chat with this agent
@@ -1632,7 +1632,7 @@ impl App {
                         "name = \"{}\"\ndescription = \"{}\"\n\n[model]\nprovider = \"{}\"\nmodel = \"{}\"\n\n[capabilities]\ntools = [\"shell\", \"file_read\", \"file_write\", \"web_fetch\", \"web_search\"]\n",
                         t.name, t.description, t.provider, t.model,
                     );
-                    self.spawn_agent(toml_content);
+                    self.spawn_agent(toml_content, None);
                 }
             }
         }
@@ -1818,11 +1818,20 @@ impl App {
         }
     }
 
-    fn spawn_agent(&mut self, toml_content: String) {
+    fn spawn_agent(
+        &mut self,
+        toml_content: String,
+        scaffold: Option<openfang_types::agent::AgentScaffold>,
+    ) {
         match &self.backend {
             Backend::Daemon { base_url } => {
                 self.agents.sub = agents::AgentSubScreen::Spawning;
-                event::spawn_daemon_agent(base_url.clone(), toml_content, self.event_tx.clone());
+                event::spawn_daemon_agent(
+                    base_url.clone(),
+                    toml_content,
+                    scaffold,
+                    self.event_tx.clone(),
+                );
             }
             Backend::InProcess { kernel } => {
                 let manifest: openfang_types::agent::AgentManifest =
@@ -1835,7 +1844,7 @@ impl App {
                         }
                     };
                 let name = manifest.name.clone();
-                match kernel.spawn_agent(manifest) {
+                match kernel.spawn_agent_with_scaffold(manifest, scaffold) {
                     Ok(id) => self.enter_chat_inprocess(id, name),
                     Err(e) => {
                         self.agents.status_msg = format!("Spawn failed: {e}");

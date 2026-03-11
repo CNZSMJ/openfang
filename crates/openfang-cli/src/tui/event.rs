@@ -3,7 +3,7 @@
 use openfang_kernel::OpenFangKernel;
 use openfang_runtime::agent_loop::AgentLoopResult;
 use openfang_runtime::llm_driver::StreamEvent;
-use openfang_types::agent::AgentId;
+use openfang_types::agent::{AgentId, AgentScaffold};
 use ratatui::crossterm::event::{self, Event as CtEvent, KeyEvent, KeyEventKind};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
@@ -485,7 +485,12 @@ fn daemon_fallback(
 }
 
 /// Spawn a background thread that spawns an agent on the daemon.
-pub fn spawn_daemon_agent(base_url: String, toml_content: String, tx: mpsc::Sender<AppEvent>) {
+pub fn spawn_daemon_agent(
+    base_url: String,
+    toml_content: String,
+    scaffold: Option<AgentScaffold>,
+    tx: mpsc::Sender<AppEvent>,
+) {
     std::thread::spawn(move || {
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(30))
@@ -494,7 +499,7 @@ pub fn spawn_daemon_agent(base_url: String, toml_content: String, tx: mpsc::Send
 
         let resp = client
             .post(format!("{base_url}/api/agents"))
-            .json(&serde_json::json!({"manifest_toml": toml_content}))
+            .json(&serde_json::json!({"manifest_toml": toml_content, "scaffold": scaffold}))
             .send();
 
         match resp {

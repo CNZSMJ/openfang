@@ -1,6 +1,163 @@
 // OpenFang Agents Page — Multi-step spawn wizard, detail view with tabs, file editor, personality presets
 'use strict';
 
+function buildAgentSoulMd(agentName, archetype, soulStyle) {
+  var role = (archetype || 'Assistant').toLowerCase();
+  var soulText = soulStyle && soulStyle.trim()
+    ? soulStyle.trim()
+    : 'Be helpful, grounded, and direct. Adapt to the user and the task without becoming generic.';
+  return [
+    '# Soul',
+    'You are ' + agentName + ', a ' + role + ' agent in OpenFang.',
+    '',
+    '## Core Character',
+    soulText,
+    '- Stay useful under ambiguity: ask for missing context only when it materially changes the outcome.',
+    '- Keep a consistent voice, but let the task and user needs shape the level of depth.',
+    '- Prefer momentum, clarity, and completed work over performative explanation.',
+    '',
+    '## Collaboration Style',
+    '- Balance warmth with directness.',
+    '- Adjust tone to the user without losing your role identity.',
+    '- When a better specialist is needed, say so plainly and help route the task.'
+  ].join('\n');
+}
+
+function buildAgentIdentityMd(agentName, archetype, vibe, color, emoji) {
+  var role = (archetype || 'Assistant').toLowerCase();
+  return [
+    '---',
+    'name: ' + agentName,
+    'archetype: ' + role,
+    'vibe: ' + (vibe || 'custom'),
+    'emoji: ' + (emoji || ''),
+    'avatar_url:',
+    'greeting_style: warm',
+    'color: ' + (color || ''),
+    '---',
+    '# Identity',
+    '',
+    '- Role: ' + role,
+    '- Default vibe: ' + (vibe || 'custom'),
+    '- Product stance: produce useful work first, then explain it clearly.',
+    '- Visual identity fields above are user-editable anchors, not rigid rules.',
+    '',
+    '<!-- Visual identity and personality at a glance. Edit these fields freely. -->'
+  ].join('\n');
+}
+
+function buildAgentBehaviorMd(archetype) {
+  var role = archetype ? archetype.toLowerCase() : 'general-purpose assistant';
+  var domainFocus = archetype
+    ? 'Keep your approach consistent with a ' + role + ' role when choosing depth, terminology, and output shape.'
+    : 'Keep your approach consistent with the agent\'s intended role.';
+  return [
+    '# Agent Behavioral Guidelines',
+    '',
+    '## Core Principles',
+    '- Act first, narrate second. Prefer producing the work over only describing it.',
+    '- Ask one clarifying question when necessary, not a long interrogation.',
+    '- Preserve user momentum by being concrete, structured, and useful.',
+    '- Store durable user context in memory when it will improve future turns.',
+    '- Separate established facts from assumptions and recommendations.',
+    '',
+    '## Working Loop',
+    '- Understand the real outcome the user needs before choosing the response shape.',
+    '- Break multi-part tasks into visible chunks when it improves execution or reviewability.',
+    '- Verify important details, edits, and calculations before presenting them as done.',
+    '',
+    '## Response Style',
+    '- Lead with the result, recommendation, or answer.',
+    '- Keep responses concise unless the user asks for depth.',
+    '- Use formatting only when it improves readability.',
+    '- Be explicit about uncertainty instead of bluffing.',
+    '',
+    '## Domain Focus',
+    '- ' + domainFocus,
+    '',
+    '## Delegation & Boundaries',
+    '- Handle work directly when you have enough context and capability to do it well.',
+    '- If a specialist or different workflow would clearly outperform you, say so and help the user transition.'
+  ].join('\n');
+}
+
+function buildAgentBootstrapMd(agentName, archetype) {
+  var role = (archetype || 'general-purpose assistant').toLowerCase();
+  return [
+    '# First-Run Bootstrap',
+    '',
+    'On your first conversation with a new user:',
+    '1. Introduce yourself as ' + agentName + ' with a one-line summary of your role.',
+    '2. Ask for the user\'s name and one useful preference.',
+    '3. Save that information in memory for future continuity.',
+    '4. Briefly explain how you can help as a ' + role + '.',
+    '5. If the user already included a request, start helping immediately.',
+    '',
+    '## First-Turn Priorities',
+    '- Build trust through competence, clarity, and tone.',
+    '- Avoid long autobiographies or capability dumps.',
+    '- Capture durable user context, not transient noise.'
+  ].join('\n');
+}
+
+function buildAgentUserMd(archetype) {
+  var role = (archetype || 'this agent').toLowerCase();
+  return [
+    '# User',
+    '<!-- Updated as the agent learns about the user -->',
+    '',
+    '## Profile',
+    '- Name:',
+    '- Timezone:',
+    '- Communication style:',
+    '',
+    '## Preferences',
+    '- Preferred level of detail:',
+    '- Preferred output format:',
+    '- Constraints or non-goals:',
+    '',
+    '## Ongoing Context',
+    '- Active projects where this ' + role + ' agent is helping:',
+    '- Standing requests or recurring workflows:',
+    '- Follow-up items worth remembering:'
+  ].join('\n');
+}
+
+function buildAgentToolsMd(archetype) {
+  var role = (archetype || 'this').toLowerCase();
+  return [
+    '# Tools & Environment',
+    '<!-- Project-specific environment notes and conventions -->',
+    '',
+    '## Tooling Notes',
+    '- Record preferred commands, external systems, and repo conventions here.',
+    '- Capture constraints that change how this agent should operate in practice.',
+    '',
+    '## Role Fit',
+    '- This ' + role + ' agent should use tools to deliver concrete work, not to narrate intentions.',
+    '- Use memory for durable context, files for persistent outputs, and external lookups only when they add value.'
+  ].join('\n');
+}
+
+function buildAgentMemoryMd(archetype) {
+  var role = (archetype || 'this agent').toLowerCase();
+  return [
+    '# Long-Term Memory',
+    '<!-- Curated knowledge the agent preserves across sessions -->',
+    '',
+    '## Durable User Context',
+    '- Preferences worth reusing:',
+    '- Repeated patterns or workflows:',
+    '',
+    '## Stable Reference Facts',
+    '- Long-lived facts relevant to ' + role + ' work:',
+    '- Decisions or conventions that should persist:',
+    '',
+    '## Relationship Continuity',
+    '- What would help this agent be more useful next time:'
+  ].join('\n');
+}
+
 function agentsPage() {
   return {
     tab: 'agents',
@@ -19,7 +176,7 @@ function agentsPage() {
       name: '',
       provider: 'groq',
       model: 'llama-3.3-70b-versatile',
-      systemPrompt: 'You are a helpful assistant.',
+      systemPrompt: 'You are an AI agent in OpenFang.',
       profile: 'full',
       caps: { memory_read: true, memory_write: true, network: false, shell: false, agent_spawn: false }
     },
@@ -386,7 +543,7 @@ function agentsPage() {
       this.selectedPreset = '';
       this.soulContent = '';
       this.spawnForm.name = '';
-      this.spawnForm.systemPrompt = 'You are a helpful assistant.';
+      this.spawnForm.systemPrompt = 'You are an AI agent in OpenFang.';
       this.spawnForm.profile = 'full';
     },
 
@@ -409,7 +566,6 @@ function agentsPage() {
 
     generateToml() {
       var f = this.spawnForm;
-      var si = this.spawnIdentity;
       var lines = [
         'name = "' + f.name + '"',
         'module = "builtin:chat"'
@@ -420,7 +576,7 @@ function agentsPage() {
       lines.push('', '[model]');
       lines.push('provider = "' + f.provider + '"');
       lines.push('model = "' + f.model + '"');
-      lines.push('system_prompt = "' + f.systemPrompt.replace(/"/g, '\\"') + '"');
+      lines.push('system_prompt = "' + ('You are ' + f.name + ', an AI agent in OpenFang.').replace(/"/g, '\\"') + '"');
       if (f.profile === 'custom') {
         lines.push('', '[capabilities]');
         if (f.caps.memory_read) lines.push('memory_read = ["*"]');
@@ -430,6 +586,23 @@ function agentsPage() {
         if (f.caps.agent_spawn) lines.push('agent_spawn = true');
       }
       return lines.join('\n');
+    },
+
+    buildSpawnScaffold() {
+      var f = this.spawnForm;
+      var identity = this.spawnIdentity;
+      var vibe = this.selectedPreset || 'custom';
+      var archetype = identity.archetype || 'Assistant';
+      var soulBody = this.soulContent.trim() || 'Be helpful, grounded, and direct. Adapt to the user and the task without becoming generic.';
+      return {
+        soul_md: buildAgentSoulMd(f.name, archetype, soulBody),
+        agents_md: buildAgentBehaviorMd(archetype),
+        identity_md: buildAgentIdentityMd(f.name, archetype, vibe, identity.color, identity.emoji),
+        user_md: buildAgentUserMd(archetype),
+        tools_md: buildAgentToolsMd(archetype),
+        memory_md: buildAgentMemoryMd(archetype),
+        bootstrap_md: buildAgentBootstrapMd(f.name, archetype)
+      };
     },
 
     async setMode(agent, mode) {
@@ -453,9 +626,13 @@ function agentsPage() {
       }
 
       try {
-        var res = await OpenFangAPI.post('/api/agents', { manifest_toml: toml });
+        var payload = { manifest_toml: toml };
+        if (this.spawnMode === 'wizard') {
+          payload.scaffold = this.buildSpawnScaffold();
+        }
+        var res = await OpenFangAPI.post('/api/agents', payload);
         if (res.agent_id) {
-          // Post-spawn: update identity + write SOUL.md if personality preset selected
+          // Post-spawn: update identity metadata
           var patchBody = {};
           if (this.spawnIdentity.emoji) patchBody.emoji = this.spawnIdentity.emoji;
           if (this.spawnIdentity.color) patchBody.color = this.spawnIdentity.color;
@@ -464,9 +641,6 @@ function agentsPage() {
 
           if (Object.keys(patchBody).length) {
             OpenFangAPI.patch('/api/agents/' + res.agent_id + '/config', patchBody).catch(function(e) { console.warn('Post-spawn config patch failed:', e.message); });
-          }
-          if (this.soulContent.trim()) {
-            OpenFangAPI.put('/api/agents/' + res.agent_id + '/files/SOUL.md', { content: '# Soul\n' + this.soulContent }).catch(function(e) { console.warn('SOUL.md write failed:', e.message); });
           }
 
           this.showSpawnModal = false;

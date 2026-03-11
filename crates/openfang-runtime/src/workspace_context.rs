@@ -125,33 +125,51 @@ impl WorkspaceContext {
 
     /// Build a prompt context section summarizing the workspace.
     pub fn build_context_section(&mut self) -> String {
-        let mut parts = Vec::new();
+        let mut parts = vec![
+            "## Workspace Context".to_string(),
+            format!("- Workspace root: {}", self.workspace_root.display()),
+            "- Run file and shell work inside this workspace unless the user explicitly asks otherwise.".to_string(),
+            "- For substantial tasks, create or choose a dedicated subdirectory in this workspace before generating task-specific files.".to_string(),
+        ];
 
-        parts.push(format!(
-            "## Workspace Context\n- Project: {} ({})",
-            self.workspace_root
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "workspace".to_string()),
-            self.project_type.label(),
-        ));
+        if self.project_type != ProjectType::Unknown {
+            parts.push(format!(
+                "- Detected project type: {}",
+                self.project_type.label()
+            ));
+        }
 
         if self.is_git_repo {
             parts.push("- Git repository: yes".to_string());
         }
 
-        // Include context file summaries
-        let file_names: Vec<String> = self.cache.keys().cloned().collect();
-        for name in file_names {
-            if let Some(content) = self.get_file(&name) {
-                // Take first 200 chars as preview
-                let preview = if content.len() > 200 {
-                    format!("{}...", crate::str_utils::safe_truncate_str(content, 200))
-                } else {
-                    content.to_string()
-                };
-                parts.push(format!("### {}\n{}", name, preview));
+        if self.has_openfang_dir {
+            parts.push("- .openfang state: present".to_string());
+        }
+
+        match self.project_type {
+            ProjectType::Rust => {
+                parts.push("- Likely build command: cargo build".to_string());
+                parts.push("- Likely test command: cargo test".to_string());
             }
+            ProjectType::Node => {
+                parts.push("- Inspect package.json for build/test scripts".to_string());
+            }
+            ProjectType::Python => {
+                parts.push("- Inspect pyproject.toml / requirements for project commands".to_string());
+            }
+            ProjectType::Go => {
+                parts.push("- Likely build command: go build ./...".to_string());
+                parts.push("- Likely test command: go test ./...".to_string());
+            }
+            ProjectType::Java => {
+                parts.push("- Inspect pom.xml or build.gradle for build/test tasks".to_string());
+            }
+            ProjectType::DotNet => {
+                parts.push("- Likely build command: dotnet build".to_string());
+                parts.push("- Likely test command: dotnet test".to_string());
+            }
+            ProjectType::Unknown => {}
         }
 
         parts.join("\n")
@@ -368,10 +386,14 @@ mod tests {
 
         let mut ctx = WorkspaceContext::detect(&dir);
         let section = ctx.build_context_section();
+        assert!(section.contains("Workspace root:"));
         assert!(section.contains("Rust"));
         assert!(section.contains("Git repository: yes"));
-        assert!(section.contains("SOUL.md"));
-        assert!(section.contains("Be nice"));
+        assert!(section.contains("dedicated subdirectory"));
+        assert!(section.contains("cargo build"));
+        assert!(section.contains("cargo test"));
+        assert!(!section.contains("SOUL.md"));
+        assert!(!section.contains("Be nice"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

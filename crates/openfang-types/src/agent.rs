@@ -395,6 +395,20 @@ impl Default for ModelConfig {
     }
 }
 
+/// Structured seed content for initial workspace prompt files.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct AgentScaffold {
+    pub soul_md: Option<String>,
+    pub user_md: Option<String>,
+    pub tools_md: Option<String>,
+    pub memory_md: Option<String>,
+    pub agents_md: Option<String>,
+    pub bootstrap_md: Option<String>,
+    pub identity_md: Option<String>,
+    pub heartbeat_md: Option<String>,
+}
+
 /// A fallback model entry in a chain.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FallbackModel {
@@ -1144,6 +1158,25 @@ mod tests {
         let json = r#"{"name":"test"}"#;
         let manifest: AgentManifest = serde_json::from_str(json).unwrap();
         assert!(manifest.generate_identity_files);
+    }
+
+    #[test]
+    fn test_agent_scaffold_defaults() {
+        let scaffold = AgentScaffold::default();
+        assert!(scaffold.soul_md.is_none());
+        assert!(scaffold.agents_md.is_none());
+    }
+
+    #[test]
+    fn test_agent_scaffold_serde_roundtrip() {
+        let scaffold = AgentScaffold {
+            soul_md: Some("# Soul".to_string()),
+            agents_md: Some("# Agent Behavioral Guidelines".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&scaffold).unwrap();
+        let parsed: AgentScaffold = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, scaffold);
     }
 
     // ----- ModelConfig alias tests -----
