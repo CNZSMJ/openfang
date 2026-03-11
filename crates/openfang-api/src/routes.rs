@@ -6117,7 +6117,9 @@ pub async fn mcp_http(
     State(state): State<Arc<AppState>>,
     Json(request): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    // Gather all available tools (builtin + skills + MCP)
+    // Gather externally executable tools (builtin + skills + MCP).
+    // Internal discovery helpers stay inside the agent loop and should not be
+    // exposed over stateless MCP transports.
     let mut tools = builtin_tool_definitions();
     {
         let registry = state
@@ -6130,12 +6132,19 @@ pub async fn mcp_http(
                 name: skill_tool.name.clone(),
                 description: skill_tool.description.clone(),
                 input_schema: skill_tool.input_schema.clone(),
+                defer_loading: true,
             });
         }
     }
     if let Ok(mcp_tools) = state.kernel.mcp_tools.lock() {
         tools.extend(mcp_tools.iter().cloned());
     }
+    tools.retain(|tool| {
+        !matches!(
+            tool.name.as_str(),
+            "tool_search" | "tool_get_instructions" | "skill_get_instructions"
+        )
+    });
 
     // Check if this is a tools/call that needs real execution
     let method = request["method"].as_str().unwrap_or("");

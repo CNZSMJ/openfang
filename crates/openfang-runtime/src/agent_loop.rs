@@ -135,7 +135,7 @@ pub async fn run_agent_loop(
     session: &mut Session,
     memory: &MemorySubstrate,
     driver: Arc<dyn LlmDriver>,
-    available_tools: &[ToolDefinition],
+    authorized_tools: &[ToolDefinition],
     kernel: Option<Arc<dyn KernelHandle>>,
     skill_registry: Option<&SkillRegistry>,
     mcp_connections: Option<&tokio::sync::Mutex<Vec<McpConnection>>>,
@@ -158,7 +158,7 @@ pub async fn run_agent_loop(
         session,
         memory,
         driver,
-        available_tools,
+        authorized_tools,
         kernel,
         skill_registry,
         mcp_connections,
@@ -186,7 +186,7 @@ pub async fn run_agent_loop_with_session_message(
     session: &mut Session,
     memory: &MemorySubstrate,
     driver: Arc<dyn LlmDriver>,
-    available_tools: &[ToolDefinition],
+    authorized_tools: &[ToolDefinition],
     kernel: Option<Arc<dyn KernelHandle>>,
     skill_registry: Option<&SkillRegistry>,
     mcp_connections: Option<&tokio::sync::Mutex<Vec<McpConnection>>>,
@@ -342,13 +342,34 @@ pub async fn run_agent_loop_with_session_message(
     let ctx_window = context_window_tokens.unwrap_or(DEFAULT_CONTEXT_WINDOW);
     let context_budget = ContextBudget::new(ctx_window);
     let mut any_tools_executed = false;
+    let effective_exec_policy = manifest.exec_policy.as_ref();
+    let mut tool_runner = tool_runner::ToolRunner::new(
+        authorized_tools.to_vec(),
+        kernel.as_ref(),
+        Some(agent_id_str.as_str()),
+        skill_registry,
+        mcp_connections,
+        web_ctx,
+        browser_ctx,
+        if hand_allowed_env.is_empty() {
+            None
+        } else {
+            Some(hand_allowed_env.as_slice())
+        },
+        workspace_root,
+        media_engine,
+        effective_exec_policy,
+        tts_engine,
+        docker_config,
+        process_manager,
+    );
 
     for iteration in 0..max_iterations {
         debug!(iteration, "Agent loop iteration");
 
         // Context overflow recovery pipeline (replaces emergency_trim_messages)
         let recovery =
-            recover_from_overflow(&mut messages, &system_prompt, available_tools, ctx_window);
+            recover_from_overflow(&mut messages, &system_prompt, tool_runner.visible_tools(), ctx_window);
         if recovery == RecoveryStage::FinalError {
             warn!("Context overflow unrecoverable — suggest /reset or /compact");
         }
@@ -360,7 +381,7 @@ pub async fn run_agent_loop_with_session_message(
         }
 
         // Context guard: compact oversized tool results before LLM call
-        apply_context_guard(&mut messages, &context_budget, available_tools);
+        apply_context_guard(&mut messages, &context_budget, tool_runner.visible_tools());
 
         // Strip provider prefix: "openrouter/google/gemini-2.5-flash" → "google/gemini-2.5-flash"
         let api_model = strip_provider_prefix(&manifest.model.model, &manifest.model.provider);
@@ -368,7 +389,7 @@ pub async fn run_agent_loop_with_session_message(
         let request = CompletionRequest {
             model: api_model.clone(),
             messages: messages.clone(),
-            tools: available_tools.to_vec(),
+            tools: tool_runner.visible_tools().to_vec(),
             max_tokens: manifest.model.max_tokens,
             temperature: manifest.model.temperature,
             system: Some(system_prompt.clone()),
@@ -405,7 +426,8 @@ pub async fn run_agent_loop_with_session_message(
             StopReason::EndTurn | StopReason::StopSequence
         ) && response.tool_calls.is_empty()
         {
-            let recovered = recover_text_tool_calls(&response.text(), available_tools);
+            let recovered =
+                recover_text_tool_calls(&response.text(), tool_runner.visible_tools());
             if !recovered.is_empty() {
                 info!(
                     count = recovered.len(),
@@ -595,9 +617,6 @@ pub async fn run_agent_loop_with_session_message(
                     content: MessageContent::Blocks(assistant_blocks),
                 });
 
-                // Build allowed tool names list for capability enforcement
-                let allowed_tool_names: Vec<String> =
-                    available_tools.iter().map(|t| t.name.clone()).collect();
                 let caller_id_str = session.agent_id.to_string();
 
                 // Execute each tool call with loop guard, timeout, and truncation
@@ -680,34 +699,13 @@ pub async fn run_agent_loop_with_session_message(
                         }
                     }
 
-                    // Resolve effective exec policy (per-agent override or global)
-                    let effective_exec_policy = manifest.exec_policy.as_ref();
-
                     // Timeout-wrapped execution
                     let result = match tokio::time::timeout(
                         Duration::from_secs(TOOL_TIMEOUT_SECS),
-                        tool_runner::execute_tool(
+                        tool_runner.execute_tool_call(
                             &tool_call.id,
                             &tool_call.name,
                             &tool_call.input,
-                            kernel.as_ref(),
-                            Some(&allowed_tool_names),
-                            Some(&caller_id_str),
-                            skill_registry,
-                            mcp_connections,
-                            web_ctx,
-                            browser_ctx,
-                            if hand_allowed_env.is_empty() {
-                                None
-                            } else {
-                                Some(&hand_allowed_env)
-                            },
-                            workspace_root,
-                            media_engine,
-                            effective_exec_policy,
-                            tts_engine,
-                            docker_config,
-                            process_manager,
                         ),
                     )
                     .await
@@ -1114,7 +1112,7 @@ pub async fn run_agent_loop_streaming(
     session: &mut Session,
     memory: &MemorySubstrate,
     driver: Arc<dyn LlmDriver>,
-    available_tools: &[ToolDefinition],
+    authorized_tools: &[ToolDefinition],
     kernel: Option<Arc<dyn KernelHandle>>,
     stream_tx: mpsc::Sender<StreamEvent>,
     skill_registry: Option<&SkillRegistry>,
@@ -1267,13 +1265,38 @@ pub async fn run_agent_loop_streaming(
     let ctx_window = context_window_tokens.unwrap_or(DEFAULT_CONTEXT_WINDOW);
     let context_budget = ContextBudget::new(ctx_window);
     let mut any_tools_executed = false;
+    let effective_exec_policy = manifest.exec_policy.as_ref();
+    let mut tool_runner = tool_runner::ToolRunner::new(
+        authorized_tools.to_vec(),
+        kernel.as_ref(),
+        Some(agent_id_str.as_str()),
+        skill_registry,
+        mcp_connections,
+        web_ctx,
+        browser_ctx,
+        if hand_allowed_env.is_empty() {
+            None
+        } else {
+            Some(hand_allowed_env.as_slice())
+        },
+        workspace_root,
+        media_engine,
+        effective_exec_policy,
+        tts_engine,
+        docker_config,
+        process_manager,
+    );
 
     for iteration in 0..max_iterations {
         debug!(iteration, "Streaming agent loop iteration");
 
         // Context overflow recovery pipeline (replaces emergency_trim_messages)
-        let recovery =
-            recover_from_overflow(&mut messages, &system_prompt, available_tools, ctx_window);
+        let recovery = recover_from_overflow(
+            &mut messages,
+            &system_prompt,
+            tool_runner.visible_tools(),
+            ctx_window,
+        );
         match &recovery {
             RecoveryStage::None => {}
             RecoveryStage::FinalError => {
@@ -1295,7 +1318,7 @@ pub async fn run_agent_loop_streaming(
         }
 
         // Context guard: compact oversized tool results before LLM call
-        apply_context_guard(&mut messages, &context_budget, available_tools);
+        apply_context_guard(&mut messages, &context_budget, tool_runner.visible_tools());
 
         // Strip provider prefix: "openrouter/google/gemini-2.5-flash" → "google/gemini-2.5-flash"
         let api_model = strip_provider_prefix(&manifest.model.model, &manifest.model.provider);
@@ -1303,7 +1326,7 @@ pub async fn run_agent_loop_streaming(
         let request = CompletionRequest {
             model: api_model.clone(),
             messages: messages.clone(),
-            tools: available_tools.to_vec(),
+            tools: tool_runner.visible_tools().to_vec(),
             max_tokens: manifest.model.max_tokens,
             temperature: manifest.model.temperature,
             system: Some(system_prompt.clone()),
@@ -1346,7 +1369,8 @@ pub async fn run_agent_loop_streaming(
             StopReason::EndTurn | StopReason::StopSequence
         ) && response.tool_calls.is_empty()
         {
-            let recovered = recover_text_tool_calls(&response.text(), available_tools);
+            let recovered =
+                recover_text_tool_calls(&response.text(), tool_runner.visible_tools());
             if !recovered.is_empty() {
                 info!(
                     count = recovered.len(),
@@ -1530,8 +1554,6 @@ pub async fn run_agent_loop_streaming(
                     content: MessageContent::Blocks(assistant_blocks),
                 });
 
-                let allowed_tool_names: Vec<String> =
-                    available_tools.iter().map(|t| t.name.clone()).collect();
                 let caller_id_str = session.agent_id.to_string();
 
                 // Execute each tool call with loop guard, timeout, and truncation
@@ -1613,34 +1635,13 @@ pub async fn run_agent_loop_streaming(
                         }
                     }
 
-                    // Resolve effective exec policy (per-agent override or global)
-                    let effective_exec_policy = manifest.exec_policy.as_ref();
-
                     // Timeout-wrapped execution
                     let result = match tokio::time::timeout(
                         Duration::from_secs(TOOL_TIMEOUT_SECS),
-                        tool_runner::execute_tool(
+                        tool_runner.execute_tool_call(
                             &tool_call.id,
                             &tool_call.name,
                             &tool_call.input,
-                            kernel.as_ref(),
-                            Some(&allowed_tool_names),
-                            Some(&caller_id_str),
-                            skill_registry,
-                            mcp_connections,
-                            web_ctx,
-                            browser_ctx,
-                            if hand_allowed_env.is_empty() {
-                                None
-                            } else {
-                                Some(&hand_allowed_env)
-                            },
-                            workspace_root,
-                            media_engine,
-                            effective_exec_policy,
-                            tts_engine,
-                            docker_config,
-                            process_manager,
                         ),
                     )
                     .await
@@ -1832,9 +1833,9 @@ pub async fn run_agent_loop_streaming(
 /// Parses patterns like `<function=tool_name>{"key":"value"}</function>` from
 /// the model's text output, validates tool names against the available tools,
 /// and returns synthetic `ToolCall` entries.
-fn recover_text_tool_calls(text: &str, available_tools: &[ToolDefinition]) -> Vec<ToolCall> {
+fn recover_text_tool_calls(text: &str, visible_tools: &[ToolDefinition]) -> Vec<ToolCall> {
     let mut calls = Vec::new();
-    let tool_names: Vec<&str> = available_tools.iter().map(|t| t.name.as_str()).collect();
+    let tool_names: Vec<&str> = visible_tools.iter().map(|t| t.name.as_str()).collect();
 
     // Pattern 1: <function=TOOL_NAME>JSON_BODY</function>
     let mut search_from = 0;
@@ -1858,7 +1859,7 @@ fn recover_text_tool_calls(text: &str, available_tools: &[ToolDefinition]) -> Ve
         let json_body = text[json_start..json_start + close_offset].trim();
         search_from = json_start + close_offset + "</function>".len();
 
-        // Validate: tool name must be in available_tools
+        // Validate: tool name must be in the current visible tool surface
         if !tool_names.contains(&tool_name) {
             warn!(
                 tool = tool_name,
@@ -1913,7 +1914,7 @@ fn recover_text_tool_calls(text: &str, available_tools: &[ToolDefinition]) -> Ve
             continue;
         }
 
-        // Validate: tool name must be in available_tools
+        // Validate: tool name must be in the current visible tool surface
         if !tool_names.contains(&tool_name) {
             warn!(
                 tool = tool_name,
@@ -2273,6 +2274,15 @@ async fn log_llm_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    macro_rules! tool_definition {
+        ($($tt:tt)*) => {
+            ToolDefinition {
+                defer_loading: false,
+                $($tt)*
+            }
+        };
+    }
     use crate::llm_driver::{CompletionResponse, LlmError};
     use async_trait::async_trait;
     use openfang_types::tool::ToolCall;
@@ -2876,7 +2886,7 @@ mod tests {
 
     #[test]
     fn test_recover_text_tool_calls_basic() {
-        let tools = vec![ToolDefinition {
+        let tools = vec![tool_definition! {
             name: "web_search".into(),
             description: "Search the web".into(),
             input_schema: serde_json::json!({}),
@@ -2892,7 +2902,7 @@ mod tests {
 
     #[test]
     fn test_recover_text_tool_calls_unknown_tool() {
-        let tools = vec![ToolDefinition {
+        let tools = vec![tool_definition! {
             name: "web_search".into(),
             description: "Search the web".into(),
             input_schema: serde_json::json!({}),
@@ -2904,7 +2914,7 @@ mod tests {
 
     #[test]
     fn test_recover_text_tool_calls_invalid_json() {
-        let tools = vec![ToolDefinition {
+        let tools = vec![tool_definition! {
             name: "web_search".into(),
             description: "Search the web".into(),
             input_schema: serde_json::json!({}),
@@ -2917,12 +2927,12 @@ mod tests {
     #[test]
     fn test_recover_text_tool_calls_multiple() {
         let tools = vec![
-            ToolDefinition {
+            tool_definition! {
                 name: "web_search".into(),
                 description: "Search".into(),
                 input_schema: serde_json::json!({}),
             },
-            ToolDefinition {
+            tool_definition! {
                 name: "read_file".into(),
                 description: "Read a file".into(),
                 input_schema: serde_json::json!({}),
@@ -2937,7 +2947,7 @@ mod tests {
 
     #[test]
     fn test_recover_text_tool_calls_no_pattern() {
-        let tools = vec![ToolDefinition {
+        let tools = vec![tool_definition! {
             name: "web_search".into(),
             description: "Search".into(),
             input_schema: serde_json::json!({}),
@@ -2958,7 +2968,7 @@ mod tests {
 
     #[test]
     fn test_recover_text_tool_calls_nested_json() {
-        let tools = vec![ToolDefinition {
+        let tools = vec![tool_definition! {
             name: "web_search".into(),
             description: "Search".into(),
             input_schema: serde_json::json!({}),
@@ -2971,7 +2981,7 @@ mod tests {
 
     #[test]
     fn test_recover_text_tool_calls_with_surrounding_text() {
-        let tools = vec![ToolDefinition {
+        let tools = vec![tool_definition! {
             name: "web_search".into(),
             description: "Search".into(),
             input_schema: serde_json::json!({}),
@@ -2984,7 +2994,7 @@ mod tests {
 
     #[test]
     fn test_recover_text_tool_calls_whitespace_in_json() {
-        let tools = vec![ToolDefinition {
+        let tools = vec![tool_definition! {
             name: "web_search".into(),
             description: "Search".into(),
             input_schema: serde_json::json!({}),
@@ -2998,7 +3008,7 @@ mod tests {
 
     #[test]
     fn test_recover_text_tool_calls_unclosed_tag() {
-        let tools = vec![ToolDefinition {
+        let tools = vec![tool_definition! {
             name: "web_search".into(),
             description: "Search".into(),
             input_schema: serde_json::json!({}),
@@ -3011,7 +3021,7 @@ mod tests {
 
     #[test]
     fn test_recover_text_tool_calls_missing_closing_bracket() {
-        let tools = vec![ToolDefinition {
+        let tools = vec![tool_definition! {
             name: "web_search".into(),
             description: "Search".into(),
             input_schema: serde_json::json!({}),
@@ -3027,7 +3037,7 @@ mod tests {
 
     #[test]
     fn test_recover_text_tool_calls_empty_json_object() {
-        let tools = vec![ToolDefinition {
+        let tools = vec![tool_definition! {
             name: "list_files".into(),
             description: "List".into(),
             input_schema: serde_json::json!({}),
@@ -3042,12 +3052,12 @@ mod tests {
     #[test]
     fn test_recover_text_tool_calls_mixed_valid_invalid() {
         let tools = vec![
-            ToolDefinition {
+            tool_definition! {
                 name: "web_search".into(),
                 description: "Search".into(),
                 input_schema: serde_json::json!({}),
             },
-            ToolDefinition {
+            tool_definition! {
                 name: "read_file".into(),
                 description: "Read".into(),
                 input_schema: serde_json::json!({}),
@@ -3065,7 +3075,7 @@ mod tests {
 
     #[test]
     fn test_recover_variant2_basic() {
-        let tools = vec![ToolDefinition {
+        let tools = vec![tool_definition! {
             name: "web_fetch".into(),
             description: "Fetch".into(),
             input_schema: serde_json::json!({}),
@@ -3079,7 +3089,7 @@ mod tests {
 
     #[test]
     fn test_recover_variant2_unknown_tool() {
-        let tools = vec![ToolDefinition {
+        let tools = vec![tool_definition! {
             name: "web_search".into(),
             description: "Search".into(),
             input_schema: serde_json::json!({}),
@@ -3091,7 +3101,7 @@ mod tests {
 
     #[test]
     fn test_recover_variant2_with_surrounding_text() {
-        let tools = vec![ToolDefinition {
+        let tools = vec![tool_definition! {
             name: "web_search".into(),
             description: "Search".into(),
             input_schema: serde_json::json!({}),
@@ -3105,12 +3115,12 @@ mod tests {
     #[test]
     fn test_recover_both_variants_mixed() {
         let tools = vec![
-            ToolDefinition {
+            tool_definition! {
                 name: "web_search".into(),
                 description: "Search".into(),
                 input_schema: serde_json::json!({}),
             },
-            ToolDefinition {
+            tool_definition! {
                 name: "web_fetch".into(),
                 description: "Fetch".into(),
                 input_schema: serde_json::json!({}),
@@ -3126,7 +3136,7 @@ mod tests {
 
     #[test]
     fn test_recover_tool_tag_variant() {
-        let tools = vec![ToolDefinition {
+        let tools = vec![tool_definition! {
             name: "exec".into(),
             description: "Execute".into(),
             input_schema: serde_json::json!({}),
@@ -3140,7 +3150,7 @@ mod tests {
 
     #[test]
     fn test_recover_markdown_code_block() {
-        let tools = vec![ToolDefinition {
+        let tools = vec![tool_definition! {
             name: "exec".into(),
             description: "Execute".into(),
             input_schema: serde_json::json!({}),
@@ -3154,7 +3164,7 @@ mod tests {
 
     #[test]
     fn test_recover_markdown_code_block_with_lang() {
-        let tools = vec![ToolDefinition {
+        let tools = vec![tool_definition! {
             name: "web_search".into(),
             description: "Search".into(),
             input_schema: serde_json::json!({}),
@@ -3167,7 +3177,7 @@ mod tests {
 
     #[test]
     fn test_recover_backtick_wrapped() {
-        let tools = vec![ToolDefinition {
+        let tools = vec![tool_definition! {
             name: "exec".into(),
             description: "Execute".into(),
             input_schema: serde_json::json!({}),
@@ -3181,7 +3191,7 @@ mod tests {
 
     #[test]
     fn test_recover_backtick_ignores_unknown_tool() {
-        let tools = vec![ToolDefinition {
+        let tools = vec![tool_definition! {
             name: "exec".into(),
             description: "Execute".into(),
             input_schema: serde_json::json!({}),
@@ -3193,7 +3203,7 @@ mod tests {
 
     #[test]
     fn test_recover_no_duplicates_across_patterns() {
-        let tools = vec![ToolDefinition {
+        let tools = vec![tool_definition! {
             name: "exec".into(),
             description: "Execute".into(),
             input_schema: serde_json::json!({}),
@@ -3276,7 +3286,7 @@ mod tests {
         let driver: Arc<dyn LlmDriver> = Arc::new(TextToolCallDriver::new());
 
         // Provide web_search as an available tool so recovery can match it
-        let tools = vec![ToolDefinition {
+        let tools = vec![tool_definition! {
             name: "web_search".into(),
             description: "Search the web".into(),
             input_schema: serde_json::json!({
@@ -3347,7 +3357,7 @@ mod tests {
         let manifest = test_manifest();
         let driver: Arc<dyn LlmDriver> = Arc::new(NormalDriver);
 
-        let tools = vec![ToolDefinition {
+        let tools = vec![tool_definition! {
             name: "web_search".into(),
             description: "Search the web".into(),
             input_schema: serde_json::json!({}),
@@ -3401,7 +3411,7 @@ mod tests {
         let manifest = test_manifest();
         let driver: Arc<dyn LlmDriver> = Arc::new(TextToolCallDriver::new());
 
-        let tools = vec![ToolDefinition {
+        let tools = vec![tool_definition! {
             name: "web_search".into(),
             description: "Search the web".into(),
             input_schema: serde_json::json!({

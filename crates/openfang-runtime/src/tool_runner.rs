@@ -9,13 +9,23 @@ use crate::web_search::{parse_ddg_results, WebToolsContext};
 use openfang_skills::registry::SkillRegistry;
 use openfang_types::taint::{TaintLabel, TaintSink, TaintedValue};
 use openfang_types::tool::{ToolDefinition, ToolResult};
-use std::collections::HashSet;
+use serde::Serialize;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{debug, warn};
 
 /// Maximum inter-agent call depth to prevent infinite recursion (A->B->C->...).
 const MAX_AGENT_CALL_DEPTH: u32 = 5;
+
+macro_rules! tool_definition {
+    ($($tt:tt)*) => {
+        ToolDefinition {
+            defer_loading: false,
+            $($tt)*
+        }
+    };
+}
 
 /// Check if a shell command should be blocked by taint tracking.
 ///
@@ -93,6 +103,383 @@ tokio::task_local! {
 /// Returns 0 if called outside an agent task.
 pub fn current_agent_depth() -> u32 {
     AGENT_CALL_DEPTH.try_with(|d| d.get()).unwrap_or(0)
+}
+
+/// Stateful tool runtime for a single agent-loop execution.
+///
+/// This currently keeps the authorized tool surface and exposes the
+/// per-request visible tool list. Dynamic tool expansion will build on this
+/// object instead of teaching `agent_loop` about hidden/deferred tool state.
+pub struct ToolRunner<'a> {
+    visible_tools: Vec<ToolDefinition>,
+    visible_tool_names: Vec<String>,
+    hidden_tools: HashMap<String, HiddenToolEntry>,
+    kernel: Option<&'a Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&'a str>,
+    skill_registry: Option<&'a SkillRegistry>,
+    mcp_connections: Option<&'a tokio::sync::Mutex<Vec<mcp::McpConnection>>>,
+    web_ctx: Option<&'a WebToolsContext>,
+    browser_ctx: Option<&'a crate::browser::BrowserManager>,
+    allowed_env_vars: Option<&'a [String]>,
+    workspace_root: Option<&'a Path>,
+    media_engine: Option<&'a crate::media_understanding::MediaEngine>,
+    exec_policy: Option<&'a openfang_types::config::ExecPolicy>,
+    tts_engine: Option<&'a crate::tts::TtsEngine>,
+    docker_config: Option<&'a openfang_types::config::DockerSandboxConfig>,
+    process_manager: Option<&'a crate::process_manager::ProcessManager>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HiddenToolSource {
+    Builtin,
+    Skill,
+    Mcp,
+}
+
+#[derive(Debug, Clone)]
+struct HiddenToolEntry {
+    tool: ToolDefinition,
+    source: HiddenToolSource,
+    provider_name: Option<String>,
+    search_text: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ToolSearchResultItem {
+    kind: String,
+    name: String,
+    description: String,
+    source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    has_instructions: Option<bool>,
+}
+
+#[derive(Debug)]
+struct RankedToolSearchItem {
+    score: f32,
+    expandable_tool_name: Option<String>,
+    item: ToolSearchResultItem,
+}
+
+impl<'a> ToolRunner<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        authorized_tools: Vec<ToolDefinition>,
+        kernel: Option<&'a Arc<dyn KernelHandle>>,
+        caller_agent_id: Option<&'a str>,
+        skill_registry: Option<&'a SkillRegistry>,
+        mcp_connections: Option<&'a tokio::sync::Mutex<Vec<mcp::McpConnection>>>,
+        web_ctx: Option<&'a WebToolsContext>,
+        browser_ctx: Option<&'a crate::browser::BrowserManager>,
+        allowed_env_vars: Option<&'a [String]>,
+        workspace_root: Option<&'a Path>,
+        media_engine: Option<&'a crate::media_understanding::MediaEngine>,
+        exec_policy: Option<&'a openfang_types::config::ExecPolicy>,
+        tts_engine: Option<&'a crate::tts::TtsEngine>,
+        docker_config: Option<&'a openfang_types::config::DockerSandboxConfig>,
+        process_manager: Option<&'a crate::process_manager::ProcessManager>,
+    ) -> Self {
+        let mut visible_tools = Vec::new();
+        let mut visible_tool_names = Vec::new();
+        let mut hidden_tools = HashMap::new();
+
+        for tool in authorized_tools {
+            if tool.defer_loading {
+                let hidden = HiddenToolEntry::from_tool(&tool, skill_registry);
+                hidden_tools.insert(tool.name.clone(), hidden);
+                continue;
+            }
+
+            visible_tool_names.push(tool.name.clone());
+            visible_tools.push(tool);
+        }
+
+        Self {
+            visible_tools,
+            visible_tool_names,
+            hidden_tools,
+            kernel,
+            caller_agent_id,
+            skill_registry,
+            mcp_connections,
+            web_ctx,
+            browser_ctx,
+            allowed_env_vars,
+            workspace_root,
+            media_engine,
+            exec_policy,
+            tts_engine,
+            docker_config,
+            process_manager,
+        }
+    }
+
+    pub fn visible_tools(&self) -> &[ToolDefinition] {
+        &self.visible_tools
+    }
+
+    pub fn visible_tool_names(&self) -> &[String] {
+        &self.visible_tool_names
+    }
+
+    pub async fn execute_tool_call(
+        &mut self,
+        tool_use_id: &str,
+        tool_name: &str,
+        input: &serde_json::Value,
+    ) -> ToolResult {
+        if tool_name == "tool_search" {
+            return self.execute_tool_search(tool_use_id, input);
+        }
+
+        execute_tool(
+            tool_use_id,
+            tool_name,
+            input,
+            self.kernel,
+            Some(&self.visible_tool_names),
+            self.caller_agent_id,
+            self.skill_registry,
+            self.mcp_connections,
+            self.web_ctx,
+            self.browser_ctx,
+            self.allowed_env_vars,
+            self.workspace_root,
+            self.media_engine,
+            self.exec_policy,
+            self.tts_engine,
+            self.docker_config,
+            self.process_manager,
+        )
+        .await
+    }
+
+    fn execute_tool_search(
+        &mut self,
+        tool_use_id: &str,
+        input: &serde_json::Value,
+    ) -> ToolResult {
+        let query = input["query"].as_str().unwrap_or("").trim();
+        let top_k = input["top_k"].as_u64().unwrap_or(3) as usize;
+        let results = self.search_discovery_items(query, top_k);
+
+        let matched_names: Vec<String> = results
+            .iter()
+            .filter_map(|result| result.expandable_tool_name.clone())
+            .collect();
+        self.expand_hidden_tools(&matched_names);
+
+        let visible_results: Vec<&ToolSearchResultItem> =
+            results.iter().map(|result| &result.item).collect();
+
+        match serde_json::to_string_pretty(&serde_json::json!({ "results": visible_results })) {
+            Ok(content) => ToolResult {
+                tool_use_id: tool_use_id.to_string(),
+                content,
+                is_error: false,
+            },
+            Err(err) => ToolResult {
+                tool_use_id: tool_use_id.to_string(),
+                content: format!("Failed to serialize tool search results: {err}"),
+                is_error: true,
+            },
+        }
+    }
+
+    fn search_discovery_items(
+        &self,
+        query: &str,
+        top_k: usize,
+    ) -> Vec<RankedToolSearchItem> {
+        if query.trim().is_empty() || top_k == 0 {
+            return Vec::new();
+        }
+
+        let mut results = self.search_hidden_tools(query);
+        results.extend(self.search_skill_manuals(query));
+        results.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.item.kind.cmp(&b.item.kind))
+                .then_with(|| a.item.name.cmp(&b.item.name))
+        });
+        results.truncate(top_k);
+        results
+    }
+
+    fn expand_hidden_tools(&mut self, tool_names: &[String]) {
+        for tool_name in tool_names {
+            let Some(entry) = self.hidden_tools.remove(tool_name) else {
+                continue;
+            };
+            if self.visible_tool_names.iter().any(|name| name == &entry.tool.name) {
+                continue;
+            }
+            self.visible_tool_names.push(entry.tool.name.clone());
+            self.visible_tools.push(entry.tool);
+        }
+    }
+
+    fn search_hidden_tools(
+        &self,
+        query: &str,
+    ) -> Vec<RankedToolSearchItem> {
+        let normalized_query = query.trim().to_lowercase();
+        if normalized_query.is_empty() {
+            return Vec::new();
+        }
+
+        let query_terms: Vec<&str> = normalized_query.split_whitespace().collect();
+        let mut matches: Vec<(i32, &HiddenToolEntry)> = self
+            .hidden_tools
+            .values()
+            .filter_map(|entry| {
+                let score = hidden_tool_match_score(entry, &normalized_query, &query_terms);
+                (score > 0).then_some((score, entry))
+            })
+            .collect();
+
+        matches.sort_by(|(score_a, entry_a), (score_b, entry_b)| {
+            score_b
+                .cmp(score_a)
+                .then_with(|| entry_a.tool.name.cmp(&entry_b.tool.name))
+        });
+
+        matches
+            .into_iter()
+            .map(|(score, entry)| RankedToolSearchItem {
+                score: score as f32,
+                expandable_tool_name: Some(entry.tool.name.clone()),
+                item: ToolSearchResultItem {
+                    kind: "tool".to_string(),
+                    name: entry.tool.name.clone(),
+                    description: entry.tool.description.clone(),
+                    source: entry.source.as_str().to_string(),
+                    provider: entry.provider_name.clone(),
+                    has_instructions: None,
+                },
+            })
+            .collect()
+    }
+
+    fn search_skill_manuals(&self, query: &str) -> Vec<RankedToolSearchItem> {
+        let skill_results = if let Some(kh) = self.kernel {
+            kh.search_visible_skills(query, 8, self.caller_agent_id)
+        } else if let Some(registry) = self.skill_registry {
+            Ok(registry.search(query, 8, None))
+        } else {
+            Err("Skill registry not available.".to_string())
+        };
+
+        match skill_results {
+            Ok(results) => results
+                .into_iter()
+                .filter(|result| result.has_prompt_context)
+                .map(|result| RankedToolSearchItem {
+                    score: result.score,
+                    expandable_tool_name: None,
+                    item: ToolSearchResultItem {
+                        kind: "skill_manual".to_string(),
+                        name: result.name,
+                        description: result.description,
+                        source: "skill".to_string(),
+                        provider: None,
+                        has_instructions: Some(true),
+                    },
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+}
+
+impl HiddenToolEntry {
+    fn from_tool(tool: &ToolDefinition, skill_registry: Option<&SkillRegistry>) -> Self {
+        if let Some(registry) = skill_registry {
+            if let Some(skill) = registry.find_tool_provider(&tool.name) {
+                let mut parts = vec![
+                    tool.name.clone(),
+                    tool.description.clone(),
+                    "skill".to_string(),
+                    skill.manifest.skill.name.clone(),
+                    skill.manifest.skill.description.clone(),
+                ];
+                parts.extend(skill.manifest.skill.tags.iter().cloned());
+                return Self {
+                    tool: tool.clone(),
+                    source: HiddenToolSource::Skill,
+                    provider_name: Some(skill.manifest.skill.name.clone()),
+                    search_text: parts.join(" ").to_lowercase(),
+                };
+            }
+        }
+
+        if mcp::is_mcp_tool(&tool.name) {
+            let provider_name = mcp::extract_mcp_server(&tool.name).map(str::to_string);
+            let mut parts = vec![
+                tool.name.clone(),
+                tool.description.clone(),
+                "mcp".to_string(),
+            ];
+            if let Some(ref provider) = provider_name {
+                parts.push(provider.clone());
+            }
+            return Self {
+                tool: tool.clone(),
+                source: HiddenToolSource::Mcp,
+                provider_name,
+                search_text: parts.join(" ").to_lowercase(),
+            };
+        }
+
+        Self {
+            tool: tool.clone(),
+            source: HiddenToolSource::Builtin,
+            provider_name: None,
+            search_text: format!("{} {} builtin", tool.name, tool.description).to_lowercase(),
+        }
+    }
+}
+
+impl HiddenToolSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            HiddenToolSource::Builtin => "builtin",
+            HiddenToolSource::Skill => "skill",
+            HiddenToolSource::Mcp => "mcp",
+        }
+    }
+}
+
+fn hidden_tool_match_score(
+    entry: &HiddenToolEntry,
+    normalized_query: &str,
+    query_terms: &[&str],
+) -> i32 {
+    let name = entry.tool.name.to_lowercase();
+    let mut score = 0;
+
+    if name == normalized_query {
+        score += 200;
+    } else if name.contains(normalized_query) {
+        score += 120;
+    }
+
+    if entry.search_text.contains(normalized_query) {
+        score += 80;
+    }
+
+    for term in query_terms {
+        if name.contains(term) {
+            score += 40;
+        } else if entry.search_text.contains(term) {
+            score += 15;
+        }
+    }
+
+    score
 }
 
 /// Execute a tool by name with the given input, returning a ToolResult.
@@ -432,37 +819,14 @@ pub async fn execute_tool(
         // Canvas / A2UI tool
         "canvas_present" => tool_canvas_present(input, workspace_root).await,
 
-        // Skill discovery tool
-        "skill_search" => {
-            let query = input["query"].as_str().unwrap_or("").trim();
-            let top_k = input["top_k"].as_u64().unwrap_or(3) as usize;
-            let results = if let Some(kh) = kernel {
-                match kh.skill_search(query, top_k, caller_agent_id) {
-                    Ok(results) => results,
-                    Err(err) => {
-                        return ToolResult {
-                            tool_use_id: tool_use_id.to_string(),
-                            content: err,
-                            is_error: true,
-                        };
-                    }
-                }
-            } else if let Some(registry) = skill_registry {
-                registry.search(query, top_k, None)
-            } else {
-                return ToolResult {
-                    tool_use_id: tool_use_id.to_string(),
-                    content: "Skill registry not available.".to_string(),
-                    is_error: true,
-                };
-            };
-
-            serde_json::to_string_pretty(&serde_json::json!({ "results": results }))
-                .map_err(|e| format!("Failed to serialize skill search results: {e}"))
-        }
+        // Tool discovery requires the loop-local ToolRunner state.
+        "tool_search" => Err(
+            "tool_search requires the active agent loop and is not available through the stateless execution path."
+                .to_string(),
+        ),
 
         // Skill documentation tool
-        "skill_get_instructions" => {
+        "tool_get_instructions" | "skill_get_instructions" => {
             let name = input["skill_name"].as_str().unwrap_or("");
             if let Some(registry) = skill_registry {
                 if let Some(skill) = registry.get(name) {
@@ -620,7 +984,7 @@ pub async fn execute_tool(
 pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
     vec![
         // --- Filesystem tools ---
-        ToolDefinition {
+        tool_definition! {
             name: "file_read".to_string(),
             description: "Read the contents of a file. Paths are relative to the agent workspace.".to_string(),
             input_schema: serde_json::json!({
@@ -631,7 +995,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["path"]
             }),
         },
-        ToolDefinition {
+        tool_definition! {
             name: "file_write".to_string(),
             description: "Write content to a file. Paths are relative to the agent workspace.".to_string(),
             input_schema: serde_json::json!({
@@ -643,7 +1007,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["path", "content"]
             }),
         },
-        ToolDefinition {
+        tool_definition! {
             name: "file_list".to_string(),
             description: "List files in a directory. Paths are relative to the agent workspace.".to_string(),
             input_schema: serde_json::json!({
@@ -654,7 +1018,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["path"]
             }),
         },
-        ToolDefinition {
+        tool_definition! {
             name: "apply_patch".to_string(),
             description: "Apply a multi-hunk diff patch to add, update, move, or delete files. Use this for targeted edits instead of full file overwrites.".to_string(),
             input_schema: serde_json::json!({
@@ -669,7 +1033,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         // --- Web tools ---
-        ToolDefinition {
+        tool_definition! {
             name: "web_fetch".to_string(),
             description: "Fetch a URL with SSRF protection. Supports GET/POST/PUT/PATCH/DELETE. For GET, HTML is converted to Markdown. For other methods, returns raw response body.".to_string(),
             input_schema: serde_json::json!({
@@ -683,7 +1047,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["url"]
             }),
         },
-        ToolDefinition {
+        tool_definition! {
             name: "web_search".to_string(),
             description: "Search the web using multiple providers (Tavily, Brave, Perplexity, DuckDuckGo) with automatic fallback. Returns structured results with titles, URLs, and snippets.".to_string(),
             input_schema: serde_json::json!({
@@ -696,7 +1060,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         // --- Shell tool ---
-        ToolDefinition {
+        tool_definition! {
             name: "shell_exec".to_string(),
             description: "Execute a shell command and return its output.".to_string(),
             input_schema: serde_json::json!({
@@ -709,7 +1073,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         // --- Inter-agent tools ---
-        ToolDefinition {
+        tool_definition! {
             name: "agent_send".to_string(),
             description: "Send a message to another agent and receive their response. Accepts UUID or agent name. Use agent_find first to discover agents.".to_string(),
             input_schema: serde_json::json!({
@@ -721,7 +1085,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["agent_id", "message"]
             }),
         },
-        ToolDefinition {
+        tool_definition! {
             name: "agent_spawn".to_string(),
             description: "Spawn a new agent from a TOML manifest. Returns the new agent's ID and name.".to_string(),
             input_schema: serde_json::json!({
@@ -735,7 +1099,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["manifest_toml"]
             }),
         },
-        ToolDefinition {
+        tool_definition! {
             name: "agent_list".to_string(),
             description: "List all currently running agents with their IDs, names, states, and models.".to_string(),
             input_schema: serde_json::json!({
@@ -743,7 +1107,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "properties": {}
             }),
         },
-        ToolDefinition {
+        tool_definition! {
             name: "agent_kill".to_string(),
             description: "Kill (terminate) another agent by its ID.".to_string(),
             input_schema: serde_json::json!({
@@ -755,7 +1119,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         // --- Shared memory tools ---
-        ToolDefinition {
+        tool_definition! {
             name: "memory_store".to_string(),
             description: "Store a value in shared memory accessible by all agents. Use for cross-agent coordination and data sharing.".to_string(),
             input_schema: serde_json::json!({
@@ -767,7 +1131,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["key", "value"]
             }),
         },
-        ToolDefinition {
+        tool_definition! {
             name: "memory_recall".to_string(),
             description: "Recall a value from shared memory by key.".to_string(),
             input_schema: serde_json::json!({
@@ -779,7 +1143,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         // --- Collaboration tools ---
-        ToolDefinition {
+        tool_definition! {
             name: "agent_find".to_string(),
             description: "Discover agents by name, tag, tool, or description. Use to find specialists before delegating work.".to_string(),
             input_schema: serde_json::json!({
@@ -790,7 +1154,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["query"]
             }),
         },
-        ToolDefinition {
+        tool_definition! {
             name: "task_post".to_string(),
             description: "Post a task to the shared task queue for another agent to pick up.".to_string(),
             input_schema: serde_json::json!({
@@ -803,7 +1167,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["title", "description"]
             }),
         },
-        ToolDefinition {
+        tool_definition! {
             name: "task_claim".to_string(),
             description: "Claim the next available task from the task queue assigned to you or unassigned.".to_string(),
             input_schema: serde_json::json!({
@@ -811,7 +1175,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "properties": {}
             }),
         },
-        ToolDefinition {
+        tool_definition! {
             name: "task_complete".to_string(),
             description: "Mark a previously claimed task as completed with a result.".to_string(),
             input_schema: serde_json::json!({
@@ -823,7 +1187,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["task_id", "result"]
             }),
         },
-        ToolDefinition {
+        tool_definition! {
             name: "task_list".to_string(),
             description: "List tasks in the shared queue, optionally filtered by status (pending, in_progress, completed).".to_string(),
             input_schema: serde_json::json!({
@@ -833,7 +1197,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 }
             }),
         },
-        ToolDefinition {
+        tool_definition! {
             name: "event_publish".to_string(),
             description: "Publish a custom event that can trigger proactive agents. Use to broadcast signals to the agent fleet.".to_string(),
             input_schema: serde_json::json!({
@@ -846,7 +1210,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         // --- Scheduling tools ---
-        ToolDefinition {
+        tool_definition! {
             name: "schedule_create".to_string(),
             description: "Schedule a recurring task using natural language or cron syntax. Examples: 'every 5 minutes', 'daily at 9am', 'weekdays at 6pm', '0 */5 * * *'.".to_string(),
             input_schema: serde_json::json!({
@@ -859,7 +1223,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["description", "schedule"]
             }),
         },
-        ToolDefinition {
+        tool_definition! {
             name: "schedule_list".to_string(),
             description: "List all scheduled tasks with their IDs, descriptions, schedules, and next run times.".to_string(),
             input_schema: serde_json::json!({
@@ -867,7 +1231,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "properties": {}
             }),
         },
-        ToolDefinition {
+        tool_definition! {
             name: "schedule_delete".to_string(),
             description: "Remove a scheduled task by its ID.".to_string(),
             input_schema: serde_json::json!({
@@ -879,7 +1243,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         // --- Knowledge graph tools ---
-        ToolDefinition {
+        tool_definition! {
             name: "knowledge_add_entity".to_string(),
             description: "Add an entity to the knowledge graph. Entities represent people, organizations, projects, concepts, locations, tools, etc.".to_string(),
             input_schema: serde_json::json!({
@@ -892,7 +1256,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["name", "entity_type"]
             }),
         },
-        ToolDefinition {
+        tool_definition! {
             name: "knowledge_add_relation".to_string(),
             description: "Add a relation between two entities in the knowledge graph.".to_string(),
             input_schema: serde_json::json!({
@@ -907,7 +1271,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["source", "relation", "target"]
             }),
         },
-        ToolDefinition {
+        tool_definition! {
             name: "knowledge_query".to_string(),
             description: "Query the knowledge graph. Filter by source entity, relation type, and/or target entity. Returns matching entity-relation-entity triples.".to_string(),
             input_schema: serde_json::json!({
@@ -921,7 +1285,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         // --- Image analysis tool ---
-        ToolDefinition {
+        tool_definition! {
             name: "image_analyze".to_string(),
             description: "Analyze an image file — returns format, dimensions, file size, and a base64 preview. For vision-model analysis, include a prompt.".to_string(),
             input_schema: serde_json::json!({
@@ -933,9 +1297,9 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["path"]
             }),
         },
-        ToolDefinition {
-            name: "skill_search".to_string(),
-            description: "Search locally available skills by natural-language task intent. Use this before loading a skill manual when specialized guidance may help.".to_string(),
+        tool_definition! {
+            name: "tool_search".to_string(),
+            description: "Search deferred tools available to this agent and expand the relevant ones for later turns. Returns tool-centric matches across the currently enabled deferred sources, including skills and MCP tools participating in the rollout.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -945,9 +1309,20 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["query"]
             }),
         },
-        ToolDefinition {
+        tool_definition! {
+            name: "tool_get_instructions".to_string(),
+            description: "Retrieve detailed instructions for a discovered skill manual. Use this after tool_search returns a skill_manual result and you need the full guidance.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "skill_name": { "type": "string", "description": "The name of the skill manual to load" }
+                },
+                "required": ["skill_name"]
+            }),
+        },
+        tool_definition! {
             name: "skill_get_instructions".to_string(),
-            description: "Retrieve comprehensive rules and documentation for a specific skill. Use this when the skill summary is insufficient to understand how to use its tools effectively.".to_string(),
+            description: "Compatibility alias for tool_get_instructions during the unified skill-manual migration.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -956,7 +1331,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["skill_name"]
             }),
         },
-        ToolDefinition {
+        tool_definition! {
             name: "skill_install".to_string(),
             description: "Install a new skill. Source can be a FangHub slug ('agent-reach'), an arbitrary GitHub repo ('owner/repo'), a direct ZIP/TAR URL, or a local absolute directory path. Note: Use scope='workspace' for agent-specific tools, or 'global' (default) to make it available to the entire fleet in ~/.openfang/skills/.".to_string(),
             input_schema: serde_json::json!({
@@ -968,7 +1343,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["source"]
             }),
         },
-        ToolDefinition {
+        tool_definition! {
             name: "skill_create".to_string(),
             description: "Install a new prompt-only skill natively by providing its prompt context. This is the preferred way to convert instructions from a webpage, document, or tweet into a reusable agent capability.".to_string(),
             input_schema: serde_json::json!({
@@ -983,7 +1358,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         // --- Location tool ---
-        ToolDefinition {
+        tool_definition! {
             name: "location_get".to_string(),
             description: "Get approximate geographic location based on IP address. Returns city, country, coordinates, and timezone.".to_string(),
             input_schema: serde_json::json!({
@@ -992,7 +1367,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         // --- Browser automation tools ---
-        ToolDefinition {
+        tool_definition! {
             name: "browser_navigate".to_string(),
             description: "Navigate a browser to a URL. Returns the page title and readable content as markdown. Opens a persistent browser session.".to_string(),
             input_schema: serde_json::json!({
@@ -1003,7 +1378,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["url"]
             }),
         },
-        ToolDefinition {
+        tool_definition! {
             name: "browser_click".to_string(),
             description: "Click an element on the current browser page by CSS selector or visible text. Returns the resulting page state.".to_string(),
             input_schema: serde_json::json!({
@@ -1014,7 +1389,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["selector"]
             }),
         },
-        ToolDefinition {
+        tool_definition! {
             name: "browser_type".to_string(),
             description: "Type text into an input field on the current browser page.".to_string(),
             input_schema: serde_json::json!({
@@ -1026,7 +1401,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["selector", "text"]
             }),
         },
-        ToolDefinition {
+        tool_definition! {
             name: "browser_screenshot".to_string(),
             description: "Take a screenshot of the current browser page. Returns a base64-encoded PNG image.".to_string(),
             input_schema: serde_json::json!({
@@ -1034,7 +1409,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "properties": {}
             }),
         },
-        ToolDefinition {
+        tool_definition! {
             name: "browser_read_page".to_string(),
             description: "Read the current browser page content as structured markdown. Use after clicking or navigating to see the updated page.".to_string(),
             input_schema: serde_json::json!({
@@ -1042,7 +1417,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "properties": {}
             }),
         },
-        ToolDefinition {
+        tool_definition! {
             name: "browser_close".to_string(),
             description: "Close the browser session. The browser will also auto-close when the agent loop ends.".to_string(),
             input_schema: serde_json::json!({
@@ -1050,7 +1425,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "properties": {}
             }),
         },
-        ToolDefinition {
+        tool_definition! {
             name: "browser_scroll".to_string(),
             description: "Scroll the browser page. Use this to see content below the fold or navigate long pages.".to_string(),
             input_schema: serde_json::json!({
@@ -1061,7 +1436,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 }
             }),
         },
-        ToolDefinition {
+        tool_definition! {
             name: "browser_wait".to_string(),
             description: "Wait for a CSS selector to appear on the page. Useful for dynamic content that loads asynchronously.".to_string(),
             input_schema: serde_json::json!({
@@ -1073,7 +1448,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["selector"]
             }),
         },
-        ToolDefinition {
+        tool_definition! {
             name: "browser_run_js".to_string(),
             description: "Run JavaScript on the current browser page and return the result. For advanced interactions that other browser tools cannot handle.".to_string(),
             input_schema: serde_json::json!({
@@ -1084,7 +1459,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["expression"]
             }),
         },
-        ToolDefinition {
+        tool_definition! {
             name: "browser_back".to_string(),
             description: "Go back to the previous page in browser history.".to_string(),
             input_schema: serde_json::json!({
@@ -1093,7 +1468,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         // --- Media understanding tools ---
-        ToolDefinition {
+        tool_definition! {
             name: "media_describe".to_string(),
             description: "Describe an image using a vision-capable LLM. Auto-selects the best available provider (Anthropic, OpenAI, or Gemini). Returns a text description of the image content.".to_string(),
             input_schema: serde_json::json!({
@@ -1105,7 +1480,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["path"]
             }),
         },
-        ToolDefinition {
+        tool_definition! {
             name: "media_transcribe".to_string(),
             description: "Transcribe audio to text using speech-to-text. Auto-selects the best available provider (Groq Whisper or OpenAI Whisper). Returns the transcript.".to_string(),
             input_schema: serde_json::json!({
@@ -1118,7 +1493,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         // --- Image generation tool ---
-        ToolDefinition {
+        tool_definition! {
             name: "image_generate".to_string(),
             description: "Generate images from a text prompt using DALL-E 3, DALL-E 2, or GPT-Image-1. Requires OPENAI_API_KEY. Generated images are saved to the workspace output/ directory.".to_string(),
             input_schema: serde_json::json!({
@@ -1134,7 +1509,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         // --- Cron scheduling tools ---
-        ToolDefinition {
+        tool_definition! {
             name: "cron_create".to_string(),
             description: "Create a scheduled/cron job. Supports one-shot (at), recurring (every N seconds), and cron expressions. Max 50 jobs per agent.".to_string(),
             input_schema: serde_json::json!({
@@ -1158,7 +1533,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["name", "schedule", "action"]
             }),
         },
-        ToolDefinition {
+        tool_definition! {
             name: "cron_list".to_string(),
             description: "List all scheduled/cron jobs for the current agent.".to_string(),
             input_schema: serde_json::json!({
@@ -1166,7 +1541,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "properties": {}
             }),
         },
-        ToolDefinition {
+        tool_definition! {
             name: "cron_cancel".to_string(),
             description: "Cancel a scheduled/cron job by its ID.".to_string(),
             input_schema: serde_json::json!({
@@ -1178,7 +1553,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         // --- Channel send tool (proactive outbound messaging) ---
-        ToolDefinition {
+        tool_definition! {
             name: "channel_send".to_string(),
             description: "Send a message or media to a user on a configured channel (email, telegram, slack, etc). For email: recipient is the email address; optionally set subject. For media: set image_url or file_url to send an image or file instead of (or alongside) text.".to_string(),
             input_schema: serde_json::json!({
@@ -1196,7 +1571,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         // --- Hand tools (curated autonomous capability packages) ---
-        ToolDefinition {
+        tool_definition! {
             name: "hand_list".to_string(),
             description: "List available Hands (curated autonomous packages) and their activation status.".to_string(),
             input_schema: serde_json::json!({
@@ -1204,7 +1579,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "properties": {}
             }),
         },
-        ToolDefinition {
+        tool_definition! {
             name: "hand_activate".to_string(),
             description: "Activate a Hand — spawns a specialized autonomous agent with curated tools and skills.".to_string(),
             input_schema: serde_json::json!({
@@ -1216,7 +1591,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["hand_id"]
             }),
         },
-        ToolDefinition {
+        tool_definition! {
             name: "hand_status".to_string(),
             description: "Check the status and metrics of an active Hand.".to_string(),
             input_schema: serde_json::json!({
@@ -1227,7 +1602,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["hand_id"]
             }),
         },
-        ToolDefinition {
+        tool_definition! {
             name: "hand_deactivate".to_string(),
             description: "Deactivate a running Hand and stop its agent.".to_string(),
             input_schema: serde_json::json!({
@@ -1239,7 +1614,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         // --- A2A outbound tools ---
-        ToolDefinition {
+        tool_definition! {
             name: "a2a_discover".to_string(),
             description: "Discover an external A2A agent by fetching its agent card from a URL. Returns the agent's name, description, skills, and supported protocols.".to_string(),
             input_schema: serde_json::json!({
@@ -1250,7 +1625,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["url"]
             }),
         },
-        ToolDefinition {
+        tool_definition! {
             name: "a2a_send".to_string(),
             description: "Send a task/message to an external A2A agent and get the response. Use agent_name to send to a previously discovered agent, or agent_url for direct addressing.".to_string(),
             input_schema: serde_json::json!({
@@ -1265,7 +1640,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         // --- TTS/STT tools ---
-        ToolDefinition {
+        tool_definition! {
             name: "text_to_speech".to_string(),
             description: "Convert text to speech audio. Auto-selects OpenAI or ElevenLabs. Saves audio to workspace output/ directory.".to_string(),
             input_schema: serde_json::json!({
@@ -1278,7 +1653,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["text"]
             }),
         },
-        ToolDefinition {
+        tool_definition! {
             name: "speech_to_text".to_string(),
             description: "Transcribe audio to text using speech-to-text. Auto-selects Groq Whisper or OpenAI Whisper. Supported formats: mp3, wav, ogg, flac, m4a, webm.".to_string(),
             input_schema: serde_json::json!({
@@ -1291,7 +1666,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         // --- Docker sandbox tool ---
-        ToolDefinition {
+        tool_definition! {
             name: "docker_exec".to_string(),
             description: "Execute a command inside a Docker container sandbox. Provides OS-level isolation with resource limits, network isolation, and capability dropping. Requires Docker to be installed and docker.enabled=true.".to_string(),
             input_schema: serde_json::json!({
@@ -1303,7 +1678,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         // --- Persistent process tools ---
-        ToolDefinition {
+        tool_definition! {
             name: "process_start".to_string(),
             description: "Start a long-running process (REPL, server, watcher). Returns a process_id for subsequent poll/write/kill operations. Max 5 processes per agent.".to_string(),
             input_schema: serde_json::json!({
@@ -1319,7 +1694,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["command"]
             }),
         },
-        ToolDefinition {
+        tool_definition! {
             name: "process_poll".to_string(),
             description: "Read accumulated stdout/stderr from a running process. Non-blocking: returns whatever output has buffered since the last poll.".to_string(),
             input_schema: serde_json::json!({
@@ -1330,7 +1705,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["process_id"]
             }),
         },
-        ToolDefinition {
+        tool_definition! {
             name: "process_write".to_string(),
             description: "Write data to a running process's stdin. A newline is appended automatically if not present.".to_string(),
             input_schema: serde_json::json!({
@@ -1342,7 +1717,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["process_id", "data"]
             }),
         },
-        ToolDefinition {
+        tool_definition! {
             name: "process_kill".to_string(),
             description: "Terminate a running process and clean up its resources.".to_string(),
             input_schema: serde_json::json!({
@@ -1353,7 +1728,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["process_id"]
             }),
         },
-        ToolDefinition {
+        tool_definition! {
             name: "process_list".to_string(),
             description: "List all running processes for the current agent, including their IDs, commands, uptime, and alive status.".to_string(),
             input_schema: serde_json::json!({
@@ -1362,7 +1737,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         // --- System time tool ---
-        ToolDefinition {
+        tool_definition! {
             name: "system_time".to_string(),
             description: "Get the current date, time, and timezone. Returns ISO 8601 timestamp, Unix epoch seconds, and timezone info.".to_string(),
             input_schema: serde_json::json!({
@@ -1372,7 +1747,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         // --- Canvas / A2UI tool ---
-        ToolDefinition {
+        tool_definition! {
             name: "canvas_present".to_string(),
             description: "Present an interactive HTML canvas to the user. The HTML is sanitized (no scripts, no event handlers) and saved to the workspace. The dashboard will render it in a panel. Use for rich data visualizations, formatted reports, or interactive UI.".to_string(),
             input_schema: serde_json::json!({
@@ -3327,6 +3702,42 @@ async fn tool_canvas_present(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openfang_skills::registry::SkillRegistry;
+    use std::fs;
+    use tempfile::tempdir;
+
+    fn make_skill_registry() -> SkillRegistry {
+        let temp = tempdir().unwrap();
+        let skill_dir = temp.path().join("github-helper");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("skill.toml"),
+            r#"
+prompt_context = "Use this skill when working with GitHub pull requests."
+
+[skill]
+name = "github-helper"
+description = "GitHub workflow helper"
+tags = ["github", "pull-request"]
+
+[runtime]
+type = "promptonly"
+
+[[tools.provided]]
+name = "github_comment"
+description = "Post a GitHub comment"
+input_schema = { type = "object", properties = { issue = { type = "string" } } }
+"#,
+        )
+        .unwrap();
+
+        let mut registry = SkillRegistry::new(temp.path().to_path_buf());
+        registry.load_skill(&skill_dir).unwrap();
+
+        // Keep the tempdir alive by leaking it for the duration of the test process.
+        std::mem::forget(temp);
+        registry
+    }
 
     #[test]
     fn test_builtin_tool_definitions() {
@@ -3393,8 +3804,277 @@ mod tests {
         // Canvas tool
         assert!(names.contains(&"canvas_present"));
         // Skill discovery tools
-        assert!(names.contains(&"skill_search"));
+        assert!(names.contains(&"tool_search"));
+        assert!(names.contains(&"tool_get_instructions"));
         assert!(names.contains(&"skill_get_instructions"));
+        assert!(
+            tools.iter().all(|tool| !tool.defer_loading),
+            "builtin tools should remain visible by default; defer_loading is reserved for skill/MCP rollout"
+        );
+    }
+
+    #[test]
+    fn test_tool_runner_exposes_authorized_tools_as_visible_by_default() {
+        let authorized_tools = vec![
+            tool_definition! {
+                name: "file_read".to_string(),
+                description: "Read file".to_string(),
+                input_schema: serde_json::json!({}),
+            },
+            tool_definition! {
+                name: "web_search".to_string(),
+                description: "Search web".to_string(),
+                input_schema: serde_json::json!({}),
+            },
+        ];
+
+        let runner = ToolRunner::new(
+            authorized_tools.clone(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(runner.visible_tools().len(), authorized_tools.len());
+        assert_eq!(runner.visible_tool_names().len(), authorized_tools.len());
+        assert_eq!(runner.visible_tool_names()[0], "file_read");
+        assert_eq!(runner.visible_tool_names()[1], "web_search");
+    }
+
+    #[test]
+    fn test_tool_runner_hides_skill_tools_until_search() {
+        let registry = make_skill_registry();
+        let authorized_tools = vec![
+            tool_definition! {
+                name: "tool_search".to_string(),
+                description: "Search tools".to_string(),
+                input_schema: serde_json::json!({}),
+            },
+            ToolDefinition {
+                name: "github_comment".to_string(),
+                description: "Post a GitHub comment".to_string(),
+                input_schema: serde_json::json!({}),
+                defer_loading: true,
+            },
+        ];
+
+        let runner = ToolRunner::new(
+            authorized_tools,
+            None,
+            None,
+            Some(&registry),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(runner.visible_tool_names(), ["tool_search"]);
+    }
+
+    #[tokio::test]
+    async fn test_tool_search_expands_matching_skill_tools() {
+        let registry = make_skill_registry();
+        let authorized_tools = vec![
+            tool_definition! {
+                name: "tool_search".to_string(),
+                description: "Search tools".to_string(),
+                input_schema: serde_json::json!({}),
+            },
+            ToolDefinition {
+                name: "github_comment".to_string(),
+                description: "Post a GitHub comment".to_string(),
+                input_schema: serde_json::json!({}),
+                defer_loading: true,
+            },
+        ];
+
+        let mut runner = ToolRunner::new(
+            authorized_tools,
+            None,
+            None,
+            Some(&registry),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let result = runner
+            .execute_tool_call(
+                "toolu_1",
+                "tool_search",
+                &serde_json::json!({"query": "github pull request workflow", "top_k": 3}),
+            )
+            .await;
+
+        assert!(!result.is_error);
+        assert!(result.content.contains("github_comment"));
+        assert!(result.content.contains("\"kind\": \"tool\""));
+        assert!(result.content.contains("\"source\": \"skill\""));
+        assert!(result.content.contains("github-helper"));
+        assert!(runner.visible_tool_names().contains(&"github_comment".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_tool_search_returns_skill_manual_entries() {
+        let registry = make_skill_registry();
+        let authorized_tools = vec![tool_definition! {
+            name: "tool_search".to_string(),
+            description: "Search tools".to_string(),
+            input_schema: serde_json::json!({}),
+        }];
+
+        let mut runner = ToolRunner::new(
+            authorized_tools,
+            None,
+            None,
+            Some(&registry),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let result = runner
+            .execute_tool_call(
+                "toolu_1",
+                "tool_search",
+                &serde_json::json!({"query": "github workflow guidance", "top_k": 3}),
+            )
+            .await;
+
+        assert!(!result.is_error);
+        assert!(result.content.contains("\"kind\": \"skill_manual\""));
+        assert!(result.content.contains("\"name\": \"github-helper\""));
+        assert!(result.content.contains("\"has_instructions\": true"));
+        assert_eq!(runner.visible_tool_names(), ["tool_search"]);
+    }
+
+    #[tokio::test]
+    async fn test_tool_search_expands_generic_deferred_tools() {
+        let authorized_tools = vec![
+            tool_definition! {
+                name: "tool_search".to_string(),
+                description: "Search tools".to_string(),
+                input_schema: serde_json::json!({}),
+            },
+            ToolDefinition {
+                name: "docker_exec".to_string(),
+                description: "Execute a command inside a Docker sandbox".to_string(),
+                input_schema: serde_json::json!({}),
+                defer_loading: true,
+            },
+        ];
+
+        let mut runner = ToolRunner::new(
+            authorized_tools,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let result = runner
+            .execute_tool_call(
+                "toolu_1",
+                "tool_search",
+                &serde_json::json!({"query": "docker sandbox command execution", "top_k": 3}),
+            )
+            .await;
+
+        assert!(!result.is_error);
+        assert!(result.content.contains("docker_exec"));
+        assert!(result.content.contains("\"source\": \"builtin\""));
+        assert!(runner.visible_tool_names().contains(&"docker_exec".to_string()));
+    }
+
+
+    #[tokio::test]
+    async fn test_tool_search_expands_deferred_mcp_tools() {
+        let authorized_tools = vec![
+            tool_definition! {
+                name: "tool_search".to_string(),
+                description: "Search tools".to_string(),
+                input_schema: serde_json::json!({}),
+            },
+            ToolDefinition {
+                name: "mcp_minimax_web_search".to_string(),
+                description: "[MCP:MiniMax] Search the web".to_string(),
+                input_schema: serde_json::json!({}),
+                defer_loading: true,
+            },
+        ];
+
+        let mut runner = ToolRunner::new(
+            authorized_tools,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let result = runner
+            .execute_tool_call(
+                "toolu_1",
+                "tool_search",
+                &serde_json::json!({"query": "search the web with minimax", "top_k": 3}),
+            )
+            .await;
+
+        assert!(!result.is_error);
+        assert!(result.content.contains("mcp_minimax_web_search"));
+        assert!(result.content.contains("\"source\": \"mcp\""));
+        assert!(result.content.contains("\"provider\": \"minimax\""));
+        assert!(runner
+            .visible_tool_names()
+            .contains(&"mcp_minimax_web_search".to_string()));
     }
 
     #[test]

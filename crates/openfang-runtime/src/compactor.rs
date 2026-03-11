@@ -1260,6 +1260,7 @@ mod tests {
             name: "web_search".into(),
             description: "Search the web for information".into(),
             input_schema: serde_json::json!({"type": "object", "properties": {"query": {"type": "string"}}}),
+            defer_loading: false,
         }];
         let tokens_without = estimate_token_count(&messages, None, None);
         let tokens_with = estimate_token_count(&messages, None, Some(&tools));

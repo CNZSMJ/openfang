@@ -248,8 +248,8 @@ pub trait KernelHandle: Send + Sync {
         Err("Skill system not available".to_string())
     }
 
-    /// Search locally visible skills using natural-language intent.
-    fn skill_search(
+    /// Search the skills visible to the current agent, including prompt-only skills.
+    fn search_visible_skills(
         &self,
         query: &str,
         top_k: usize,
@@ -258,4 +258,5 @@ pub trait KernelHandle: Send + Sync {
         let _ = (query, top_k, agent_id);
         Err("Skill system not available".to_string())
     }
+
 }

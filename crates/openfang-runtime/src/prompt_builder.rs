@@ -290,8 +290,10 @@ fn build_skills_section() -> String {
     "## Skills\n\
      - Skills are available on demand.\n\
      - Do not assume a skill is relevant just because it exists.\n\
-     - When a request may benefit from specialized guidance, call `skill_search` first.\n\
-     - If a skill looks relevant, load detailed instructions only for that skill with `skill_get_instructions`."
+     - When a request may benefit from specialized guidance, call `tool_search` first if available.\n\
+     - `tool_search` may return callable deferred tools or skill manuals with additional instructions.\n\
+     - Matching skill tools may become available in later turns after `tool_search` returns.\n\
+     - If a skill looks relevant, load detailed instructions only for that skill with `tool_get_instructions`."
         .to_string()
 }
 
@@ -706,8 +708,9 @@ pub fn tool_hint(name: &str) -> &'static str {
         "process_list" => "list active processes",
 
         // Skills
-        "skill_search" => "discover relevant skills on demand",
-        "skill_get_instructions" => "load detailed instructions for a skill",
+        "tool_search" => "discover relevant deferred tools on demand",
+        "tool_get_instructions" => "load detailed instructions for a discovered skill manual",
+        "skill_get_instructions" => "deprecated compatibility alias for tool_get_instructions",
 
         _ => "",
     }
@@ -975,8 +978,8 @@ mod tests {
         let prompt = build_system_prompt(&ctx);
         assert!(prompt.contains("## Skills"));
         assert!(prompt.contains("Skills are available on demand"));
-        assert!(prompt.contains("skill_search"));
-        assert!(prompt.contains("skill_get_instructions"));
+        assert!(prompt.contains("tool_search"));
+        assert!(prompt.contains("tool_get_instructions"));
     }
 
     #[test]
