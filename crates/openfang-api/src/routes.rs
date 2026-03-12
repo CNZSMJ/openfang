@@ -525,6 +525,7 @@ pub async fn get_agent_session(
                                     id,
                                     name,
                                     input,
+                                    ..
                                 } => {
                                     let tool_idx = tools.len();
                                     tools.push(serde_json::json!({
@@ -6952,6 +6953,7 @@ pub async fn test_provider(
                 temperature: 0.0,
                 system: None,
                 thinking: None,
+                workspace_root: None,
             };
             match driver.complete(test_req).await {
                 Ok(_) => {

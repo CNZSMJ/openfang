@@ -261,7 +261,9 @@ impl LlmDriver for OpenAIDriver {
                     for block in blocks {
                         match block {
                             ContentBlock::Text { text } => text_parts.push(text.clone()),
-                            ContentBlock::ToolUse { id, name, input } => {
+                            ContentBlock::ToolUse {
+                                id, name, input, ..
+                            } => {
                                 tool_calls.push(OaiToolCall {
                                     id: id.clone(),
                                     call_type: "function".to_string(),
@@ -487,11 +489,13 @@ impl LlmDriver for OpenAIDriver {
                         id: call.id.clone(),
                         name: call.function.name.clone(),
                         input: input.clone(),
+                        thought_signature: None,
                     });
                     tool_calls.push(ToolCall {
                         id: call.id,
                         name: call.function.name,
                         input,
+                        thought_signature: None,
                     });
                 }
             }
@@ -601,7 +605,9 @@ impl LlmDriver for OpenAIDriver {
                     for block in blocks {
                         match block {
                             ContentBlock::Text { text } => text_parts.push(text.clone()),
-                            ContentBlock::ToolUse { id, name, input } => {
+                            ContentBlock::ToolUse {
+                                id, name, input, ..
+                            } => {
                                 tool_calls_out.push(OaiToolCall {
                                     id: id.clone(),
                                     call_type: "function".to_string(),
@@ -958,11 +964,13 @@ impl LlmDriver for OpenAIDriver {
                     id: id.clone(),
                     name: name.clone(),
                     input: input.clone(),
+                    thought_signature: None,
                 });
                 tool_calls.push(ToolCall {
                     id: id.clone(),
                     name: name.clone(),
                     input,
+                    thought_signature: None,
                 });
 
                 let _ = tx
@@ -970,6 +978,7 @@ impl LlmDriver for OpenAIDriver {
                         id: id.clone(),
                         name: name.clone(),
                         input: serde_json::from_str(arguments).unwrap_or_default(),
+                        thought_signature: None,
                     })
                     .await;
             }
@@ -1074,6 +1083,7 @@ fn parse_groq_failed_tool_call(body: &str) -> Option<CompletionResponse> {
             id: format!("groq_recovered_{}", tool_calls.len()),
             name: name.to_string(),
             input: args_value,
+            thought_signature: None,
         });
     }
 

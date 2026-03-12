@@ -492,6 +492,7 @@ pub async fn run_agent_loop_with_session_message(
             temperature: manifest.model.temperature,
             system: Some(system_prompt.clone()),
             thinking: None,
+            workspace_root: workspace_root.map(std::path::Path::to_path_buf),
         };
 
         // Log LLM Input
@@ -540,6 +541,7 @@ pub async fn run_agent_loop_with_session_message(
                         id: tc.id.clone(),
                         name: tc.name.clone(),
                         input: tc.input.clone(),
+                        thought_signature: tc.thought_signature.clone(),
                     });
                 }
                 response.content = new_blocks;
@@ -1441,6 +1443,7 @@ pub async fn run_agent_loop_streaming(
             temperature: manifest.model.temperature,
             system: Some(system_prompt.clone()),
             thinking: None,
+            workspace_root: workspace_root.map(std::path::Path::to_path_buf),
         };
 
         // Log LLM Input (streaming)
@@ -1494,6 +1497,7 @@ pub async fn run_agent_loop_streaming(
                         id: tc.id.clone(),
                         name: tc.name.clone(),
                         input: tc.input.clone(),
+                        thought_signature: tc.thought_signature.clone(),
                     });
                 }
                 response.content = new_blocks;
@@ -1995,6 +1999,7 @@ fn recover_text_tool_calls(text: &str, visible_tools: &[ToolDefinition]) -> Vec<
             id: format!("recovered_{}", uuid::Uuid::new_v4()),
             name: tool_name.to_string(),
             input,
+            thought_signature: None,
         });
     }
 
@@ -2058,6 +2063,7 @@ fn recover_text_tool_calls(text: &str, visible_tools: &[ToolDefinition]) -> Vec<
             id: format!("recovered_{}", uuid::Uuid::new_v4()),
             name: tool_name.to_string(),
             input,
+            thought_signature: None,
         });
     }
 
@@ -2104,6 +2110,7 @@ fn recover_text_tool_calls(text: &str, visible_tools: &[ToolDefinition]) -> Vec<
             id: format!("recovered_{}", uuid::Uuid::new_v4()),
             name: tool_name.to_string(),
             input,
+            thought_signature: None,
         });
     }
 
@@ -2136,6 +2143,7 @@ fn recover_text_tool_calls(text: &str, visible_tools: &[ToolDefinition]) -> Vec<
                                         id: format!("recovered_{}", uuid::Uuid::new_v4()),
                                         name: potential_tool.to_string(),
                                         input,
+                                        thought_signature: None,
                                     });
                                 }
                             }
@@ -2183,6 +2191,7 @@ fn recover_text_tool_calls(text: &str, visible_tools: &[ToolDefinition]) -> Vec<
                                 id: format!("recovered_{}", uuid::Uuid::new_v4()),
                                 name: potential_tool.to_string(),
                                 input,
+                                thought_signature: None,
                             });
                         }
                     }
@@ -2268,7 +2277,7 @@ fn format_blocks_for_log(blocks: &[ContentBlock]) -> String {
                 "- block[{idx}] image: media_type={media_type}, base64_chars={}",
                 data.len()
             ),
-            ContentBlock::ToolUse { id, name, input } => format!(
+            ContentBlock::ToolUse { id, name, input, .. } => format!(
                 "- block[{idx}] tool_use: id={id}, name={name}, input={}",
                 truncate_for_log(&input.to_string(), MAX_BLOCK_TEXT_LOG_CHARS)
             ),
@@ -2577,12 +2586,14 @@ mod tests {
                         id: "tool_1".to_string(),
                         name: "fake_tool".to_string(),
                         input: serde_json::json!({"query": "test"}),
+                        thought_signature: None,
                     }],
                     stop_reason: StopReason::ToolUse,
                     tool_calls: vec![ToolCall {
                         id: "tool_1".to_string(),
                         name: "fake_tool".to_string(),
                         input: serde_json::json!({"query": "test"}),
+                        thought_signature: None,
                     }],
                     usage: TokenUsage {
                         input_tokens: 10,

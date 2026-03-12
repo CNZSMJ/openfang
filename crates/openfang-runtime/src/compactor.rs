@@ -459,6 +459,7 @@ async fn summarize_messages(
                 .to_string(),
         ),
         thinking: None,
+        workspace_root: None,
     };
 
     // Retry logic for transient failures
@@ -574,6 +575,7 @@ async fn summarize_in_chunks(
                 .to_string(),
         ),
         thinking: None,
+        workspace_root: None,
     };
 
     match driver.complete(merge_request).await {
@@ -850,6 +852,7 @@ mod tests {
                 id: "tu-1".to_string(),
                 name: "web_search".to_string(),
                 input: serde_json::json!({"query": "test"}),
+                thought_signature: None,
             }]),
         };
         messages[2] = Message {
@@ -1184,6 +1187,7 @@ mod tests {
                         id: "tu-1".to_string(),
                         name: "web_search".to_string(),
                         input: serde_json::json!({"query": "rust"}),
+                        thought_signature: None,
                     },
                 ]),
             },

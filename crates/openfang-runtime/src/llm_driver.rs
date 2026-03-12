@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use openfang_types::message::{ContentBlock, Message, StopReason, TokenUsage};
 use openfang_types::tool::{ToolCall, ToolDefinition};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use thiserror::Error;
 
 /// Error type for LLM driver operations.
@@ -65,6 +66,8 @@ pub struct CompletionRequest {
     pub system: Option<String>,
     /// Extended thinking configuration (if supported by the model).
     pub thinking: Option<openfang_types::config::ThinkingConfig>,
+    /// Optional workspace root for provider-local debug logs.
+    pub workspace_root: Option<PathBuf>,
 }
 
 /// A response from an LLM completion.
@@ -109,6 +112,7 @@ pub enum StreamEvent {
         id: String,
         name: String,
         input: serde_json::Value,
+        thought_signature: Option<String>,
     },
     /// Incremental thinking/reasoning text.
     ThinkingDelta { text: String },
@@ -228,6 +232,7 @@ mod tests {
                 id: "t1".to_string(),
                 name: "web_search".to_string(),
                 input: serde_json::json!({"query": "rust"}),
+                thought_signature: None,
             },
             StreamEvent::ContentComplete {
                 stop_reason: StopReason::EndTurn,
@@ -276,6 +281,7 @@ mod tests {
             temperature: 0.0,
             system: None,
             thinking: None,
+            workspace_root: None,
         };
 
         let response = driver.stream(request, tx).await.unwrap();
