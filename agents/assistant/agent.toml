@@ -22,16 +22,13 @@ max_llm_tokens_per_hour = 30000000
 max_concurrent_tools = 10
 
 [capabilities]
-tools = ["file_read", "file_write", "file_list", "memory_store", "memory_recall",
-         "web_fetch", "web_search", "shell_exec", "agent_send", "agent_list",
-         "skill_install", "skill_create", "skill_get_instructions",
-         "schedule_create", "schedule_list", "apply_patch"]
+tools = ["*"]
 network = ["*"]
 memory_read = ["*"]
 memory_write = ["self.*", "shared.*"]
 agent_spawn = true
 agent_message = ["*"]
-shell = ["python *", "cargo *", "git *", "npm *", "curl *", "pip *", "nv *", "nvx *", "which *", "claude *", "brew *", "tar *", "uv *", "cat *"]
+shell = ["*"]
 
 [exec_policy]
 mode = "full"
