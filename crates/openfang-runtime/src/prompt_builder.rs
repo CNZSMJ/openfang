@@ -788,7 +788,7 @@ pub fn tool_category(name: &str) -> &'static str {
 
         "docker_exec" | "docker_build" | "docker_run" => "Docker",
 
-        "cron_create" | "cron_list" | "cron_delete" => "Scheduling",
+        "cron_create" | "cron_list" | "cron_cancel" | "cron_delete" => "Scheduling",
 
         "process_start" | "process_poll" | "process_write" | "process_kill" | "process_list" => {
             "Processes"
@@ -865,6 +865,7 @@ pub fn tool_hint(name: &str) -> &'static str {
         // Scheduling
         "cron_create" => "schedule a recurring task",
         "cron_list" => "list scheduled tasks",
+        "cron_cancel" => "cancel a scheduled task",
         "cron_delete" => "remove a scheduled task",
 
         // Processes
@@ -1086,6 +1087,7 @@ mod tests {
         assert_eq!(tool_category("agent_send"), "Agents");
         assert_eq!(tool_category("mcp_minimax_web_search"), "Web");
         assert_eq!(tool_category("mcp_minimax_understand_image"), "Media");
+        assert_eq!(tool_category("cron_cancel"), "Scheduling");
         assert_eq!(tool_category("skill_install"), "Skill Management");
         assert_eq!(tool_category("tool_search"), "Discovery Tools");
         assert_eq!(tool_category("unknown_tool"), "Other");
@@ -1096,6 +1098,7 @@ mod tests {
         assert!(!tool_hint("web_search").is_empty());
         assert!(!tool_hint("file_read").is_empty());
         assert!(!tool_hint("browser_navigate").is_empty());
+        assert_eq!(tool_hint("cron_cancel"), "cancel a scheduled task");
         assert!(tool_hint("some_unknown_tool").is_empty());
     }
 
