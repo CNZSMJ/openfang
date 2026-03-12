@@ -1872,8 +1872,13 @@ impl OpenFangKernel {
             by_messages || by_tokens
         };
 
-        let tools = self.available_tools(agent_id);
+        let tools = self.authorized_tools(agent_id);
         let tools = entry.mode.filter_tools(tools);
+        let visible_tools: Vec<ToolDefinition> = tools
+            .iter()
+            .filter(|tool| !tool.defer_loading)
+            .cloned()
+            .collect();
         let driver = self.resolve_driver(&entry.manifest)?;
 
         // Look up model's actual context window from the catalog
@@ -1899,7 +1904,6 @@ impl OpenFangKernel {
 
         // Build the structured system prompt via prompt_builder
         {
-            let mcp_tool_count = self.mcp_tools.lock().map(|t| t.len()).unwrap_or(0);
             let shared_id = shared_memory_agent_id();
             let user_name = self
                 .memory
@@ -1917,14 +1921,10 @@ impl OpenFangKernel {
                 agent_name: manifest.name.clone(),
                 agent_description: manifest.description.clone(),
                 base_system_prompt: manifest.model.system_prompt.clone(),
-                granted_tools: tools.iter().map(|t| t.name.clone()).collect(),
+                granted_tools: visible_tools.iter().map(|t| t.name.clone()).collect(),
                 recalled_memories: vec![],
-                skills: self.collect_skill_info(&manifest.skills),
-                mcp_summary: if mcp_tool_count > 0 {
-                    self.build_mcp_summary(&manifest.mcp_servers)
-                } else {
-                    String::new()
-                },
+                skills: self.collect_visible_skill_info(&manifest.skills, &visible_tools),
+                mcp_summary: self.build_mcp_summary(&visible_tools, &manifest.mcp_servers),
                 workspace_path: manifest.workspace.as_ref().map(|p| p.display().to_string()),
                 soul_md: manifest
                     .workspace
@@ -2354,8 +2354,13 @@ impl OpenFangKernel {
 
         let messages_before = session.messages.len();
 
-        let tools = self.available_tools(agent_id);
+        let tools = self.authorized_tools(agent_id);
         let tools = entry.mode.filter_tools(tools);
+        let visible_tools: Vec<ToolDefinition> = tools
+            .iter()
+            .filter(|tool| !tool.defer_loading)
+            .cloned()
+            .collect();
 
         info!(
             agent = %entry.name,
@@ -2384,7 +2389,6 @@ impl OpenFangKernel {
 
         // Build the structured system prompt via prompt_builder
         {
-            let mcp_tool_count = self.mcp_tools.lock().map(|t| t.len()).unwrap_or(0);
             let shared_id = shared_memory_agent_id();
             let user_name = self
                 .memory
@@ -2402,14 +2406,10 @@ impl OpenFangKernel {
                 agent_name: manifest.name.clone(),
                 agent_description: manifest.description.clone(),
                 base_system_prompt: manifest.model.system_prompt.clone(),
-                granted_tools: tools.iter().map(|t| t.name.clone()).collect(),
+                granted_tools: visible_tools.iter().map(|t| t.name.clone()).collect(),
                 recalled_memories: vec![], // Recalled in agent_loop, not here
-                skills: self.collect_skill_info(&manifest.skills),
-                mcp_summary: if mcp_tool_count > 0 {
-                    self.build_mcp_summary(&manifest.mcp_servers)
-                } else {
-                    String::new()
-                },
+                skills: self.collect_visible_skill_info(&manifest.skills, &visible_tools),
+                mcp_summary: self.build_mcp_summary(&visible_tools, &manifest.mcp_servers),
                 workspace_path: manifest.workspace.as_ref().map(|p| p.display().to_string()),
                 soul_md: manifest
                     .workspace
@@ -4686,8 +4686,9 @@ impl OpenFangKernel {
         }
     }
 
-    /// Get the list of tools available to an agent based on its capabilities.
-    fn available_tools(&self, agent_id: AgentId) -> Vec<ToolDefinition> {
+    /// Get the list of tools authorized for an agent after all capability,
+    /// allowlist, and execution-policy filtering has been applied.
+    fn authorized_tools(&self, agent_id: AgentId) -> Vec<ToolDefinition> {
         let all_builtins = builtin_tool_definitions();
         let mut skill_tool_names = std::collections::HashSet::new();
 
@@ -4706,7 +4707,7 @@ impl OpenFangKernel {
 
         // Filter builtin tools by ToolProfile (if set and not Full).
         // This is the primary token-saving mechanism: a chat agent with ToolProfile::Minimal
-        // gets 2 tools instead of 46+, saving ~15-20K tokens of tool definitions.
+        // gets a small builtin surface instead of the full 46+ tool catalog.
         let has_tool_all = entry.as_ref().is_some_and(|_| {
             let caps = self.capabilities.list(agent_id);
             caps.iter().any(|c| matches!(c, Capability::ToolAll))
@@ -4760,13 +4761,17 @@ impl OpenFangKernel {
                 name: skill_tool.name.clone(),
                 description: skill_tool.description.clone(),
                 input_schema: skill_tool.input_schema.clone(),
+                defer_loading: skill_tool.defer_loading,
             });
         }
 
         // Add MCP tools (filtered by agent's MCP server allowlist)
         if let Ok(mcp_tools) = self.mcp_tools.lock() {
             if mcp_allowlist.is_empty() {
-                all_tools.extend(mcp_tools.iter().cloned());
+                all_tools.extend(mcp_tools.iter().cloned().map(|mut tool| {
+                    tool.defer_loading = false;
+                    tool
+                }));
             } else {
                 // Normalize allowlist names for matching
                 let normalized: Vec<String> = mcp_allowlist
@@ -4781,7 +4786,11 @@ impl OpenFangKernel {
                                 .map(|s| normalized.iter().any(|n| n == s))
                                 .unwrap_or(false)
                         })
-                        .cloned(),
+                        .cloned()
+                        .map(|mut tool| {
+                            tool.defer_loading = false;
+                            tool
+                        }),
                 );
             }
         }
@@ -4811,7 +4820,6 @@ impl OpenFangKernel {
             all_tools.retain(|t| t.name != "shell_exec");
         }
 
-        // If agent has ToolAll, return all tools
         if caps.iter().any(|c| matches!(c, Capability::ToolAll)) {
             return all_tools;
         }
@@ -4839,12 +4847,8 @@ impl OpenFangKernel {
 
     /// Build a compact MCP server/tool summary for the system prompt so the
     /// agent knows what external tool servers are connected.
-    fn build_mcp_summary(&self, mcp_allowlist: &[String]) -> String {
-        let tools = match self.mcp_tools.lock() {
-            Ok(t) => t.clone(),
-            Err(_) => return String::new(),
-        };
-        if tools.is_empty() {
+    fn build_mcp_summary(&self, visible_tools: &[ToolDefinition], mcp_allowlist: &[String]) -> String {
+        if visible_tools.is_empty() {
             return String::new();
         }
 
@@ -4858,26 +4862,21 @@ impl OpenFangKernel {
         let mut servers: std::collections::BTreeMap<String, Vec<String>> =
             std::collections::BTreeMap::new();
         let mut tool_count = 0usize;
-        for tool in &tools {
+        for tool in visible_tools {
             let parts: Vec<&str> = tool.name.splitn(3, '_').collect();
-            if parts.len() >= 3 && parts[0] == "mcp" {
-                let server = parts[1].to_string();
-                // Filter by MCP allowlist if set
-                if !mcp_allowlist.is_empty() && !normalized.iter().any(|n| n == &server) {
-                    continue;
-                }
-                servers
-                    .entry(server)
-                    .or_default()
-                    .push(tool.name.clone());
-                tool_count += 1;
-            } else {
-                servers
-                    .entry("unknown".to_string())
-                    .or_default()
-                    .push(tool.name.clone());
-                tool_count += 1;
+            if parts.len() < 3 || parts[0] != "mcp" {
+                continue;
             }
+            let server = parts[1].to_string();
+            // Filter by MCP allowlist if set
+            if !mcp_allowlist.is_empty() && !normalized.iter().any(|n| n == &server) {
+                continue;
+            }
+            servers
+                .entry(server)
+                .or_default()
+                .push(tool.name.clone());
+            tool_count += 1;
         }
         if tool_count == 0 {
             return String::new();
@@ -4930,10 +4929,13 @@ impl OpenFangKernel {
         *registry = fresh;
     }
 
-    fn collect_skill_info(
+    fn collect_visible_skill_info(
         &self,
         skill_allowlist: &[String],
+        visible_tools: &[ToolDefinition],
     ) -> Vec<openfang_runtime::prompt_builder::SkillInfo> {
+        let visible_tool_names: std::collections::HashSet<&str> =
+            visible_tools.iter().map(|tool| tool.name.as_str()).collect();
         let registry = self
             .skill_registry
             .read()
@@ -4941,28 +4943,33 @@ impl OpenFangKernel {
         registry
             .list()
             .into_iter()
-            .filter(|s| {
-                s.enabled
+            .filter(|skill| {
+                skill.enabled
+                    && !skill.manifest.skill.defer_loading
                     && (skill_allowlist.is_empty()
-                        || skill_allowlist.contains(&s.manifest.skill.name))
+                        || skill_allowlist.contains(&skill.manifest.skill.name))
             })
-            .map(|s| openfang_runtime::prompt_builder::SkillInfo {
-                name: s.manifest.skill.name.clone(),
-                description: s.manifest.skill.description.clone(),
-                provided_tools: s
+            .map(|skill| {
+                let provided_tools: Vec<String> = skill
                     .manifest
                     .tools
                     .provided
                     .iter()
-                    .filter(|t| t.policy.model_invocable())
-                    .map(|t| t.name.clone())
-                    .collect(),
-                has_prompt_context: s
-                    .manifest
-                    .prompt_context
-                    .as_ref()
-                    .map(|c| !c.is_empty())
-                    .unwrap_or(false),
+                    .filter(|tool| tool.policy.model_invocable())
+                    .filter(|tool| visible_tool_names.contains(tool.name.as_str()))
+                    .map(|tool| tool.name.clone())
+                    .collect();
+                openfang_runtime::prompt_builder::SkillInfo {
+                    name: skill.manifest.skill.name.clone(),
+                    description: skill.manifest.skill.description.clone(),
+                    provided_tools,
+                    has_prompt_context: skill
+                        .manifest
+                        .prompt_context
+                        .as_ref()
+                        .map(|ctx| !ctx.is_empty())
+                        .unwrap_or(false),
+                }
             })
             .collect()
     }
@@ -5763,6 +5770,7 @@ impl KernelHandle for OpenFangKernel {
                 author: String::new(),
                 license: String::new(),
                 tags: vec!["prompt-only".to_string()],
+                defer_loading: false,
             },
             runtime: openfang_skills::SkillRuntimeConfig {
                 runtime_type: openfang_skills::SkillRuntime::PromptOnly,
@@ -5785,6 +5793,32 @@ impl KernelHandle for OpenFangKernel {
             name,
             if is_workspace { "workspace" } else { "global home" }
         ))
+    }
+
+    fn search_visible_skills(
+        &self,
+        query: &str,
+        top_k: usize,
+        agent_id: Option<&str>,
+    ) -> Result<Vec<openfang_skills::SkillSearchResult>, String> {
+        let visible_skills = if let Some(raw_id) = agent_id {
+            let agent_id = raw_id
+                .parse::<AgentId>()
+                .map_err(|_| "Invalid agent ID".to_string())?;
+            let entry = self
+                .registry
+                .get(agent_id)
+                .ok_or_else(|| format!("Agent {} not found", agent_id))?;
+            Some(entry.manifest.skills.clone())
+        } else {
+            None
+        };
+
+        let registry = self
+            .skill_registry
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        Ok(registry.search(query, top_k, visible_skills.as_deref()))
     }
 
     async fn send_channel_message(

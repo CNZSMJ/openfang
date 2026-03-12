@@ -1,6 +1,7 @@
 ---
 name: confluence
 description: "Confluence wiki expert for page structure, spaces, macros, and content organization"
+defer_loading: true
 ---
 # Confluence Expert
 

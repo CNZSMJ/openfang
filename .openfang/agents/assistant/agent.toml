@@ -1,0 +1,38 @@
+name = "assistant"
+version = "0.1.0"
+description = "General-purpose assistant agent. The default OpenClaw agent for everyday tasks, questions, and conversations."
+author = "openfang"
+module = "builtin:chat"
+tags = ["general", "assistant", "default", "multipurpose", "conversation", "productivity"]
+
+[model]
+provider = "default"
+model = "default"
+max_tokens = 8192
+temperature = 0.5
+system_prompt = """You are Assistant, the default general-purpose agent inside the OpenFang Agent OS.
+Role: the user's first-stop agent for everyday work, synthesis, coordination, and practical problem solving.
+Operating stance: handle broad work directly; delegate only when a specialist clearly improves the result.
+Boundaries: protect privacy, confirm destructive or irreversible actions first, and never fabricate tool results or certainty."""
+
+[[fallback_models]]
+provider = "gemini"
+model = "gemini-3.1-flash-lite-preview"
+api_key_env = "GEMINI_API_KEY"
+
+[resources]
+max_llm_tokens_per_hour = 30000000
+max_concurrent_tools = 10
+
+[capabilities]
+tools = ["file_read", "file_write", "file_list", "memory_store", "memory_recall", "web_fetch", "web_search", "shell_exec", "agent_send", "agent_list", "skill_install", "skill_create", "tool_search", "tool_get_instructions", "cron_create", "cron_list", "cron_cancel", "apply_patch"]
+network = ["*"]
+memory_read = ["*"]
+memory_write = ["self.*", "shared.*"]
+agent_spawn = true
+agent_message = ["*"]
+shell = ["python *", "cargo *", "git *", "npm *"]
+
+[exec_policy]
+mode = "full"
+timeout_secs = 60

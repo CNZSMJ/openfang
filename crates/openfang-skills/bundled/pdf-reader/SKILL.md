@@ -1,6 +1,7 @@
 ---
 name: pdf-reader
 description: PDF content extraction and analysis specialist
+defer_loading: false
 ---
 # PDF Content Extraction and Analysis
 

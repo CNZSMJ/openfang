@@ -1,6 +1,7 @@
 ---
 name: prompt-engineer
 description: "Prompt engineering expert for chain-of-thought, few-shot learning, evaluation, and LLM optimization"
+defer_loading: false
 ---
 # Prompt Engineering Expertise
 

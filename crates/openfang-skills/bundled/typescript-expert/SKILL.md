@@ -1,6 +1,7 @@
 ---
 name: typescript-expert
 description: "TypeScript expert for type system, generics, utility types, and strict mode patterns"
+defer_loading: true
 ---
 # TypeScript Type System Mastery
 

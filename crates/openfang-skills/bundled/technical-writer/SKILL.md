@@ -1,6 +1,7 @@
 ---
 name: technical-writer
 description: "Technical writing expert for API docs, READMEs, ADRs, and developer documentation"
+defer_loading: false
 ---
 # Technical Writing Expertise
 

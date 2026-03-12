@@ -1,353 +1,393 @@
-# Skill Progressive Loading Design
+# Tool / Skill 渐进式发现方案
 
-## Overview
+## 概览
 
-This document proposes a progressive loading architecture for OpenFang skills.
+本文档只描述这个分支**当前已经落地的实现**，以及已经确认的技术决策依据。
 
-The target shape is:
+这条分支的目标已经不再是早期的 `skill_search -> skill_get_instructions` 方案，而是更通用的：
 
-- the system prompt no longer contains a full catalog of bundled and installed skills
-- agents discover relevant skills on demand instead of reading every skill on every turn
-- detailed skill instructions are loaded only for the selected skill
-- prompt size drops, cacheability improves, and skill choice becomes more reliable
+- 统一使用 `tool_search`
+- 统一使用 `tool_get_instructions`
+- 统一用 `ToolDefinition.defer_loading` 控制默认可见性
+- 由 runtime 在 agent loop 内自动展开 deferred tools
 
-This design is intended for OpenFang's current runtime, which already has:
+当前分支里，`tool` 是统一抽象；`builtin`、`skill`、`MCP` 只是来源。
 
-- a skill registry
-- `skill_get_instructions(skill_name)`
-- per-agent skill visibility
+## 当前实现结论
 
-The missing piece is a lightweight retrieval step between "skills exist" and "load one skill manual".
+### 1. LLM 看到的工具协议已经统一
 
-## Problem Statement
+当前代码里，LLM 最终拿到的是统一的 `Vec<ToolDefinition>`：
 
-The current system prompt injects a full `## Skills` section every turn.
+- builtin tools
+- skill-provided callable tools
+- MCP tools
 
-This creates four problems:
+运行链路是：
 
-1. Token waste from listing dozens of unrelated skills
-2. Lower prompt cache efficiency because a large dynamic catalog is always present
-3. Worse model focus because irrelevant skills compete with the current task
-4. Weak reliability if we later remove the full catalog without giving the model a way to discover relevant skills
+1. kernel 先计算 agent 的 `authorized_tools`
+2. runtime 的 `ToolRunner` 再维护 loop-local `visible_tools`
+3. 每轮只把 `visible_tools` 发给 LLM
+4. 模型返回 `tool_use`
+5. runtime 统一解析成 `ToolCall`
+6. 再按现有执行分发去执行 builtin / skill / MCP
 
-The core issue is that the system currently supports:
+这里已经成立的统一抽象是：
 
-- full skill inventory injection
-- direct single-skill expansion via `skill_get_instructions`
+- `ToolDefinition`
+- `ToolCall`
+- `ToolResult`
 
-but it does not support:
+### 2. `tool_search` 已经是唯一 discovery 入口
 
-- skill discovery from natural language intent
+当前分支中：
 
-## Goals
+- `skill_search` 已删除
+- `tool_search` 是唯一 discovery 入口
+- `tool_get_instructions` 是统一的 guidance/manual loader
 
-- Remove the full skill catalog from the default system prompt
-- Let the model discover relevant skills from natural language task intent
-- Load detailed instructions only for the chosen skill
-- Keep the implementation simple and explainable in v1
-- Reuse the existing skill registry and `skill_get_instructions` flow
+它们都已经是 runtime builtin tools。
 
-## Non-Goals
+### 3. agent loop 已支持 automatic expansion
 
-- Build a general-purpose semantic retrieval platform in v1
-- Add vector search infrastructure for skills in v1
-- Change the skill installation model
-- Redesign skill manifests
-- Automatically force skill usage on every task
+当前实现不是“搜索后只返回名字，模型再显式 load”，而是：
 
-## Desired Runtime Flow
+1. 模型调用 `tool_search`
+2. runtime 在当前 agent 已授权但默认隐藏的资源里搜索
+3. `ToolRunner` 自动把命中的 deferred tools 并入当前 loop 的 visible tool set
+4. 同一条顶层消息内，模型可以继续直接调用新暴露出的 tool
 
-The desired model workflow is:
+这是当前分支最关键的运行时能力。
 
-1. Decide whether the task may benefit from a specialized skill
-2. Call `skill_search("natural language intent", top_k=3)`
-3. Inspect the top results
-4. If one result is clearly strongest, choose it directly
-5. Otherwise compare the short list and choose the best fit, or skip skills if nothing is relevant
-6. Call `skill_get_instructions(skill_name)`
-7. Execute the task
+### 4. 当前默认可见性策略
 
-This keeps skill discovery explicit and cheap while preserving access to detailed manuals only when needed.
+这条分支里，当前默认行为是：
 
-## Prompt Strategy
+- builtin tools：默认 `defer_loading = false`
+- MCP tools：默认 `defer_loading = false`
+- skill：系统默认 `defer_loading = false`
+- bundled skills：当前已统一显式标记为 `defer_loading: true`
 
-### Current Behavior
+因此今天的真实效果是：
 
-The current prompt builder injects a full `## Skills` section containing every visible skill summary.
+- builtin 默认直接可见
+- MCP 默认直接可见
+- 用户安装 / 工作区 skill 默认直接可见
+- 系统内置 bundled skills 默认 deferred，通过 `tool_search` 发现
 
-### Proposed Behavior
+这条策略是当前分支的**真实代码状态**，不是未来设想。
 
-Replace the full skill catalog with a short protocol section:
+## 当前 skill 侧配置模型
 
-```md
-## Skills
-- Skills are available on demand.
-- Do not assume a skill is relevant just because it exists.
-- When a request may benefit from specialized guidance, search for matching skills first.
-- If a skill looks relevant, load detailed instructions only for that skill.
+### 已实现的配置点
+
+skill 侧当前已经支持在 skill 顶层声明 `defer_loading`。
+
+#### `SKILL.md` 顶层 frontmatter
+
+```yaml
+---
+name: github
+description: GitHub operations expert
+defer_loading: true
+---
 ```
 
-This keeps the stable prompt small while still telling the model how to discover and load skills.
+#### `skill.toml`
 
-## API and Tool Design
-
-## New Tool: `skill_search`
-
-Add a new built-in tool:
-
-```json
-{
-  "query": "natural language task intent",
-  "top_k": 3
-}
+```toml
+[skill]
+name = "github"
+description = "GitHub operations expert"
+defer_loading = true
 ```
 
-Response shape:
+两种格式最终都会收敛到 canonical `SkillManifest.skill.defer_loading`。
 
-```json
-{
-  "results": [
-    {
-      "name": "kubernetes",
-      "description": "Kubernetes operations expert for kubectl, pods, deployments, and debugging",
-      "tags": ["infra", "k8s"],
-      "tools_count": 0,
-      "has_prompt_context": true,
-      "score": 0.91,
-      "match_reason": [
-        "alias:k8s->kubernetes",
-        "description:deployment",
-        "description:debug"
-      ]
-    }
-  ]
-}
+### 当前 skill 默认值
+
+如果 skill 没有显式声明 `defer_loading`：
+
+- 默认值是 `false`
+
+也就是说，系统默认不会把所有 skill 都隐藏。
+
+这是这条分支里明确确认过的技术决策。
+
+### 当前 bundled skill 策略
+
+为了避免内置 skill 目录过大、过噪、对 prompt 造成干扰，这个分支已经把 `crates/openfang-skills/bundled/**/SKILL.md` 全部显式加上：
+
+```yaml
+defer_loading: true
 ```
 
-### Why a New Tool Is Needed
+所以 bundled skills 现在的行为不是依赖代码硬编码，而是来自 skill 自身 manifest/frontmatter。
 
-OpenFang already has:
+## 当前 skill 策略的决策依据
 
-- a skill registry that can list installed skills
-- `skill_get_instructions(skill_name)` for loading one skill manual
+### 为什么 skill 默认值不是 `true`
 
-But it does not currently have a native skill discovery tool that accepts natural language queries.
+这条分支最终没有采用“所有 skill 默认 deferred”的策略，原因很明确：
 
-`skill_search` fills exactly that gap.
+1. 这会让用户完全失去控制权
+2. skill 是 OpenFang 最主要的扩展方式之一
+3. 用户通常希望 agent 先看到用户自己安装的能力包
+4. 把全部 skill 默认隐藏，会让能力地图严重退化
 
-## Retrieval Strategy
+所以最终收敛为：
 
-### Principle
+- skill 系统默认 `false`
+- 是否 deferred 由 skill 自己声明
 
-Do not ask the model to generate exact keywords.
+### 为什么不做 agent 级 skill override
 
-Instead:
+这一点在这个分支上已经明确排除了。
 
-- let the model provide natural language intent
-- let the backend perform retrieval and ranking
+没有采用“agent manifest 再覆盖 skill 的 defer_loading”，原因是：
 
-This is more reliable than forcing the model to guess the exact vocabulary used by skill names or descriptions.
+1. 对 skill 来说，安装本身已经有作用域：
+   - 全局安装
+   - 工作区安装
+2. 再引入 agent 级 override，会把作用域、授权、可见性混在一起
+3. 当前产品模型里，skill 更像一个能力包，不值得为了 deferred 再加一层 agent policy
 
-### V1 Retrieval Method
+因此当前 skill 方案刻意保持简单：
 
-Version 1 should use a lightweight hybrid lexical scorer, not embeddings.
+- skill 自身 manifest/frontmatter
+- 系统默认值
 
-Candidate signals:
+就这两层。
 
-- exact name match
-- name prefix match
-- alias match
-- description token hits
-- tag hits
-- provided tool hits
-- small bonus for `has_prompt_context`
+### 为什么 bundled skill 要统一 deferred
 
-### Query Normalization
+这是当前分支里非常明确的一条决策：
 
-`skill_search` should normalize input before scoring:
+- bundled skill 数量多
+- 覆盖面广
+- 如果默认全量展开，会重新把 prompt 变回超长 catalog
 
-- lowercase
-- tokenize
-- drop common stopwords
-- expand aliases and domain synonyms
+而 bundled skills 的设计目标更适合“长尾能力库”：
 
-Examples:
+- 默认隐藏
+- 需要时通过 `tool_search` 发现
+- 命中后再按需 `tool_get_instructions`
 
-- `k8s -> kubernetes`
-- `rag -> retrieval, vector, embeddings`
-- `email -> email-writer`
-- `review -> code-reviewer`
-- `ts -> typescript`
+因此 bundled skills 统一 `defer_loading: true`，是为了降低默认 prompt 噪音，同时保留完整 discoverability。
 
-This keeps the interface natural-language-first while avoiding a hard dependency on model-generated keyword quality.
+## 当前 MCP 侧状态
 
-## Ranking
+### 已实现行为
 
-Version 1 ranking should stay simple and explainable.
+当前分支里，MCP tools 已经纳入统一 `ToolDefinition` 和 `ToolRunner` 体系。
 
-An example scoring formula:
+但**MCP 的 `defer_loading` 配置项还没有实现**。
+
+当前真实行为是：
+
+- MCP tools 默认 `defer_loading = false`
+- 也就是默认直接可见
+
+### 尚未实现的部分
+
+我们已经确认过更合理的 MCP 配置方向，但这条分支**还没有落地**：
+
+- server 级默认值
+- tool 级覆盖
+- 命名建议对齐 Anthropic 的 `default_config.defer_loading`
+
+因此文档必须明确：
+
+- skill 的 deferred 配置已经实现
+- MCP 的 deferred 配置**尚未实现**
+
+不要把这两者写成已经对称完成。
+
+## 当前 prompt 结构
+
+当前 system prompt 已按这个分支的真实实现调整为：
+
+1. `## Tool Use Strategy`
+2. `## Immediate Tools`
+3. `## Skills`
+4. `## Tool Discovery`
+5. `## Connected Tool Servers (MCP)`
+
+### 各 section 的职责
+
+#### `## Tool Use Strategy`
+
+描述模型如何决策：
+
+- 当前 visible tools 是否已覆盖任务
+- 是否应先走 discovery
+- skill manual 什么时候值得先读
+
+它不再使用旧的“只要需要就立刻调工具”式表述，而是和 deferred loading 协调。
+
+#### `## Immediate Tools`
+
+这是“当前已经可直接调用”的统一 tool surface。
+
+这里不是 builtin-only，而是统一包含：
+
+- visible builtin tools
+- visible skill tools
+- visible MCP tools
+- discovery tools
+
+也就是说，它按“当前能不能直接调用”组织，而不是按来源组织。
+
+#### `## Skills`
+
+这里承担 capability map 的职责。
+
+它列出当前 agent 环境下**默认可见的 skill 摘要**，并保留：
+
+- `[manual available]`
+- `tool_get_instructions(<skill name>)` 的 skill-specific 指引
+
+当前实现里，这个 section 会受 skill 顶层 `defer_loading` 影响：
+
+- `defer_loading = false` 的 skill 可以进入 `## Skills`
+- `defer_loading = true` 的 skill 不进入这个 section
+
+#### `## Tool Discovery`
+
+这是统一 discovery protocol：
+
+- 当前 visible tools 不够时调用 `tool_search`
+- 命中 guidance 时调用 `tool_get_instructions(<result name>)`
+- deferred tool 被展开后，按精确 tool name 调用
+
+这个 section 不再挂在 `## Skills` 下面，而是独立存在。
+
+#### `## Connected Tool Servers (MCP)`
+
+这里只承担 MCP 环境说明。
+
+当前仍保留明确约束：
 
 ```text
-score =
-  10 * exact_name_match +
-   6 * prefix_name_match +
-   4 * alias_match +
-   3 * description_hits +
-   2 * tag_hits +
-   1 * provided_tool_hits +
- 0.5 * has_prompt_context
+To use these tools, call them by their FULL name exactly as shown above.
 ```
 
-The exact constants can change. The important property is interpretability.
+这是因为 MCP namespaced tool name 对模型调用正确性仍然重要。
 
-The response should include a compact `match_reason` list so the model can understand why a result was surfaced.
+## 当前运行时行为
 
-## Selection Rules for the Model
+### 已验证通过的真实链路
 
-The runtime protocol should encourage these decisions:
+这条分支已经做过真实 MiniMax 联调验证，确认以下行为成立：
 
-- if the top result is clearly stronger than the rest, choose it directly
-- if the top results are close, compare the top 2-3 briefly
-- if all results are weak, skip skill loading and proceed normally
-- do not load multiple skill manuals unless the task genuinely requires it
+#### skill / MCP deferred tool automatic expansion
 
-This prevents pointless prompt expansion after retrieval.
+```text
+llm -> tool_search -> host automatic expansion -> llm tool_use
+```
 
-## Implementation Plan
+#### prompt-only skill guidance flow
 
-### Phase 1: Minimal Working Flow
+```text
+llm -> tool_search -> tool_get_instructions
+```
 
-1. Replace the full skill catalog in the system prompt with a short skills protocol
-2. Add `skill_search` as a built-in tool
-3. Implement lexical search in the skill registry
-4. Keep `skill_get_instructions` unchanged
+#### budget / metering side effect
 
-### Phase 2: Better Matching
+真实 LLM 调用后，`/api/budget` 与 `/api/budget/agents/{id}` 已确认会更新。
 
-1. Add alias and synonym tables
-2. Improve field weighting
-3. Add telemetry for search queries and selected skills
+### 当前 deferred expansion 的作用域
 
-### Phase 3: Optional Semantic Rerank
+当前 expanded tool surface 是：
 
-If the skill count grows enough to justify it:
+- loop-scoped
 
-1. Use lexical retrieval to get top 10-15 candidates
-2. Add embedding-based reranking over that shortlist
-3. Keep lexical retrieval as the stable fallback
+不是：
 
-This avoids committing to a vector-only design too early.
+- session-scoped
 
-## Code Touch Points
+这意味着：
 
-### Prompt Layer
+- 同一条顶层消息里，discovery 后展开的 tool 可以继续直接调用
+- 新的一条顶层消息开始时，会重新从初始 visible tool set 开始
 
-- [prompt_builder.rs](/Users/huangjiahao/workspace/openfang-0.1.0/feature-cyber-soul/crates/openfang-runtime/src/prompt_builder.rs)
+## 与 Anthropic 设计的关系
 
-Changes:
+### 当前已经吸收的部分
 
-- remove full skill enumeration from the default system prompt
-- replace it with a short skills usage protocol
+这条分支已经采纳了 Anthropic `tool_search` 设计里的几个核心思想：
 
-### Tool Layer
+1. 用统一 discovery tool，而不是 skill-only discovery
+2. 用 `defer_loading` 控制默认可见性
+3. 把 discovery 后的 tool 自动展开，而不是要求模型手写复杂 load 流程
+4. 把 prompt 从“静态大目录”改成“即时工具面 + 能力地图 + discovery protocol”
 
-- [tool_runner.rs](/Users/huangjiahao/workspace/openfang-0.1.0/feature-cyber-soul/crates/openfang-runtime/src/tool_runner.rs)
+### 当前没有照搬的部分
 
-Changes:
+有些 Anthropic 设计点在这条分支还没有照搬：
 
-- register `skill_search`
-- validate input
-- call registry search
-- return compact structured results
+1. 外部协议层的薄 `tool_reference`
+2. MCP 的 `default_config.defer_loading` / per-tool override 配置
+3. 全部 deferred resource 的统一外部 schema
 
-### Registry Layer
+这里必须明确：
 
-- [registry.rs](/Users/huangjiahao/workspace/openfang-0.1.0/feature-cyber-soul/crates/openfang-skills/src/registry.rs)
+- 这条分支是“向 Anthropic 收敛”
+- 不是“已经完整等价于 Anthropic”
 
-Changes:
+## 当前未完成项
 
-- add `search(query, top_k)` on `SkillRegistry`
-- define result structs and scoring helpers
+下面这些在当前分支里还没有实现：
 
-### Optional API Layer
+### 1. MCP 的配置化 deferred policy
 
-- [routes.rs](/Users/huangjiahao/workspace/openfang-0.1.0/feature-cyber-soul/crates/openfang-api/src/routes.rs)
+还没有：
 
-Optional future change:
+- `config.toml` 里的 server 级 `defer_loading`
+- `config.toml` 里的 MCP tool 级覆盖
 
-- add `POST /api/skills/search` for dashboard and TUI reuse
+### 2. 更薄的外部 `tool_reference` 协议
 
-## Why Not Use Vector Search in V1
+当前 runtime 已经有 automatic expansion，但对外协议仍是 OpenFang 当前实现，不是完整的 Anthropic-style 薄 reference。
 
-OpenFang already has embedding-backed retrieval for memory, but not for skills.
+### 3. builtin 的精细化 deferred rollout
 
-Using vector search for skills in v1 would add:
+当前 builtin 默认仍全部 visible，没有进入这一轮 deferred 策略。
 
-- embedding generation lifecycle for bundled and installed skills
-- index refresh logic
-- provider dependency and fallback complexity
-- less interpretable ranking
+## 当前代码对应关系
 
-The skill corpus is still small enough that lexical retrieval with alias expansion should be sufficient for a first production version.
+### skill defer_loading 解析与归一化
 
-The correct upgrade path is:
+- [lib.rs](/Users/jiahaohuang/workspace_ai/openfang-0.1.0/refactor-tool-progressive-design/crates/openfang-skills/src/lib.rs)
+- [openclaw_compat.rs](/Users/jiahaohuang/workspace_ai/openfang-0.1.0/refactor-tool-progressive-design/crates/openfang-skills/src/openclaw_compat.rs)
+- [registry.rs](/Users/jiahaohuang/workspace_ai/openfang-0.1.0/refactor-tool-progressive-design/crates/openfang-skills/src/registry.rs)
 
-- lexical retrieval first
-- semantic rerank later if needed
+### kernel 侧 tool surface 与 skills section 过滤
 
-not:
+- [kernel.rs](/Users/jiahaohuang/workspace_ai/openfang-0.1.0/refactor-tool-progressive-design/crates/openfang-kernel/src/kernel.rs)
 
-- vector search first
+### prompt 结构与文案
 
-## Risks
+- [prompt_builder.rs](/Users/jiahaohuang/workspace_ai/openfang-0.1.0/refactor-tool-progressive-design/crates/openfang-runtime/src/prompt_builder.rs)
 
-### Risk: Weak Alias Coverage
+### runtime tool execution 与 automatic expansion
 
-The first version may miss good skills if the alias table is too small.
+- [tool_runner.rs](/Users/jiahaohuang/workspace_ai/openfang-0.1.0/refactor-tool-progressive-design/crates/openfang-runtime/src/tool_runner.rs)
+- [agent_loop.rs](/Users/jiahaohuang/workspace_ai/openfang-0.1.0/refactor-tool-progressive-design/crates/openfang-runtime/src/agent_loop.rs)
 
-Mitigation:
+## 本分支最终决策摘要
 
-- start with a focused alias table for the highest-traffic domains
-- log weak-result queries for iteration
+为了避免后续继续混淆，这里把已经确认的结论压成最终版：
 
-### Risk: Over-Retrieval
+1. `tool_search` 是唯一 discovery 入口。
+2. `tool_get_instructions` 保留，用于按需加载 guidance/manual。
+3. skill 的 `defer_loading` 由 skill 顶层声明，系统默认值是 `false`。
+4. 不做 agent 级 skill defer override。
+5. bundled skills 统一显式 `defer_loading: true`。
+6. MCP deferred 配置方向已确认，但本分支还没实现。
+7. prompt 只做三件事：
+   - 告诉模型当前哪些 tools 可直接调用
+   - 告诉模型当前有哪些能力域存在
+   - 告诉模型当能力没直接可见时如何 discovery
 
-Broad lexical matching may return too many mediocre results.
-
-Mitigation:
-
-- keep `top_k` small
-- rank by multiple fields
-- surface `match_reason`
-- let the model skip skills when results are weak
-
-### Risk: Model Does Not Call `skill_search`
-
-Even with the tool available, the model may continue to ignore it.
-
-Mitigation:
-
-- keep a short but explicit skills protocol in the system prompt
-- use a highly literal tool name: `skill_search`
-- add tests that assert the tool is available and described
-
-## Acceptance Criteria
-
-- The system prompt no longer lists all skills by default
-- The model can discover relevant skills through `skill_search`
-- The model loads detailed instructions only for selected skills
-- Prompt token count drops materially on normal turns
-- Skill selection quality is better than direct name guessing
-- The design remains fully functional without embeddings
-
-## Summary
-
-The recommended design is:
-
-- keep a short skills protocol in the system prompt
-- add `skill_search` for natural language discovery
-- keep `skill_get_instructions` for single-skill expansion
-- use lexical retrieval first
-- add semantic reranking only if scale later justifies it
-
-This is the smallest change that materially improves prompt quality without introducing unnecessary retrieval infrastructure.
+这就是这个分支目前为止的真实方案边界。

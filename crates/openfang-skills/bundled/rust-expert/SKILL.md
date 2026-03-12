@@ -1,6 +1,7 @@
 ---
 name: rust-expert
 description: "Rust programming expert for ownership, lifetimes, async/await, traits, and unsafe code"
+defer_loading: true
 ---
 # Rust Programming Expertise
 

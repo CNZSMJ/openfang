@@ -247,4 +247,16 @@ pub trait KernelHandle: Send + Sync {
         let _ = (name, description, prompt, agent_id, scope);
         Err("Skill system not available".to_string())
     }
+
+    /// Search the skills visible to the current agent, including prompt-only skills.
+    fn search_visible_skills(
+        &self,
+        query: &str,
+        top_k: usize,
+        agent_id: Option<&str>,
+    ) -> Result<Vec<openfang_skills::SkillSearchResult>, String> {
+        let _ = (query, top_k, agent_id);
+        Err("Skill system not available".to_string())
+    }
+
 }

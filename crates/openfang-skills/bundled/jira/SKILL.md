@@ -1,6 +1,7 @@
 ---
 name: jira
 description: Jira project management expert for issues, sprints, workflows, and reporting
+defer_loading: true
 ---
 # Jira Project Management Expert
 

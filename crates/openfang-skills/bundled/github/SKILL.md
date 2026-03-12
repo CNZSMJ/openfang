@@ -1,6 +1,7 @@
 ---
 name: github
 description: GitHub operations expert for PRs, issues, code review, Actions, and gh CLI
+defer_loading: true
 ---
 # GitHub Operations Expert
 

@@ -1,6 +1,7 @@
 ---
 name: writing-coach
 description: Writing improvement specialist for grammar, style, clarity, and structure
+defer_loading: false
 ---
 # Writing Coach
 

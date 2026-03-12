@@ -4605,7 +4605,7 @@ pub async fn network_status(State(state): State<Arc<AppState>>) -> impl IntoResp
 // Tools endpoint
 // ---------------------------------------------------------------------------
 
-/// GET /api/tools — List all tool definitions (built-in + MCP).
+/// GET /api/tools — List all tool definitions (built-in + skills + MCP).
 pub async fn list_tools(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let mut tools: Vec<serde_json::Value> = builtin_tool_definitions()
         .iter()
@@ -4614,9 +4614,33 @@ pub async fn list_tools(State(state): State<Arc<AppState>>) -> impl IntoResponse
                 "name": t.name,
                 "description": t.description,
                 "input_schema": t.input_schema,
+                "source": "builtin",
             })
         })
         .collect();
+
+    if let Ok(registry) = state.kernel.skill_registry.read() {
+        for skill in registry.list() {
+            if !skill.enabled {
+                continue;
+            }
+            for tool in skill
+                .manifest
+                .tools
+                .provided
+                .iter()
+                .filter(|tool| tool.policy.model_invocable())
+            {
+                tools.push(serde_json::json!({
+                    "name": tool.name,
+                    "description": tool.description,
+                    "input_schema": tool.input_schema,
+                    "source": "skill",
+                    "skill": skill.manifest.skill.name,
+                }));
+            }
+        }
+    }
 
     // Include MCP tools so they're visible in Settings -> Tools
     if let Ok(mcp_tools) = state.kernel.mcp_tools.lock() {
@@ -6093,7 +6117,9 @@ pub async fn mcp_http(
     State(state): State<Arc<AppState>>,
     Json(request): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    // Gather all available tools (builtin + skills + MCP)
+    // Gather externally executable tools (builtin + skills + MCP).
+    // Internal discovery helpers stay inside the agent loop and should not be
+    // exposed over stateless MCP transports.
     let mut tools = builtin_tool_definitions();
     {
         let registry = state
@@ -6106,12 +6132,19 @@ pub async fn mcp_http(
                 name: skill_tool.name.clone(),
                 description: skill_tool.description.clone(),
                 input_schema: skill_tool.input_schema.clone(),
+                defer_loading: true,
             });
         }
     }
     if let Ok(mcp_tools) = state.kernel.mcp_tools.lock() {
         tools.extend(mcp_tools.iter().cloned());
     }
+    tools.retain(|tool| {
+        !matches!(
+            tool.name.as_str(),
+            "tool_search" | "tool_get_instructions"
+        )
+    });
 
     // Check if this is a tools/call that needs real execution
     let method = request["method"].as_str().unwrap_or("");
@@ -7129,6 +7162,7 @@ pub async fn create_skill(
             author: String::new(),
             license: String::new(),
             tags: vec!["prompt-only".to_string()],
+            defer_loading: false,
         },
         runtime: SkillRuntimeConfig {
             runtime_type: SkillRuntime::PromptOnly,

@@ -1,6 +1,7 @@
 ---
 name: ci-cd
 description: "CI/CD pipeline expert for GitHub Actions, GitLab CI, Jenkins, and deployment automation"
+defer_loading: true
 ---
 # CI/CD Pipeline Engineering
 

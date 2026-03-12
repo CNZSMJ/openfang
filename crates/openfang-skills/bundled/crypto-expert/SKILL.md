@@ -1,6 +1,7 @@
 ---
 name: crypto-expert
 description: "Cryptography expert for TLS, symmetric/asymmetric encryption, hashing, and key management"
+defer_loading: true
 ---
 # Applied Cryptography Expertise
 

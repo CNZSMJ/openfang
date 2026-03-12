@@ -1,6 +1,7 @@
 ---
 name: web-search
 description: Web search and research specialist for finding and synthesizing information
+defer_loading: false
 ---
 # Web Search and Research Specialist
 

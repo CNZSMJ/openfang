@@ -1,6 +1,7 @@
 ---
 name: react-expert
 description: "React expert for hooks, state management, Server Components, and performance optimization"
+defer_loading: true
 ---
 # React Development Expertise
 

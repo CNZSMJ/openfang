@@ -1,6 +1,7 @@
 ---
 name: nextjs-expert
 description: "Next.js expert for App Router, SSR/SSG, API routes, middleware, and deployment"
+defer_loading: true
 ---
 # Next.js Expert
 

@@ -28,6 +28,9 @@ pub struct SkillMdFrontmatter {
     pub name: String,
     /// Short description.
     pub description: String,
+    /// Whether the skill should be deferred by default.
+    #[serde(default, rename = "defer_loading", alias = "deferLoading")]
+    pub defer_loading: bool,
     /// Nested metadata block.
     pub metadata: SkillMdMetadata,
 }
@@ -251,6 +254,7 @@ pub fn convert_skillmd(dir: &Path) -> Result<ConvertedSkillMd, SkillError> {
                     }
                 }),
                 policy: command_policy(cmd, &required_bins),
+                defer_loading: false,
             });
         }
     }
@@ -272,6 +276,7 @@ pub fn convert_skillmd(dir: &Path) -> Result<ConvertedSkillMd, SkillError> {
             author: String::new(),
             license: String::new(),
             tags: vec!["openclaw-compat".to_string(), "prompt-only".to_string()],
+            defer_loading: frontmatter.defer_loading,
         },
         runtime: SkillRuntimeConfig {
             runtime_type,
@@ -351,6 +356,7 @@ pub fn convert_skillmd_str(name_hint: &str, content: &str) -> Result<ConvertedSk
                     }
                 }),
                 policy: command_policy(cmd, &required_bins),
+                defer_loading: false,
             });
         }
     }
@@ -365,6 +371,7 @@ pub fn convert_skillmd_str(name_hint: &str, content: &str) -> Result<ConvertedSk
             author: "OpenFang".to_string(),
             license: "Apache-2.0".to_string(),
             tags: vec!["bundled".to_string(), "prompt-only".to_string()],
+            defer_loading: frontmatter.defer_loading,
         },
         runtime: SkillRuntimeConfig {
             runtime_type,
@@ -452,6 +459,7 @@ pub fn convert_openclaw_skill(dir: &Path) -> Result<SkillManifest, SkillError> {
                 host_tools: vec!["shell_exec".to_string()],
                 host_capabilities: Vec::new(),
             },
+            defer_loading: false,
         }]
     };
 
@@ -465,6 +473,7 @@ pub fn convert_openclaw_skill(dir: &Path) -> Result<SkillManifest, SkillError> {
             author,
             license: pkg["license"].as_str().unwrap_or("MIT").to_string(),
             tags: vec!["openclaw-compat".to_string()],
+            defer_loading: false,
         },
         runtime: SkillRuntimeConfig {
             runtime_type: SkillRuntime::Node,
@@ -502,6 +511,7 @@ fn extract_tools_from_openclaw_meta(meta: &serde_json::Value) -> Vec<SkillToolDe
                     host_tools: vec!["shell_exec".to_string()],
                     host_capabilities: Vec::new(),
                 },
+                defer_loading: false,
             });
         }
     }
@@ -652,6 +662,7 @@ mod tests {
         let content = r#"---
 name: GitHub Helper
 description: Helps with GitHub operations
+defer_loading: true
 metadata:
   openclaw:
     emoji: "🐙"
@@ -669,6 +680,7 @@ Use the gh CLI to manage PRs and issues."#;
 
         assert_eq!(fm.name, "GitHub Helper");
         assert_eq!(fm.description, "Helps with GitHub operations");
+        assert!(fm.defer_loading);
         assert!(fm.metadata.openclaw.is_some());
         let meta = fm.metadata.openclaw.unwrap();
         assert_eq!(meta.emoji.as_deref(), Some("🐙"));
@@ -688,6 +700,7 @@ Use the gh CLI to manage PRs and issues."#;
         let (fm, body) = parse_skillmd(&dir.path().join("SKILL.md")).unwrap();
         assert_eq!(fm.name, "Plain Skill");
         assert_eq!(fm.description, "Use this skill without YAML frontmatter.");
+        assert!(!fm.defer_loading);
         assert!(body.contains("without YAML frontmatter"));
     }
 
@@ -708,6 +721,7 @@ Use the gh CLI to manage PRs and issues."#;
         let content = r#"---
 name: Writing Coach
 description: Helps improve writing style
+defer_loading: true
 ---
 # Writing Coach
 
@@ -720,6 +734,7 @@ You are an expert writing coach. When reviewing text:
         let converted = convert_skillmd(dir.path()).unwrap();
 
         assert_eq!(converted.manifest.skill.name, "Writing Coach");
+        assert!(converted.manifest.skill.defer_loading);
         assert_eq!(
             converted.manifest.runtime.runtime_type,
             SkillRuntime::PromptOnly

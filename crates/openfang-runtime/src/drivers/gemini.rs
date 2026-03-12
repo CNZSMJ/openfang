@@ -844,6 +844,7 @@ mod tests {
                         "query": {"type": "string"}
                     }
                 }),
+                defer_loading: false,
             }],
             max_tokens: 1024,
             temperature: 0.7,

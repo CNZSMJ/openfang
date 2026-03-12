@@ -1,6 +1,7 @@
 ---
 name: terraform
 description: Terraform IaC expert for providers, modules, state management, and planning
+defer_loading: true
 ---
 # Terraform IaC Expert
 

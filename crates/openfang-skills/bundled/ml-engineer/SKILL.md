@@ -1,6 +1,7 @@
 ---
 name: ml-engineer
 description: "Machine learning engineer expert for PyTorch, scikit-learn, model evaluation, and MLOps"
+defer_loading: true
 ---
 # Machine Learning Engineer
 

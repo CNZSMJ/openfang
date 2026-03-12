@@ -1,6 +1,7 @@
 ---
 name: postgres-expert
 description: "PostgreSQL expert for query optimization, indexing, extensions, and database administration"
+defer_loading: true
 ---
 # PostgreSQL Database Expertise
 

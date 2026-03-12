@@ -1,6 +1,7 @@
 ---
 name: oauth-expert
 description: "OAuth 2.0 and OpenID Connect expert for authorization flows, PKCE, and token management"
+defer_loading: true
 ---
 # OAuth and OpenID Connect Expert
 

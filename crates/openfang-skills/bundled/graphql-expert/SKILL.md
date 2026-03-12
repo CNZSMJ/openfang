@@ -1,6 +1,7 @@
 ---
 name: graphql-expert
 description: "GraphQL expert for schema design, resolvers, subscriptions, and performance optimization"
+defer_loading: true
 ---
 # GraphQL Expert
 

@@ -1,6 +1,7 @@
 ---
 name: notion
 description: Notion workspace management and content creation specialist
+defer_loading: false
 ---
 # Notion Workspace Management and Content Creation
 

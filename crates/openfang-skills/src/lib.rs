@@ -89,6 +89,9 @@ pub struct SkillToolDef {
     pub input_schema: serde_json::Value,
     /// Invocation and host-integration policy for the command.
     pub policy: SkillCommandPolicy,
+    /// Resolved deferred-loading policy inherited from the owning skill.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub defer_loading: bool,
 }
 
 impl Default for SkillToolDef {
@@ -98,6 +101,7 @@ impl Default for SkillToolDef {
             description: String::new(),
             input_schema: serde_json::json!({"type": "object"}),
             policy: SkillCommandPolicy::default(),
+            defer_loading: false,
         }
     }
 }
@@ -154,10 +158,17 @@ pub struct SkillMeta {
     /// Tags for discovery.
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Whether this skill should be hidden by default and discovered via tool_search.
+    #[serde(default)]
+    pub defer_loading: bool,
 }
 
 fn default_version() -> String {
     "0.1.0".to_string()
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Runtime configuration section.
@@ -190,6 +201,25 @@ pub struct InstalledSkill {
     pub enabled: bool,
 }
 
+/// Ranked local-skill discovery result for runtime search.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SkillSearchResult {
+    /// Unique skill name.
+    pub name: String,
+    /// Human-readable description.
+    pub description: String,
+    /// Declared tags for lightweight reasoning.
+    pub tags: Vec<String>,
+    /// Number of callable tools exposed by this skill.
+    pub tools_count: usize,
+    /// Whether the skill has a prompt manual that can be expanded.
+    pub has_prompt_context: bool,
+    /// Lexical relevance score used for ranking.
+    pub score: f32,
+    /// Short explanation of why the skill matched.
+    pub match_reason: Vec<String>,
+}
+
 /// Result of executing a skill tool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillToolResult {
@@ -213,6 +243,7 @@ description = "Summarizes any web page into bullet points"
 author = "openfang-community"
 license = "MIT"
 tags = ["web", "summarizer", "research"]
+defer_loading = true
 
 [runtime]
 type = "python"
@@ -230,6 +261,7 @@ capabilities = ["NetConnect(*)"]
 
         let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
         assert_eq!(manifest.skill.name, "web-summarizer");
+        assert!(manifest.skill.defer_loading);
         assert_eq!(manifest.runtime.runtime_type, SkillRuntime::Python);
         assert_eq!(manifest.tools.provided.len(), 1);
         assert_eq!(manifest.tools.provided[0].name, "summarize_url");

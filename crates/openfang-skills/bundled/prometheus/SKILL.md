@@ -1,6 +1,7 @@
 ---
 name: prometheus
 description: "Prometheus monitoring expert for PromQL, alerting rules, Grafana dashboards, and observability"
+defer_loading: true
 ---
 # Prometheus Monitoring and Observability
 

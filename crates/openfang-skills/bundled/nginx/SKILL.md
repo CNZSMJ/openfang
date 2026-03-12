@@ -1,6 +1,7 @@
 ---
 name: nginx
 description: "Nginx configuration expert for reverse proxy, load balancing, TLS, and performance tuning"
+defer_loading: true
 ---
 # Nginx Configuration and Performance
 

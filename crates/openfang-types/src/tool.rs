@@ -11,6 +11,10 @@ pub struct ToolDefinition {
     pub description: String,
     /// JSON Schema for the tool's input parameters.
     pub input_schema: serde_json::Value,
+    /// Whether this tool should start hidden from the model and only become
+    /// visible after a discovery/expansion step.
+    #[serde(default)]
+    pub defer_loading: bool,
 }
 
 /// A tool call requested by the LLM.
@@ -169,6 +173,7 @@ mod tests {
                 },
                 "required": ["query"]
             }),
+            defer_loading: false,
         };
         let json = serde_json::to_string(&tool).unwrap();
         assert!(json.contains("web_search"));

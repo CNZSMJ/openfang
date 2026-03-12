@@ -1,6 +1,7 @@
 ---
 name: linear-tools
 description: "Linear project management expert for issues, cycles, projects, and workflow automation"
+defer_loading: true
 ---
 # Linear Project Management Expertise
 

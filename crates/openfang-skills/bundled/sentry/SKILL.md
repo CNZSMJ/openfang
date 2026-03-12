@@ -1,6 +1,7 @@
 ---
 name: sentry
 description: Sentry error tracking and debugging specialist
+defer_loading: true
 ---
 # Sentry Error Tracking and Debugging
 

@@ -1,6 +1,7 @@
 ---
 name: mongodb
 description: MongoDB operations expert for queries, aggregation pipelines, indexes, and schema design
+defer_loading: true
 ---
 # MongoDB Operations Expert
 
