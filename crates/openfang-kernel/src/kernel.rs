@@ -1934,6 +1934,10 @@ impl OpenFangKernel {
                     .workspace
                     .as_ref()
                     .and_then(|w| read_identity_file(w, "USER.md")),
+                memory_md: manifest
+                    .workspace
+                    .as_ref()
+                    .and_then(|w| read_identity_file(w, "MEMORY.md")),
                 canonical_context: self
                     .memory
                     .canonical_context(agent_id, None)
@@ -2419,6 +2423,10 @@ impl OpenFangKernel {
                     .workspace
                     .as_ref()
                     .and_then(|w| read_identity_file(w, "USER.md")),
+                memory_md: manifest
+                    .workspace
+                    .as_ref()
+                    .and_then(|w| read_identity_file(w, "MEMORY.md")),
                 canonical_context: self
                     .memory
                     .canonical_context(agent_id, None)
@@ -5279,6 +5287,30 @@ impl KernelHandle for OpenFangKernel {
         self.memory
             .structured_get(agent_id, key)
             .map_err(|e| format!("Memory recall failed: {e}"))
+    }
+
+    fn memory_list(
+        &self,
+        prefix: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Vec<(String, serde_json::Value)>, String> {
+        let agent_id = shared_memory_agent_id();
+        let mut entries = self
+            .memory
+            .list_kv(agent_id)
+            .map_err(|e| format!("Memory list failed: {e}"))?;
+
+        if let Some(prefix) = prefix {
+            entries.retain(|(key, _)| key.starts_with(prefix));
+        }
+
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        if let Some(limit) = limit {
+            entries.truncate(limit);
+        }
+
+        Ok(entries)
     }
 
     fn find_agents(&self, query: &str) -> Vec<kernel_handle::AgentInfo> {

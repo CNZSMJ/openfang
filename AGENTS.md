@@ -126,3 +126,9 @@ pkill -f 'target/debug/openfang start'
 - `AgentLoopResult` field is `.response` not `.response_text`
 - CLI command to start daemon is `start` not `daemon`
 - On macOS, prefer `pkill -f 'target/debug/openfang start'` or `kill <pid>` after checking `ps -ax | grep '[o]penfang'`
+
+## Memory Program Workflow
+- All ongoing memory-program management docs must live under `docs/memory/`.
+- The single resume entrypoint is `docs/memory/execution_state.md`.
+- When the user says `阅读 docs/memory/execution_state.md，继续工作`, read that file first, then read every design doc listed inside it, then continue the active phase.
+- Do not rename, move, replace, or restructure `docs/memory/execution_state.md` or `docs/memory/README.md` unless the user explicitly asks for it.
