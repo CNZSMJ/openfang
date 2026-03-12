@@ -241,7 +241,7 @@ impl SetupWizard {
         }
         if has("memory_store") {
             hints.push(
-                "- Use memory_store/memory_recall for exact memory access, and memory_list when you need to discover keys first.",
+                "- Use memory_store/memory_recall for exact memory access, and memory_list when you need to discover keys first. Prefer namespaced memory keys like `project.alpha.decision`, and add `kind`/`tags`/`freshness` when storing durable memory.",
             );
         }
 

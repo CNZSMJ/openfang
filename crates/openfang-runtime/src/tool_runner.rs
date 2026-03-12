@@ -7,6 +7,12 @@ use crate::kernel_handle::KernelHandle;
 use crate::mcp;
 use crate::web_search::{parse_ddg_results, WebToolsContext};
 use openfang_skills::registry::SkillRegistry;
+use openfang_types::memory::{
+    build_memory_record_metadata, canonicalize_memory_namespace, canonicalize_user_memory_key,
+    collect_memory_metadata, is_internal_memory_key, is_memory_metadata_key,
+    memory_key_matches_prefix, memory_key_namespace, memory_lookup_candidates,
+    memory_metadata_key, MemoryConflictPolicy, MemoryFreshness,
+};
 use openfang_types::taint::{TaintLabel, TaintSink, TaintedValue};
 use openfang_types::tool::{ToolDefinition, ToolResult};
 use serde::Serialize;
@@ -1122,11 +1128,16 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         // --- Shared memory tools ---
         tool_definition! {
             name: "memory_store".to_string(),
-            description: "Store a value in shared memory accessible by all agents. Use for cross-agent coordination and data sharing.".to_string(),
+            description: "Store a value in shared memory accessible by all agents. Prefer namespaced keys such as `project.alpha.decision` or `pref.editor.theme` for durable memory.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "key": { "type": "string", "description": "The storage key" },
+                    "key": { "type": "string", "description": "The storage key. Bare keys are normalized into the `general.` namespace." },
+                    "namespace": { "type": "string", "description": "Optional namespace for a bare key. For example `project` with key `alpha.status` becomes `project.alpha.status`." },
+                    "kind": { "type": "string", "description": "Optional governance kind such as `fact`, `preference`, `decision`, or `project_state`." },
+                    "tags": { "type": "array", "items": { "type": "string" }, "description": "Optional governance tags, normalized to lowercase and deduplicated." },
+                    "freshness": { "type": "string", "enum": ["rolling", "durable", "archival"], "description": "Optional freshness class for lifecycle management." },
+                    "conflict_policy": { "type": "string", "enum": ["overwrite", "skip_if_exists"], "description": "How to behave when the key already exists. Default: `overwrite`." },
                     "value": { "type": "string", "description": "The value to store (JSON-encode objects/arrays, or pass a plain string)" }
                 },
                 "required": ["key", "value"]
@@ -1134,24 +1145,27 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         },
         tool_definition! {
             name: "memory_recall".to_string(),
-            description: "Recall a value from shared memory by key.".to_string(),
+            description: "Recall a value from shared memory by key. Bare keys automatically fall back to the `general.` namespace.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "key": { "type": "string", "description": "The storage key to recall" }
+                    "key": { "type": "string", "description": "The storage key to recall" },
+                    "namespace": { "type": "string", "description": "Optional namespace when recalling a bare key." }
                 },
                 "required": ["key"]
             }),
         },
         tool_definition! {
             name: "memory_list".to_string(),
-            description: "List shared memory entries, optionally filtered by key prefix. Use when you need to discover available memory keys before recalling a specific one.".to_string(),
+            description: "List shared memory entries, optionally filtered by namespace or key prefix. Use when you need to discover available memory keys before recalling a specific one.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
+                    "namespace": { "type": "string", "description": "Optional namespace to restrict results, for example `project` or `pref`." },
                     "prefix": { "type": "string", "description": "Optional key prefix to filter by (for example `project.alpha.` or `pref.`)" },
                     "limit": { "type": "integer", "description": "Maximum number of entries to return (default 20, max 100)" },
-                    "include_values": { "type": "boolean", "description": "Whether to include stored values in the result (default true)" }
+                    "include_values": { "type": "boolean", "description": "Whether to include stored values in the result (default true)" },
+                    "include_internal": { "type": "boolean", "description": "Whether to include internal OpenFang keys such as session summaries and scheduler state (default false)." }
                 }
             }),
         },
@@ -2180,15 +2194,123 @@ fn tool_agent_kill(
 // Shared memory tools
 // ---------------------------------------------------------------------------
 
+fn resolve_memory_store_key(input: &serde_json::Value) -> Result<(String, String), String> {
+    let raw_key = input["key"].as_str().ok_or("Missing 'key' parameter")?;
+    let raw_key = raw_key.trim().to_string();
+
+    if is_internal_memory_key(&raw_key) {
+        return Err(
+            "Reserved internal memory keys cannot be written via memory_store.".to_string(),
+        );
+    }
+
+    if let Some(namespace) = input.get("namespace").and_then(|v| v.as_str()) {
+        if raw_key.contains('.') {
+            return Err(
+                "Provide either a fully namespaced key or 'namespace' + bare key, not both."
+                    .to_string(),
+            );
+        }
+
+        let namespace = canonicalize_memory_namespace(namespace)?;
+        let canonical = canonicalize_user_memory_key(&format!("{namespace}.{raw_key}"))?;
+        return Ok((raw_key, canonical));
+    }
+
+    let canonical = canonicalize_user_memory_key(&raw_key)?;
+    Ok((raw_key, canonical))
+}
+
+fn resolve_memory_lookup_keys(input: &serde_json::Value) -> Result<(String, Vec<String>), String> {
+    let raw_key = input["key"].as_str().ok_or("Missing 'key' parameter")?;
+    let raw_key = raw_key.trim().to_string();
+
+    if let Some(namespace) = input.get("namespace").and_then(|v| v.as_str()) {
+        if is_internal_memory_key(&raw_key) {
+            return Err("Internal memory keys cannot be combined with 'namespace'.".to_string());
+        }
+        if raw_key.contains('.') {
+            return Err(
+                "Provide either a fully namespaced key or 'namespace' + bare key, not both."
+                    .to_string(),
+            );
+        }
+
+        let namespace = canonicalize_memory_namespace(namespace)?;
+        return Ok((
+            raw_key.clone(),
+            vec![canonicalize_user_memory_key(&format!("{namespace}.{raw_key}"))?],
+        ));
+    }
+
+    Ok((raw_key.clone(), memory_lookup_candidates(&raw_key)?))
+}
+
+fn memory_entry_exists(kh: &Arc<dyn KernelHandle>, key: &str) -> Result<bool, String> {
+    for candidate in memory_lookup_candidates(key)? {
+        if kh.memory_recall(&candidate)?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn tool_memory_store(
     input: &serde_json::Value,
     kernel: Option<&Arc<dyn KernelHandle>>,
 ) -> Result<String, String> {
     let kh = require_kernel(kernel)?;
-    let key = input["key"].as_str().ok_or("Missing 'key' parameter")?;
+    let (requested_key, key) = resolve_memory_store_key(input)?;
     let value = input.get("value").ok_or("Missing 'value' parameter")?;
-    kh.memory_store(key, value.clone())?;
-    Ok(format!("Stored value under key '{key}'."))
+    let kind = input.get("kind").and_then(|v| v.as_str());
+    let tags: Vec<String> = input
+        .get("tags")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items.iter()
+                .filter_map(|item| item.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let freshness: Option<MemoryFreshness> = input
+        .get("freshness")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|e| format!("Invalid 'freshness' parameter: {e}"))?;
+    let conflict_policy: MemoryConflictPolicy = input
+        .get("conflict_policy")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|e| format!("Invalid 'conflict_policy' parameter: {e}"))?
+        .unwrap_or_default();
+
+    if matches!(conflict_policy, MemoryConflictPolicy::SkipIfExists)
+        && memory_entry_exists(kh, &key)?
+    {
+        return Ok(format!(
+            "Skipped storing key '{key}' because it already exists and conflict_policy is 'skip_if_exists'."
+        ));
+    }
+
+    kh.memory_store(&key, value.clone())?;
+    let metadata = build_memory_record_metadata(
+        &key,
+        kind,
+        &tags,
+        freshness,
+        "memory_store_tool",
+    )?;
+    let metadata_key = memory_metadata_key(&key)?;
+    kh.memory_store(&metadata_key, serde_json::to_value(&metadata).map_err(|e| e.to_string())?)?;
+    if key == requested_key {
+        Ok(format!("Stored value under key '{key}'."))
+    } else {
+        Ok(format!(
+            "Stored value under key '{key}' (normalized from '{requested_key}')."
+        ))
+    }
 }
 
 fn tool_memory_recall(
@@ -2196,11 +2318,20 @@ fn tool_memory_recall(
     kernel: Option<&Arc<dyn KernelHandle>>,
 ) -> Result<String, String> {
     let kh = require_kernel(kernel)?;
-    let key = input["key"].as_str().ok_or("Missing 'key' parameter")?;
-    match kh.memory_recall(key)? {
-        Some(val) => Ok(serde_json::to_string_pretty(&val).unwrap_or_else(|_| val.to_string())),
-        None => Ok(format!("No value found for key '{key}'.")),
+    let (requested_key, candidates) = resolve_memory_lookup_keys(input)?;
+    for key in candidates {
+        if let Some(val) = kh.memory_recall(&key)? {
+            let rendered =
+                serde_json::to_string_pretty(&val).unwrap_or_else(|_| val.to_string());
+            if key == requested_key {
+                return Ok(rendered);
+            }
+            return Ok(format!(
+                "Recalled key '{key}' (requested '{requested_key}').\n{rendered}"
+            ));
+        }
     }
+    Ok(format!("No value found for key '{requested_key}'."))
 }
 
 fn tool_memory_list(
@@ -2208,10 +2339,17 @@ fn tool_memory_list(
     kernel: Option<&Arc<dyn KernelHandle>>,
 ) -> Result<String, String> {
     let kh = require_kernel(kernel)?;
+    let namespace = input
+        .get("namespace")
+        .and_then(|v| v.as_str())
+        .map(canonicalize_memory_namespace)
+        .transpose()?;
     let prefix = input
         .get("prefix")
         .or_else(|| input.get("query"))
-        .and_then(|v| v.as_str());
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
     let limit = input
         .get("limit")
         .and_then(|v| v.as_u64())
@@ -2221,22 +2359,83 @@ fn tool_memory_list(
         .get("include_values")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
+    let include_internal = input
+        .get("include_internal")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
-    let entries = kh.memory_list(prefix, limit)?;
-    if entries.is_empty() {
+    let entries = kh.memory_list(None, Some(500))?;
+    let metadata_map = collect_memory_metadata(&entries);
+    let mut filtered = Vec::new();
+    for (key, value) in entries {
+        if is_memory_metadata_key(&key) {
+            continue;
+        }
+        let internal = is_internal_memory_key(&key);
+        if internal && !include_internal {
+            continue;
+        }
+        if let Some(namespace) = namespace.as_deref() {
+            if memory_key_namespace(&key).as_deref() != Some(namespace) {
+                continue;
+            }
+        }
+        if let Some(prefix) = prefix {
+            if !memory_key_matches_prefix(&key, prefix)? {
+                continue;
+            }
+        }
+        filtered.push((key, value));
+    }
+
+    filtered.sort_by(|a, b| a.0.cmp(&b.0));
+    if let Some(limit) = limit {
+        filtered.truncate(limit);
+    }
+
+    if filtered.is_empty() {
         return Ok(match prefix {
             Some(prefix) => format!("No memory entries found with prefix '{prefix}'."),
-            None => "No memory entries found.".to_string(),
+            None => match namespace {
+                Some(namespace) => {
+                    format!("No memory entries found in namespace '{namespace}'.")
+                }
+                None => "No memory entries found.".to_string(),
+            },
         });
     }
 
-    let rows: Vec<serde_json::Value> = entries
+    let rows: Vec<serde_json::Value> = filtered
         .into_iter()
         .map(|(key, value)| {
+            let namespace = memory_key_namespace(&key);
+            let internal = is_internal_memory_key(&key);
+            let metadata = metadata_map.get(&key);
             if include_values {
-                serde_json::json!({ "key": key, "value": value })
+                serde_json::json!({
+                    "key": key,
+                    "namespace": namespace,
+                    "internal": internal,
+                    "governed": metadata.is_some(),
+                    "kind": metadata.as_ref().map(|m| m.kind.clone()),
+                    "tags": metadata.as_ref().map(|m| m.tags.clone()).unwrap_or_default(),
+                    "freshness": metadata.as_ref().map(|m| m.freshness.clone()),
+                    "source": metadata.as_ref().map(|m| m.source.clone()),
+                    "updated_at": metadata.as_ref().map(|m| m.updated_at.to_rfc3339()),
+                    "value": value
+                })
             } else {
-                serde_json::json!({ "key": key })
+                serde_json::json!({
+                    "key": key,
+                    "namespace": namespace,
+                    "internal": internal,
+                    "governed": metadata.is_some(),
+                    "kind": metadata.as_ref().map(|m| m.kind.clone()),
+                    "tags": metadata.as_ref().map(|m| m.tags.clone()).unwrap_or_default(),
+                    "freshness": metadata.as_ref().map(|m| m.freshness.clone()),
+                    "source": metadata.as_ref().map(|m| m.source.clone()),
+                    "updated_at": metadata.as_ref().map(|m| m.updated_at.to_rfc3339())
+                })
             }
         })
         .collect();

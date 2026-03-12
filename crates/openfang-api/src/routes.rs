@@ -2784,18 +2784,92 @@ pub async fn get_template(Path(name): Path<String>) -> impl IntoResponse {
 ///
 /// Note: memory_store tool writes to a shared namespace, so we read from that
 /// same namespace regardless of which agent ID is in the URL.
+#[derive(Default, serde::Deserialize)]
+pub struct MemoryListQuery {
+    pub namespace: Option<String>,
+    pub prefix: Option<String>,
+    pub limit: Option<usize>,
+    pub include_internal: Option<bool>,
+}
+
 pub async fn get_agent_kv(
     State(state): State<Arc<AppState>>,
+    Query(query): Query<MemoryListQuery>,
     Path(_id): Path<String>,
 ) -> impl IntoResponse {
     let agent_id = openfang_kernel::kernel::shared_memory_agent_id();
+    let include_internal = query.include_internal.unwrap_or(false);
+    let namespace = match query
+        .namespace
+        .as_deref()
+        .map(openfang_types::memory::canonicalize_memory_namespace)
+        .transpose()
+    {
+        Ok(namespace) => namespace,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": error })),
+            );
+        }
+    };
+    let prefix = query.prefix.as_deref().map(str::trim).filter(|v| !v.is_empty());
+    if let Some(prefix) = prefix {
+        if let Err(error) =
+            openfang_types::memory::memory_key_matches_prefix("general.validation", prefix)
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": error })),
+            );
+        }
+    }
+    let limit = query.limit.map(|v| v.min(100)).unwrap_or(100);
 
     match state.kernel.memory.list_kv(agent_id) {
         Ok(pairs) => {
-            let kv: Vec<serde_json::Value> = pairs
+            let metadata_map = openfang_types::memory::collect_memory_metadata(&pairs);
+            let mut kv: Vec<serde_json::Value> = pairs
                 .into_iter()
-                .map(|(k, v)| serde_json::json!({"key": k, "value": v}))
+                .filter(|(k, _)| !openfang_types::memory::is_memory_metadata_key(k))
+                .filter(|(k, _)| {
+                    include_internal || !openfang_types::memory::is_internal_memory_key(k)
+                })
+                .filter(|(k, _)| {
+                    namespace
+                        .as_deref()
+                        .map(|namespace| {
+                            openfang_types::memory::memory_key_namespace(k).as_deref()
+                                == Some(namespace)
+                        })
+                        .unwrap_or(true)
+                })
+                .filter(|(k, _)| {
+                    prefix
+                        .map(|prefix| {
+                            openfang_types::memory::memory_key_matches_prefix(k, prefix)
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(true)
+                })
+                .map(|(k, v)| {
+                    let metadata = metadata_map.get(&k);
+                    serde_json::json!({
+                        "key": k,
+                        "namespace": openfang_types::memory::memory_key_namespace(&k),
+                        "internal": openfang_types::memory::is_internal_memory_key(&k),
+                        "governed": metadata.is_some(),
+                        "kind": metadata.as_ref().map(|m| m.kind.clone()),
+                        "tags": metadata.as_ref().map(|m| m.tags.clone()).unwrap_or_default(),
+                        "freshness": metadata.as_ref().map(|m| m.freshness.clone()),
+                        "source": metadata.as_ref().map(|m| m.source.clone()),
+                        "updated_at": metadata.as_ref().map(|m| m.updated_at.to_rfc3339()),
+                        "value": v
+                    })
+                })
                 .collect();
+            kv.sort_by(|a, b| a["key"].as_str().cmp(&b["key"].as_str()));
+            kv.truncate(limit);
             (StatusCode::OK, Json(serde_json::json!({"kv_pairs": kv})))
         }
         Err(e) => {
@@ -2814,24 +2888,59 @@ pub async fn get_agent_kv_key(
     Path((_id, key)): Path<(String, String)>,
 ) -> impl IntoResponse {
     let agent_id = openfang_kernel::kernel::shared_memory_agent_id();
+    let lookup_keys = match openfang_types::memory::memory_lookup_candidates(&key) {
+        Ok(keys) => keys,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": error })),
+            );
+        }
+    };
 
-    match state.kernel.memory.structured_get(agent_id, &key) {
-        Ok(Some(val)) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"key": key, "value": val})),
-        ),
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "Key not found"})),
-        ),
-        Err(e) => {
-            tracing::warn!("Memory get failed for key '{key}': {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "Memory operation failed"})),
-            )
+    for candidate in lookup_keys {
+        match state.kernel.memory.structured_get(agent_id, &candidate) {
+            Ok(Some(val)) => {
+                let metadata = openfang_types::memory::memory_metadata_key(&candidate)
+                    .ok()
+                    .and_then(|meta_key| state.kernel.memory.structured_get(agent_id, &meta_key).ok())
+                    .flatten()
+                    .and_then(|value| {
+                        serde_json::from_value::<openfang_types::memory::MemoryRecordMetadata>(value)
+                            .ok()
+                    });
+                return (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "key": candidate,
+                        "requested_key": key,
+                        "namespace": openfang_types::memory::memory_key_namespace(&candidate),
+                        "internal": openfang_types::memory::is_internal_memory_key(&candidate),
+                        "governed": metadata.is_some(),
+                        "kind": metadata.as_ref().map(|m| m.kind.clone()),
+                        "tags": metadata.as_ref().map(|m| m.tags.clone()).unwrap_or_default(),
+                        "freshness": metadata.as_ref().map(|m| m.freshness.clone()),
+                        "source": metadata.as_ref().map(|m| m.source.clone()),
+                        "updated_at": metadata.as_ref().map(|m| m.updated_at.to_rfc3339()),
+                        "value": val
+                    })),
+                );
+            }
+            Ok(None) => continue,
+            Err(e) => {
+                tracing::warn!("Memory get failed for key '{candidate}': {e}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "Memory operation failed"})),
+                );
+            }
         }
     }
+
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({"error": "Key not found"})),
+    )
 }
 
 /// PUT /api/memory/agents/:id/kv/:key — Set a KV value.
@@ -2841,16 +2950,160 @@ pub async fn set_agent_kv_key(
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let agent_id = openfang_kernel::kernel::shared_memory_agent_id();
+    let canonical_key = match openfang_types::memory::canonicalize_user_memory_key(&key) {
+        Ok(key) => key,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": error })),
+            );
+        }
+    };
+    if openfang_types::memory::is_internal_memory_key(&canonical_key) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Reserved internal memory keys cannot be written through this API"
+            })),
+        );
+    }
 
-    let value = body.get("value").cloned().unwrap_or(body);
-
-    match state.kernel.memory.structured_set(agent_id, &key, value) {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"status": "stored", "key": key})),
-        ),
+    let kind = body.get("kind").and_then(|v| v.as_str());
+    let tags: Vec<String> = body
+        .get("tags")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items.iter()
+                .filter_map(|item| item.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let freshness: Option<openfang_types::memory::MemoryFreshness> = match body
+        .get("freshness")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+    {
+        Ok(freshness) => freshness,
         Err(e) => {
-            tracing::warn!("Memory set failed for key '{key}': {e}");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("Invalid freshness: {e}") })),
+            );
+        }
+    };
+    let conflict_policy: openfang_types::memory::MemoryConflictPolicy = match body
+        .get("conflict_policy")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+    {
+        Ok(policy) => policy.unwrap_or_default(),
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("Invalid conflict_policy: {e}") })),
+            );
+        }
+    };
+    let value = body.get("value").cloned().unwrap_or_else(|| body.clone());
+
+    if matches!(
+        conflict_policy,
+        openfang_types::memory::MemoryConflictPolicy::SkipIfExists
+    ) {
+        let lookup_keys = match openfang_types::memory::memory_lookup_candidates(&canonical_key) {
+            Ok(keys) => keys,
+            Err(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": error })),
+                );
+            }
+        };
+        for candidate in lookup_keys {
+            match state.kernel.memory.structured_get(agent_id, &candidate) {
+                Ok(Some(_)) => {
+                    return (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "status": "skipped",
+                            "key": candidate,
+                            "requested_key": key
+                        })),
+                    );
+                }
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!("Memory get failed for key '{candidate}' before set: {e}");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": "Memory operation failed"})),
+                    );
+                }
+            }
+        }
+    }
+
+    match state.kernel.memory.structured_set(agent_id, &canonical_key, value) {
+        Ok(()) => {
+            let metadata = match openfang_types::memory::build_memory_record_metadata(
+                &canonical_key,
+                kind,
+                &tags,
+                freshness,
+                "memory_api",
+            ) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({ "error": error })),
+                    );
+                }
+            };
+            let metadata_key = match openfang_types::memory::memory_metadata_key(&canonical_key) {
+                Ok(key) => key,
+                Err(error) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({ "error": error })),
+                    );
+                }
+            };
+            if let Err(e) = state.kernel.memory.structured_set(
+                agent_id,
+                &metadata_key,
+                serde_json::to_value(&metadata).unwrap_or(serde_json::Value::Null),
+            ) {
+                tracing::warn!("Memory metadata set failed for key '{metadata_key}': {e}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "Memory operation failed"})),
+                );
+            }
+            let migrated_legacy_key = if canonical_key != key {
+                match state.kernel.memory.structured_delete(agent_id, &key) {
+                    Ok(()) => Some(key.clone()),
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
+
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "stored",
+                    "key": canonical_key,
+                    "requested_key": key,
+                    "migrated_legacy_key": migrated_legacy_key,
+                    "metadata_key": metadata_key
+                })),
+            )
+        }
+        Err(e) => {
+            tracing::warn!("Memory set failed for key '{canonical_key}': {e}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "Memory operation failed"})),
@@ -2865,19 +3118,60 @@ pub async fn delete_agent_kv_key(
     Path((_id, key)): Path<(String, String)>,
 ) -> impl IntoResponse {
     let agent_id = openfang_kernel::kernel::shared_memory_agent_id();
-
-    match state.kernel.memory.structured_delete(agent_id, &key) {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"status": "deleted", "key": key})),
-        ),
-        Err(e) => {
-            tracing::warn!("Memory delete failed for key '{key}': {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "Memory operation failed"})),
-            )
+    let lookup_keys = match openfang_types::memory::memory_lookup_candidates(&key) {
+        Ok(keys) => keys,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": error })),
+            );
         }
+    };
+
+    let mut deleted_keys = Vec::new();
+    for candidate in lookup_keys {
+        match state.kernel.memory.structured_get(agent_id, &candidate) {
+            Ok(Some(_)) => match state.kernel.memory.structured_delete(agent_id, &candidate) {
+                Ok(()) => deleted_keys.push(candidate),
+                Err(e) => {
+                    tracing::warn!("Memory delete failed for key '{candidate}': {e}");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": "Memory operation failed"})),
+                    );
+                }
+            },
+            Ok(None) => continue,
+            Err(e) => {
+                tracing::warn!("Memory get failed for key '{candidate}' before delete: {e}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "Memory operation failed"})),
+                );
+            }
+        }
+    }
+    for candidate in deleted_keys.clone() {
+        if let Ok(metadata_key) = openfang_types::memory::memory_metadata_key(&candidate) {
+            let _ = state.kernel.memory.structured_delete(agent_id, &metadata_key);
+        }
+    }
+
+    if deleted_keys.is_empty() {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Key not found"})),
+        )
+    } else {
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "deleted",
+                "key": deleted_keys[0],
+                "requested_key": key,
+                "deleted_keys": deleted_keys
+            })),
+        )
     }
 }
 
