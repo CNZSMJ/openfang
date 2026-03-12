@@ -1,6 +1,7 @@
 ---
 name: api-tester
 description: API testing expert for curl, REST, GraphQL, authentication, and debugging
+defer_loading: true
 ---
 # API Testing Expert
 

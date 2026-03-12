@@ -1,6 +1,7 @@
 ---
 name: kubernetes
 description: Kubernetes operations expert for kubectl, pods, deployments, and debugging
+defer_loading: true
 ---
 # Kubernetes Operations Expert
 

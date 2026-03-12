@@ -1,6 +1,7 @@
 ---
 name: docker
 description: Docker expert for containers, Compose, Dockerfiles, and debugging
+defer_loading: true
 ---
 # Docker Expert
 

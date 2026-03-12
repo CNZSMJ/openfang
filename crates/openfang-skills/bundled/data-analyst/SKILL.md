@@ -1,6 +1,7 @@
 ---
 name: data-analyst
 description: Data analysis expert for statistics, visualization, pandas, and exploration
+defer_loading: false
 ---
 # Data Analysis Expert
 

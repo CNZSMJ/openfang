@@ -1,6 +1,7 @@
 ---
 name: linux-networking
 description: "Linux networking expert for iptables, nftables, routing, DNS, and network troubleshooting"
+defer_loading: true
 ---
 # Linux Networking Expert
 

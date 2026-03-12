@@ -1,6 +1,7 @@
 ---
 name: redis-expert
 description: "Redis expert for data structures, caching patterns, Lua scripting, and cluster operations"
+defer_loading: true
 ---
 # Redis Data Store Expertise
 

@@ -1,6 +1,7 @@
 ---
 name: golang-expert
 description: "Go programming expert for goroutines, channels, interfaces, modules, and concurrency patterns"
+defer_loading: true
 ---
 # Go Programming Expertise
 

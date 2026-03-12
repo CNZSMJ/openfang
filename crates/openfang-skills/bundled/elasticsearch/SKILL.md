@@ -1,6 +1,7 @@
 ---
 name: elasticsearch
 description: "Elasticsearch expert for queries, mappings, aggregations, index management, and cluster operations"
+defer_loading: true
 ---
 # Elasticsearch Expert
 

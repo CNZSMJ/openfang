@@ -826,7 +826,7 @@ pub async fn execute_tool(
         ),
 
         // Skill documentation tool
-        "tool_get_instructions" | "skill_get_instructions" => {
+        "tool_get_instructions" => {
             let name = input["skill_name"].as_str().unwrap_or("");
             if let Some(registry) = skill_registry {
                 if let Some(skill) = registry.get(name) {
@@ -1311,22 +1311,11 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         },
         tool_definition! {
             name: "tool_get_instructions".to_string(),
-            description: "Retrieve detailed instructions for a discovered skill manual. Use this after tool_search returns a skill_manual result and you need the full guidance.".to_string(),
+            description: "Retrieve additional guidance for a discovered instructional resource. Use this after tool_search returns a result with has_instructions=true and you need the full guidance.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "skill_name": { "type": "string", "description": "The name of the skill manual to load" }
-                },
-                "required": ["skill_name"]
-            }),
-        },
-        tool_definition! {
-            name: "skill_get_instructions".to_string(),
-            description: "Compatibility alias for tool_get_instructions during the unified skill-manual migration.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "skill_name": { "type": "string", "description": "The name of the skill to get instructions for" }
+                    "skill_name": { "type": "string", "description": "The identifier of the discovered instructional resource to load" }
                 },
                 "required": ["skill_name"]
             }),
@@ -3806,7 +3795,6 @@ input_schema = { type = "object", properties = { issue = { type = "string" } } }
         // Skill discovery tools
         assert!(names.contains(&"tool_search"));
         assert!(names.contains(&"tool_get_instructions"));
-        assert!(names.contains(&"skill_get_instructions"));
         assert!(
             tools.iter().all(|tool| !tool.defer_loading),
             "builtin tools should remain visible by default; defer_loading is reserved for skill/MCP rollout"

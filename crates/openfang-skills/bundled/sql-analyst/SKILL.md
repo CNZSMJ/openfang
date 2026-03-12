@@ -1,6 +1,7 @@
 ---
 name: sql-analyst
 description: SQL query expert for optimization, schema design, and data analysis
+defer_loading: true
 ---
 # SQL Query Expert
 

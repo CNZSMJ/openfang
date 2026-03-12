@@ -1,6 +1,7 @@
 ---
 name: vector-db
 description: "Vector database expert for embeddings, similarity search, RAG patterns, and indexing strategies"
+defer_loading: true
 ---
 # Vector Database Expert
 

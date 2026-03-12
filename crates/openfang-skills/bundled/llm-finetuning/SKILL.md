@@ -1,6 +1,7 @@
 ---
 name: llm-finetuning
 description: "LLM fine-tuning expert for LoRA, QLoRA, dataset preparation, and training optimization"
+defer_loading: true
 ---
 # LLM Fine-Tuning Expert
 

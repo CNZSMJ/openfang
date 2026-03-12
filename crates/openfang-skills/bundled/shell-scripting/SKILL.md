@@ -1,6 +1,7 @@
 ---
 name: shell-scripting
 description: "Shell scripting expert for Bash, POSIX compliance, error handling, and automation"
+defer_loading: false
 ---
 # Shell Scripting Expertise
 

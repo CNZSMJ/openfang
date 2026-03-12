@@ -1,6 +1,7 @@
 ---
 name: sysadmin
 description: System administration expert for Linux, macOS, Windows, services, and monitoring
+defer_loading: true
 ---
 # System Administration Expert
 

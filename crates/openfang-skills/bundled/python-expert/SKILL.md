@@ -1,6 +1,7 @@
 ---
 name: python-expert
 description: "Python expert for stdlib, packaging, type hints, async/await, and performance optimization"
+defer_loading: false
 ---
 # Python Programming Expertise
 

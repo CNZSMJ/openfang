@@ -1,6 +1,7 @@
 ---
 name: presentation
 description: "Presentation expert for slide structure, storytelling, visual design, and audience engagement"
+defer_loading: false
 ---
 # Presentation Expert
 

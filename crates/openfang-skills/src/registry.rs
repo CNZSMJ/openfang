@@ -303,7 +303,12 @@ impl SkillRegistry {
         self.skills
             .values()
             .filter(|s| s.enabled)
-            .flat_map(|s| s.manifest.tools.provided.iter().cloned())
+            .flat_map(|s| {
+                s.manifest.tools.provided.iter().cloned().map(|mut tool| {
+                    tool.defer_loading = s.manifest.skill.defer_loading;
+                    tool
+                })
+            })
             .collect()
     }
 
@@ -312,7 +317,12 @@ impl SkillRegistry {
         self.skills
             .values()
             .filter(|s| s.enabled && names.contains(&s.manifest.skill.name))
-            .flat_map(|s| s.manifest.tools.provided.iter().cloned())
+            .flat_map(|s| {
+                s.manifest.tools.provided.iter().cloned().map(|mut tool| {
+                    tool.defer_loading = s.manifest.skill.defer_loading;
+                    tool
+                })
+            })
             .collect()
     }
 
@@ -700,6 +710,37 @@ input_schema = {{ type = "object" }}
 
         let tools = registry.all_tool_definitions();
         assert_eq!(tools.len(), 2);
+    }
+
+    #[test]
+    fn test_tool_definitions_inherit_skill_defer_loading() {
+        let dir = TempDir::new().unwrap();
+        create_test_skill_with_manifest(
+            dir.path(),
+            "deferred-skill",
+            r#"
+[skill]
+name = "deferred-skill"
+version = "0.1.0"
+description = "Deferred skill"
+defer_loading = true
+
+[runtime]
+type = "promptonly"
+
+[[tools.provided]]
+name = "deferred_tool"
+description = "A deferred tool"
+input_schema = { type = "object" }
+"#,
+        );
+
+        let mut registry = SkillRegistry::new(dir.path().to_path_buf());
+        registry.load_all().unwrap();
+
+        let tools = registry.all_tool_definitions();
+        assert_eq!(tools.len(), 1);
+        assert!(tools[0].defer_loading);
     }
 
     #[test]

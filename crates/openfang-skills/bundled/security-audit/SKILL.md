@@ -1,6 +1,7 @@
 ---
 name: security-audit
 description: "Security audit expert for OWASP Top 10, CVE analysis, code review, and penetration testing methodology"
+defer_loading: true
 ---
 # Security Audit and Code Review
 

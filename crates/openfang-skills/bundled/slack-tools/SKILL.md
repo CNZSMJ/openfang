@@ -1,6 +1,7 @@
 ---
 name: slack-tools
 description: Slack workspace management and automation specialist
+defer_loading: true
 ---
 # Slack Workspace Management and Automation
 

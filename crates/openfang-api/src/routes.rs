@@ -6142,7 +6142,7 @@ pub async fn mcp_http(
     tools.retain(|tool| {
         !matches!(
             tool.name.as_str(),
-            "tool_search" | "tool_get_instructions" | "skill_get_instructions"
+            "tool_search" | "tool_get_instructions"
         )
     });
 
@@ -7162,6 +7162,7 @@ pub async fn create_skill(
             author: String::new(),
             license: String::new(),
             tags: vec!["prompt-only".to_string()],
+            defer_loading: false,
         },
         runtime: SkillRuntimeConfig {
             runtime_type: SkillRuntime::PromptOnly,

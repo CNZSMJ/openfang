@@ -1,6 +1,7 @@
 ---
 name: sqlite-expert
 description: "SQLite expert for WAL mode, query optimization, embedded patterns, and advanced features"
+defer_loading: true
 ---
 # SQLite Expert
 

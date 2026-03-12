@@ -1,6 +1,7 @@
 ---
 name: figma-expert
 description: "Figma design expert for components, auto-layout, design systems, and developer handoff"
+defer_loading: true
 ---
 # Figma Expert
 

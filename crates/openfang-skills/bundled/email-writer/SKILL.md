@@ -1,6 +1,7 @@
 ---
 name: email-writer
 description: "Professional email writing expert for tone, structure, clarity, and business communication"
+defer_loading: false
 ---
 # Professional Email Writer
 

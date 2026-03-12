@@ -1,6 +1,7 @@
 ---
 name: interview-prep
 description: "Technical interview preparation expert for algorithms, system design, and behavioral questions"
+defer_loading: true
 ---
 # Technical Interview Preparation Expert
 

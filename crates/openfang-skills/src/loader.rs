@@ -314,6 +314,7 @@ mod tests {
                 author: String::new(),
                 license: String::new(),
                 tags: vec![],
+                defer_loading: false,
             },
             runtime: SkillRuntimeConfig {
                 runtime_type: SkillRuntime::PromptOnly,
@@ -328,6 +329,7 @@ mod tests {
                         invoker: CommandInvoker::Model,
                         ..Default::default()
                     },
+                    defer_loading: false,
                 }],
             },
             requirements: SkillRequirements::default(),

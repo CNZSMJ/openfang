@@ -1,6 +1,7 @@
 ---
 name: regex-expert
 description: Regular expression expert for crafting, debugging, and explaining patterns
+defer_loading: false
 ---
 # Regular Expression Expert
 

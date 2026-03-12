@@ -1,6 +1,7 @@
 ---
 name: code-reviewer
 description: Code review specialist focused on patterns, bugs, security, and performance
+defer_loading: true
 ---
 # Code Review Specialist
 
