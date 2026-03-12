@@ -54,6 +54,8 @@ pub struct PromptContext {
     pub soul_md: Option<String>,
     /// USER.md content.
     pub user_md: Option<String>,
+    /// MEMORY.md content (long-term memory protocol and durable context).
+    pub memory_md: Option<String>,
     /// Cross-channel canonical context summary.
     pub canonical_context: Option<String>,
     /// Known user name (from shared memory).
@@ -166,6 +168,14 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
         {
             sections.push(section);
         }
+        if let Some(section) = build_workspace_file_section(
+            "Long-Term Memory",
+            "MEMORY.md",
+            ctx.memory_md.as_deref(),
+            2400,
+        ) {
+            sections.push(section);
+        }
     } else {
         if let Some(section) =
             build_workspace_file_section("Guidelines", "AGENTS.md", ctx.agents_md.as_deref(), 3200)
@@ -178,6 +188,14 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
         if let Some(section) =
             build_workspace_file_section("Local Environment", "TOOLS.md", ctx.tools_md.as_deref(), 1600)
         {
+            sections.push(section);
+        }
+        if let Some(section) = build_workspace_file_section(
+            "Long-Term Memory",
+            "MEMORY.md",
+            ctx.memory_md.as_deref(),
+            1600,
+        ) {
             sections.push(section);
         }
     }
@@ -314,14 +332,50 @@ pub fn build_canonical_context_message(ctx: &PromptContext) -> Option<String> {
         .map(|c| format!("[Previous conversation context]\n{}", cap_str(c, 500)))
 }
 
+/// Build dynamic memory context as a standalone user message.
+///
+/// This keeps the system prompt stable while still surfacing relevant memories
+/// and recent session summaries for the current turn.
+pub fn build_memory_context_message(
+    recalled_memories: &[String],
+    recent_session_summaries: &[String],
+) -> Option<String> {
+    if recalled_memories.is_empty() && recent_session_summaries.is_empty() {
+        return None;
+    }
+
+    let mut out = String::from("[Memory context]\n");
+
+    if !recalled_memories.is_empty() {
+        out.push_str("Relevant recalled memories:\n");
+        for memory in recalled_memories.iter().take(5) {
+            out.push_str(&format!("- {}\n", cap_str(memory, 320)));
+        }
+    }
+
+    if !recent_session_summaries.is_empty() {
+        if !recalled_memories.is_empty() {
+            out.push('\n');
+        }
+        out.push_str("Recent session summaries:\n");
+        for summary in recent_session_summaries.iter().take(3) {
+            out.push_str(&format!("- {}\n", cap_str(summary, 320)));
+        }
+    }
+
+    Some(out.trim_end().to_string())
+}
+
 /// Build the memory recall section.
 ///
 /// Also used by `agent_loop.rs` to append recalled memories after DB lookup.
 pub fn build_memory_section(memories: &[(String, String)]) -> String {
     let mut out = String::from(
         "## Memory Recall\n\
-         - Use memory_recall for prior decisions, preferences, or conversation context.\n\
-         - Use memory_store for durable preferences, decisions, and continuity points.",
+         - Use memory_recall when you know the exact key for prior decisions, preferences, or stored state.\n\
+         - If the exact key is unclear, use memory_list to inspect matching keys before guessing.\n\
+         - Use memory_store for durable preferences, decisions, and continuity points.\n\
+         - Treat injected memory context as historical guidance, not as a replacement for checking current state.",
     );
     if !memories.is_empty() {
         out.push_str("\n\nRecalled memories:\n");
@@ -567,6 +621,7 @@ fn is_placeholder_workspace_file(name: &str, content: &str) -> bool {
     match name {
         "USER.md" => is_placeholder_user_md(content),
         "TOOLS.md" => is_placeholder_tools_md(content),
+        "MEMORY.md" => is_placeholder_memory_md(content),
         _ => false,
     }
 }
@@ -615,6 +670,14 @@ fn is_placeholder_tools_md(content: &str) -> bool {
             ))
 }
 
+fn is_placeholder_memory_md(content: &str) -> bool {
+    normalize_placeholder_text(&strip_redundant_leading_heading("MEMORY.md", content))
+        == normalize_placeholder_text(&strip_redundant_leading_heading(
+            "MEMORY.md",
+            DEFAULT_MEMORY_MD_TEMPLATE,
+        ))
+}
+
 fn normalize_placeholder_text(content: &str) -> String {
     content
         .lines()
@@ -647,6 +710,10 @@ const DEFAULT_ASSISTANT_TOOLS_MD_TEMPLATE: &str = "\
 - Capture local environment facts that help Assistant work accurately in this setup.
 ## Why This File Exists
 - Use this file for environment knowledge and local conventions, not generic tool policy.";
+
+const DEFAULT_MEMORY_MD_TEMPLATE: &str = "\
+# Long-Term Memory
+<!-- Curated knowledge the agent preserves across sessions -->";
 
 fn build_channel_section(channel: &str) -> String {
     let (limit, hints) = match channel {
@@ -958,6 +1025,7 @@ mod tests {
         ctx.agents_md = Some("# AGENTS.md\n- Be useful.".to_string());
         ctx.tools_md = Some("# TOOLS.md - Local Environment Notes\n- Use debug binaries.\n".to_string());
         ctx.user_md = Some("# User\n- Name: Alice".to_string());
+        ctx.memory_md = Some("# Long-Term Memory\n- Prefer project.arch decisions over ad hoc choices.".to_string());
 
         let prompt = build_system_prompt(&ctx);
         let agents_pos = prompt.find("## Guidelines").unwrap();
@@ -965,11 +1033,13 @@ mod tests {
         let tools_pos = prompt.find("## Local Environment").unwrap();
         let identity_pos = prompt.find("## Identity").unwrap();
         let user_pos = prompt.find("## User Preferences").unwrap();
+        let memory_pos = prompt.find("## Long-Term Memory").unwrap();
 
         assert!(agents_pos < soul_pos);
         assert!(soul_pos < tools_pos);
         assert!(tools_pos < identity_pos);
         assert!(identity_pos < user_pos);
+        assert!(user_pos < memory_pos);
     }
 
     #[test]
@@ -1037,6 +1107,7 @@ mod tests {
         let section = build_memory_section(&[]);
         assert!(section.contains("## Memory Recall"));
         assert!(section.contains("memory_recall"));
+        assert!(section.contains("memory_list"));
         assert!(!section.contains("Recalled memories"));
     }
 
@@ -1276,6 +1347,50 @@ mod tests {
         ctx.user_md = Some("- Name: Alice".to_string());
         let prompt = build_system_prompt(&ctx);
         assert!(!prompt.contains("## User Preferences"));
+    }
+
+    #[test]
+    fn test_memory_md_section_present() {
+        let mut ctx = basic_ctx();
+        ctx.memory_md = Some("# Long-Term Memory\n- Remember project.alpha.status before proposing changes.".to_string());
+        let prompt = build_system_prompt(&ctx);
+        assert!(prompt.contains("## Long-Term Memory"));
+        assert!(prompt.contains("project.alpha.status"));
+    }
+
+    #[test]
+    fn test_placeholder_memory_md_omitted() {
+        let mut ctx = basic_ctx();
+        ctx.memory_md = Some(
+            "# Long-Term Memory\n\
+             <!-- Curated knowledge the agent preserves across sessions -->\n"
+                .to_string(),
+        );
+        let prompt = build_system_prompt(&ctx);
+        assert!(!prompt.contains("## Long-Term Memory"));
+    }
+
+    #[test]
+    fn test_memory_context_message_present() {
+        let message = build_memory_context_message(
+            &[
+                "[project.alpha] Architecture decision: use Axum".to_string(),
+                "User prefers concise summaries".to_string(),
+            ],
+            &["session_2026-03-11_alpha: Reviewed prompt pipeline".to_string()],
+        )
+        .unwrap();
+
+        assert!(message.contains("[Memory context]"));
+        assert!(message.contains("Relevant recalled memories"));
+        assert!(message.contains("Recent session summaries"));
+        assert!(message.contains("Architecture decision"));
+        assert!(message.contains("Reviewed prompt pipeline"));
+    }
+
+    #[test]
+    fn test_memory_context_message_omitted_when_empty() {
+        assert!(build_memory_context_message(&[], &[]).is_none());
     }
 
     #[test]

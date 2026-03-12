@@ -17,14 +17,14 @@ use crate::web_search::WebToolsContext;
 use openfang_memory::session::Session;
 use openfang_memory::MemorySubstrate;
 use openfang_skills::registry::SkillRegistry;
-use openfang_types::agent::AgentManifest;
+use openfang_types::agent::{AgentId, AgentManifest};
 use openfang_types::error::{OpenFangError, OpenFangResult};
 use openfang_types::memory::{Memory, MemoryFilter, MemorySource};
 use openfang_types::message::{
     ContentBlock, Message, MessageContent, Role, StopReason, TokenUsage,
 };
 use openfang_types::tool::{ToolCall, ToolDefinition};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
@@ -86,6 +86,92 @@ pub fn strip_provider_prefix(model: &str, provider: &str) -> String {
 
 /// Default context window size (tokens) for token-based trimming.
 const DEFAULT_CONTEXT_WINDOW: usize = 200_000;
+
+fn format_recalled_memory_fragments(
+    memories: &[openfang_types::memory::MemoryFragment],
+) -> Vec<String> {
+    let mut seen = HashSet::new();
+
+    memories
+        .iter()
+        .filter_map(|memory| {
+            let content = memory.content.trim();
+            if content.is_empty() {
+                return None;
+            }
+
+            let label = memory
+                .metadata
+                .get("key")
+                .and_then(|value| value.as_str())
+                .map(|key| format!("[{key}] "))
+                .or_else(|| {
+                    let scope = memory.scope.trim();
+                    (!scope.is_empty()).then(|| format!("[{scope}] "))
+                })
+                .unwrap_or_default();
+
+            let rendered = format!("{label}{}", openfang_types::truncate_str(content, 320));
+            if seen.insert(rendered.clone()) {
+                Some(rendered)
+            } else {
+                None
+            }
+        })
+        .take(5)
+        .collect()
+}
+
+fn load_recent_session_summaries(
+    memory: &MemorySubstrate,
+    agent_id: AgentId,
+    limit: usize,
+) -> Vec<String> {
+    let mut summaries: Vec<(String, String)> = memory
+        .list_kv(agent_id)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(key, value)| {
+            if !key.starts_with("session_") {
+                return None;
+            }
+
+            let rendered = match value {
+                serde_json::Value::String(text) => text,
+                other => serde_json::to_string(&other).ok()?,
+            };
+
+            let rendered = rendered.trim();
+            if rendered.is_empty() {
+                return None;
+            }
+
+            Some((
+                key.clone(),
+                format!(
+                    "{}: {}",
+                    key,
+                    openfang_types::truncate_str(rendered, 320)
+                ),
+            ))
+        })
+        .collect();
+
+    summaries.sort_by(|a, b| b.0.cmp(&a.0));
+    summaries
+        .into_iter()
+        .take(limit)
+        .map(|(_, summary)| summary)
+        .collect()
+}
+
+fn trim_messages_for_prepended_context(messages: &mut Vec<Message>, reserved_slots: usize) {
+    let keep = MAX_HISTORY_MESSAGES.saturating_sub(reserved_slots);
+    if messages.len() > keep {
+        let trim_count = messages.len() - keep;
+        messages.drain(..trim_count);
+    }
+}
 
 /// Agent lifecycle phase within the execution loop.
 /// Used for UX indicators (typing, reactions) without coupling to channel types.
@@ -257,6 +343,10 @@ pub async fn run_agent_loop_with_session_message(
             .await
             .unwrap_or_default()
     };
+    let memory_context_msg = crate::prompt_builder::build_memory_context_message(
+        &format_recalled_memory_fragments(&_memories),
+        &load_recent_session_summaries(memory, session.agent_id, 3),
+    );
 
     // Fire BeforePromptBuild hook
     let agent_id_str = session.agent_id.0.to_string();
@@ -273,7 +363,8 @@ pub async fn run_agent_loop_with_session_message(
         let _ = hook_reg.fire(&ctx);
     }
 
-    // Build the system prompt. Recalled memories are already injected by prompt_builder.
+    // Build the system prompt. Dynamic memory context is injected as a separate user message
+    // to keep the system prompt stable for provider prompt caching.
     let system_prompt = manifest.model.system_prompt.clone();
 
     // Add the user message to session history.
@@ -291,33 +382,40 @@ pub async fn run_agent_loop_with_session_message(
     // Validate and repair session history (drop orphans, merge consecutive)
     let mut messages = crate::session_repair::validate_and_repair(&llm_messages);
 
-    // Inject canonical context as the first user message (not in system prompt)
+    // Inject canonical and memory context as prepended user messages (not in system prompt)
     // to keep the system prompt stable across turns for provider prompt caching.
+    let mut prepended_messages = Vec::new();
     if let Some(cc_msg) = manifest
         .metadata
         .get("canonical_context_msg")
         .and_then(|v| v.as_str())
     {
         if !cc_msg.is_empty() {
-            messages.insert(0, Message::user(cc_msg));
+            prepended_messages.push(Message::user(cc_msg));
         }
     }
-
+    if let Some(mem_msg) = memory_context_msg {
+        prepended_messages.push(Message::user(mem_msg));
+    }
     let mut total_usage = TokenUsage::default();
     let final_response;
 
     // Safety valve: trim excessively long message histories to prevent context overflow.
     // The full compaction system handles sophisticated summarization, but this prevents
     // the catastrophic case where 200+ messages cause instant context overflow.
-    if messages.len() > MAX_HISTORY_MESSAGES {
-        let trim_count = messages.len() - MAX_HISTORY_MESSAGES;
+    if messages.len() + prepended_messages.len() > MAX_HISTORY_MESSAGES {
+        let keep = MAX_HISTORY_MESSAGES.saturating_sub(prepended_messages.len());
+        let trim_count = messages.len().saturating_sub(keep);
         warn!(
             agent = %manifest.name,
             total_messages = messages.len(),
             trimming = trim_count,
             "Trimming old messages to prevent context overflow"
         );
-        messages.drain(..trim_count);
+        trim_messages_for_prepended_context(&mut messages, prepended_messages.len());
+    }
+    if !prepended_messages.is_empty() {
+        messages.splice(0..0, prepended_messages);
     }
 
     // Use autonomous config max_iterations if set, else default
@@ -1184,6 +1282,10 @@ pub async fn run_agent_loop_streaming(
             .await
             .unwrap_or_default()
     };
+    let memory_context_msg = crate::prompt_builder::build_memory_context_message(
+        &format_recalled_memory_fragments(&_memories),
+        &load_recent_session_summaries(memory, session.agent_id, 3),
+    );
 
     // Fire BeforePromptBuild hook
     let agent_id_str = session.agent_id.0.to_string();
@@ -1200,7 +1302,8 @@ pub async fn run_agent_loop_streaming(
         let _ = hook_reg.fire(&ctx);
     }
 
-    // Build the system prompt. Recalled memories are already injected by prompt_builder.
+    // Build the system prompt. Dynamic memory context is injected as a separate user message
+    // to keep the system prompt stable for provider prompt caching.
     let system_prompt = manifest.model.system_prompt.clone();
 
     // Add the user message to session history
@@ -1216,31 +1319,38 @@ pub async fn run_agent_loop_streaming(
     // Validate and repair session history (drop orphans, merge consecutive)
     let mut messages = crate::session_repair::validate_and_repair(&llm_messages);
 
-    // Inject canonical context as the first user message (not in system prompt)
+    // Inject canonical and memory context as prepended user messages (not in system prompt)
     // to keep the system prompt stable across turns for provider prompt caching.
+    let mut prepended_messages = Vec::new();
     if let Some(cc_msg) = manifest
         .metadata
         .get("canonical_context_msg")
         .and_then(|v| v.as_str())
     {
         if !cc_msg.is_empty() {
-            messages.insert(0, Message::user(cc_msg));
+            prepended_messages.push(Message::user(cc_msg));
         }
     }
-
+    if let Some(mem_msg) = memory_context_msg {
+        prepended_messages.push(Message::user(mem_msg));
+    }
     let mut total_usage = TokenUsage::default();
     let final_response;
 
     // Safety valve: trim excessively long message histories to prevent context overflow.
-    if messages.len() > MAX_HISTORY_MESSAGES {
-        let trim_count = messages.len() - MAX_HISTORY_MESSAGES;
+    if messages.len() + prepended_messages.len() > MAX_HISTORY_MESSAGES {
+        let keep = MAX_HISTORY_MESSAGES.saturating_sub(prepended_messages.len());
+        let trim_count = messages.len().saturating_sub(keep);
         warn!(
             agent = %manifest.name,
             total_messages = messages.len(),
             trimming = trim_count,
             "Trimming old messages to prevent context overflow (streaming)"
         );
-        messages.drain(..trim_count);
+        trim_messages_for_prepended_context(&mut messages, prepended_messages.len());
+    }
+    if !prepended_messages.is_empty() {
+        messages.splice(0..0, prepended_messages);
     }
 
     // Use autonomous config max_iterations if set, else default
@@ -2331,6 +2441,83 @@ mod tests {
         let before_marker = result.split("[TRUNCATED:").next().unwrap();
         let trimmed = before_marker.trim_end();
         assert!(!trimmed.is_empty());
+    }
+
+    #[test]
+    fn test_format_recalled_memory_fragments_deduplicates_and_labels() {
+        let agent_id = AgentId::new();
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "key".to_string(),
+            serde_json::Value::String("pref.editor".to_string()),
+        );
+
+        let memory = openfang_types::memory::MemoryFragment {
+            id: openfang_types::memory::MemoryId::new(),
+            agent_id,
+            content: "Use rustfmt only when explicitly requested.".to_string(),
+            embedding: None,
+            metadata,
+            source: openfang_types::memory::MemorySource::UserProvided,
+            confidence: 1.0,
+            created_at: chrono::Utc::now(),
+            accessed_at: chrono::Utc::now(),
+            access_count: 0,
+            scope: "preferences".to_string(),
+        };
+
+        let rendered = format_recalled_memory_fragments(&[memory.clone(), memory]);
+        assert_eq!(rendered.len(), 1);
+        assert!(rendered[0].contains("[pref.editor]"));
+        assert!(rendered[0].contains("rustfmt"));
+    }
+
+    #[test]
+    fn test_load_recent_session_summaries_prefers_latest_keys() {
+        let memory = openfang_memory::MemorySubstrate::open_in_memory(0.01).unwrap();
+        let agent_id = AgentId::new();
+        memory
+            .structured_set(
+                agent_id,
+                "session_2026-03-10_alpha",
+                serde_json::Value::String("Older summary".to_string()),
+            )
+            .unwrap();
+        memory
+            .structured_set(
+                agent_id,
+                "session_2026-03-12_beta",
+                serde_json::Value::String("Newest summary".to_string()),
+            )
+            .unwrap();
+        memory
+            .structured_set(
+                agent_id,
+                "project.alpha.status",
+                serde_json::Value::String("in_progress".to_string()),
+            )
+            .unwrap();
+
+        let summaries = load_recent_session_summaries(&memory, agent_id, 1);
+        assert_eq!(summaries.len(), 1);
+        assert!(summaries[0].contains("session_2026-03-12_beta"));
+        assert!(summaries[0].contains("Newest summary"));
+    }
+
+    #[test]
+    fn test_trim_messages_preserves_slots_for_prepended_context() {
+        let mut messages: Vec<Message> = (0..MAX_HISTORY_MESSAGES)
+            .map(|i| Message::user(format!("message {i}")))
+            .collect();
+
+        trim_messages_for_prepended_context(&mut messages, 2);
+
+        assert_eq!(messages.len(), MAX_HISTORY_MESSAGES - 2);
+        assert_eq!(messages.first().unwrap().content.text_content(), "message 2");
+        assert_eq!(
+            messages.last().unwrap().content.text_content(),
+            format!("message {}", MAX_HISTORY_MESSAGES - 1)
+        );
     }
 
     #[test]

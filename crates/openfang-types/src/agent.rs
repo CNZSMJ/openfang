@@ -184,7 +184,7 @@ pub enum AgentState {
 pub enum AgentMode {
     /// Read-only: agent can observe but cannot call any tools.
     Observe,
-    /// Restricted: agent can only call read-only tools (file_read, file_list, memory_recall, web_fetch, web_search).
+    /// Restricted: agent can only call read-only tools (file_read, file_list, memory_recall, memory_list, web_fetch, web_search).
     Assist,
     /// Unrestricted: agent can use all granted tools.
     #[default]
@@ -201,6 +201,7 @@ impl AgentMode {
                     "file_read",
                     "file_list",
                     "memory_recall",
+                    "memory_list",
                     "web_fetch",
                     "web_search",
                     "agent_list",
@@ -334,6 +335,7 @@ impl ToolProfile {
                 "agent_list",
                 "memory_store",
                 "memory_recall",
+                "memory_list",
                 "tool_search",
                 "tool_get_instructions",
             ],
@@ -348,6 +350,7 @@ impl ToolProfile {
                 "agent_list",
                 "memory_store",
                 "memory_recall",
+                "memory_list",
                 "tool_search",
                 "tool_get_instructions",
             ],
@@ -867,19 +870,21 @@ mod tests {
         let tools = ToolProfile::Messaging.tools();
         assert!(tools.contains(&"agent_send".to_string()));
         assert!(tools.contains(&"memory_recall".to_string()));
+        assert!(tools.contains(&"memory_list".to_string()));
         assert!(tools.contains(&"tool_search".to_string()));
         assert!(tools.contains(&"tool_get_instructions".to_string()));
         assert!(!tools.contains(&"skill_search".to_string()));
-        assert_eq!(tools.len(), 6);
+        assert_eq!(tools.len(), 7);
     }
 
     #[test]
     fn test_tool_profile_automation() {
         let tools = ToolProfile::Automation.tools();
+        assert!(tools.contains(&"memory_list".to_string()));
         assert!(tools.contains(&"tool_search".to_string()));
         assert!(tools.contains(&"tool_get_instructions".to_string()));
         assert!(!tools.contains(&"skill_search".to_string()));
-        assert_eq!(tools.len(), 12);
+        assert_eq!(tools.len(), 13);
     }
 
     #[test]
@@ -978,13 +983,19 @@ mod tests {
                 description: String::new(),
                 input_schema: serde_json::Value::Null,
             },
+            tool_definition! {
+                name: "memory_list".into(),
+                description: String::new(),
+                input_schema: serde_json::Value::Null,
+            },
         ];
         let filtered = AgentMode::Assist.filter_tools(tools);
-        assert_eq!(filtered.len(), 3);
+        assert_eq!(filtered.len(), 4);
         let names: Vec<&str> = filtered.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"file_read"));
         assert!(names.contains(&"web_fetch"));
         assert!(names.contains(&"memory_recall"));
+        assert!(names.contains(&"memory_list"));
         assert!(!names.contains(&"file_write"));
         assert!(!names.contains(&"shell_exec"));
     }

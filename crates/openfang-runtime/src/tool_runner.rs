@@ -662,6 +662,7 @@ pub async fn execute_tool(
         // Shared memory tools
         "memory_store" => tool_memory_store(input, kernel),
         "memory_recall" => tool_memory_recall(input, kernel),
+        "memory_list" => tool_memory_list(input, kernel),
 
         // Collaboration tools
         "agent_find" => tool_agent_find(input, kernel),
@@ -1140,6 +1141,18 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     "key": { "type": "string", "description": "The storage key to recall" }
                 },
                 "required": ["key"]
+            }),
+        },
+        tool_definition! {
+            name: "memory_list".to_string(),
+            description: "List shared memory entries, optionally filtered by key prefix. Use when you need to discover available memory keys before recalling a specific one.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "prefix": { "type": "string", "description": "Optional key prefix to filter by (for example `project.alpha.` or `pref.`)" },
+                    "limit": { "type": "integer", "description": "Maximum number of entries to return (default 20, max 100)" },
+                    "include_values": { "type": "boolean", "description": "Whether to include stored values in the result (default true)" }
+                }
             }),
         },
         // --- Collaboration tools ---
@@ -2188,6 +2201,47 @@ fn tool_memory_recall(
         Some(val) => Ok(serde_json::to_string_pretty(&val).unwrap_or_else(|_| val.to_string())),
         None => Ok(format!("No value found for key '{key}'.")),
     }
+}
+
+fn tool_memory_list(
+    input: &serde_json::Value,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+) -> Result<String, String> {
+    let kh = require_kernel(kernel)?;
+    let prefix = input
+        .get("prefix")
+        .or_else(|| input.get("query"))
+        .and_then(|v| v.as_str());
+    let limit = input
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|v| v.min(100) as usize)
+        .or(Some(20));
+    let include_values = input
+        .get("include_values")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    let entries = kh.memory_list(prefix, limit)?;
+    if entries.is_empty() {
+        return Ok(match prefix {
+            Some(prefix) => format!("No memory entries found with prefix '{prefix}'."),
+            None => "No memory entries found.".to_string(),
+        });
+    }
+
+    let rows: Vec<serde_json::Value> = entries
+        .into_iter()
+        .map(|(key, value)| {
+            if include_values {
+                serde_json::json!({ "key": key, "value": value })
+            } else {
+                serde_json::json!({ "key": key })
+            }
+        })
+        .collect();
+
+    serde_json::to_string_pretty(&rows).map_err(|e| format!("Failed to serialize memory list: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -3732,8 +3786,8 @@ input_schema = { type = "object", properties = { issue = { type = "string" } } }
     fn test_builtin_tool_definitions() {
         let tools = builtin_tool_definitions();
         assert!(
-            tools.len() >= 39,
-            "Expected at least 39 tools, got {}",
+            tools.len() >= 40,
+            "Expected at least 40 tools, got {}",
             tools.len()
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
@@ -3746,6 +3800,7 @@ input_schema = { type = "object", properties = { issue = { type = "string" } } }
         assert!(names.contains(&"agent_kill"));
         assert!(names.contains(&"memory_store"));
         assert!(names.contains(&"memory_recall"));
+        assert!(names.contains(&"memory_list"));
         // 6 collaboration tools
         assert!(names.contains(&"agent_find"));
         assert!(names.contains(&"task_post"));

@@ -3928,7 +3928,7 @@ mod tests {
         assert_eq!(map_tool_name("write_file"), Some("file_write"));
         assert_eq!(map_tool_name("execute_command"), Some("shell_exec"));
         assert_eq!(map_tool_name("fetch_url"), Some("web_fetch"));
-        assert_eq!(map_tool_name("memory_search"), Some("memory_recall"));
+        assert_eq!(map_tool_name("memory_search"), Some("memory_list"));
         assert_eq!(map_tool_name("unknown_tool"), None);
         // New Claude-style mappings
         assert_eq!(map_tool_name("Read"), Some("file_read"));
