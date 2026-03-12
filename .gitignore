@@ -16,7 +16,7 @@
 *.sqlite3
 
 # User config (may contain API keys)
-config.toml
+/config.toml
 
 # Certificates & keys
 *.pem
