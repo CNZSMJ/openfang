@@ -2,7 +2,7 @@
 
 use crate::agent::AgentId;
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -272,6 +272,24 @@ pub struct MemoryRecordMetadata {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Derived lifecycle state for a governed memory record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryLifecycleState {
+    Active,
+    Stale,
+    Expired,
+}
+
+/// Computed lifecycle snapshot used by API/tool responses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryLifecycleSnapshot {
+    pub state: MemoryLifecycleState,
+    pub review_at: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub promotion_candidate: bool,
+}
+
 fn is_valid_memory_meta_token(token: &str) -> bool {
     !token.is_empty()
         && token
@@ -374,6 +392,52 @@ pub fn collect_memory_metadata(
         out.insert(primary_key, metadata);
     }
     out
+}
+
+fn lifecycle_review_window(freshness: &MemoryFreshness) -> Duration {
+    match freshness {
+        MemoryFreshness::Rolling => Duration::days(7),
+        MemoryFreshness::Durable => Duration::days(30),
+        MemoryFreshness::Archival => Duration::days(180),
+    }
+}
+
+fn lifecycle_expiry_window(freshness: &MemoryFreshness) -> Option<Duration> {
+    match freshness {
+        MemoryFreshness::Rolling => Some(Duration::days(30)),
+        MemoryFreshness::Durable | MemoryFreshness::Archival => None,
+    }
+}
+
+/// Determine whether a governed memory record should be considered for promotion into MEMORY.md.
+pub fn is_memory_promotion_candidate(metadata: &MemoryRecordMetadata) -> bool {
+    matches!(metadata.freshness, MemoryFreshness::Durable)
+        && matches!(
+            metadata.kind.as_str(),
+            "preference" | "decision" | "constraint" | "profile" | "project_state"
+        )
+}
+
+/// Compute lifecycle fields for a governed memory record.
+pub fn memory_lifecycle_snapshot(
+    metadata: &MemoryRecordMetadata,
+    now: DateTime<Utc>,
+) -> MemoryLifecycleSnapshot {
+    let review_at = metadata.updated_at + lifecycle_review_window(&metadata.freshness);
+    let expires_at = lifecycle_expiry_window(&metadata.freshness)
+        .map(|duration| metadata.updated_at + duration);
+    let state = match expires_at {
+        Some(expires_at) if now >= expires_at => MemoryLifecycleState::Expired,
+        _ if now >= review_at => MemoryLifecycleState::Stale,
+        _ => MemoryLifecycleState::Active,
+    };
+
+    MemoryLifecycleSnapshot {
+        state,
+        review_at,
+        expires_at,
+        promotion_candidate: is_memory_promotion_candidate(metadata),
+    }
 }
 
 /// An entity in the knowledge graph.
@@ -718,5 +782,43 @@ mod tests {
 
         let collected = collect_memory_metadata(&entries);
         assert_eq!(collected["general.user_name"].kind, "fact");
+    }
+
+    #[test]
+    fn test_memory_lifecycle_snapshot_marks_rolling_records_expired() {
+        let metadata = MemoryRecordMetadata {
+            schema_version: MEMORY_METADATA_SCHEMA_VERSION,
+            key: "general.user_name".to_string(),
+            namespace: "general".to_string(),
+            kind: "fact".to_string(),
+            tags: vec![],
+            freshness: MemoryFreshness::Rolling,
+            source: "memory_store_tool".to_string(),
+            updated_at: Utc::now() - Duration::days(45),
+        };
+
+        let snapshot = memory_lifecycle_snapshot(&metadata, Utc::now());
+        assert_eq!(snapshot.state, MemoryLifecycleState::Expired);
+        assert!(snapshot.expires_at.is_some());
+        assert!(!snapshot.promotion_candidate);
+    }
+
+    #[test]
+    fn test_memory_lifecycle_snapshot_marks_durable_records_as_promotion_candidates() {
+        let metadata = MemoryRecordMetadata {
+            schema_version: MEMORY_METADATA_SCHEMA_VERSION,
+            key: "general.user_name".to_string(),
+            namespace: "general".to_string(),
+            kind: "preference".to_string(),
+            tags: vec!["profile".to_string()],
+            freshness: MemoryFreshness::Durable,
+            source: "memory_store_tool".to_string(),
+            updated_at: Utc::now(),
+        };
+
+        let snapshot = memory_lifecycle_snapshot(&metadata, Utc::now());
+        assert_eq!(snapshot.state, MemoryLifecycleState::Active);
+        assert!(snapshot.expires_at.is_none());
+        assert!(snapshot.promotion_candidate);
     }
 }

@@ -243,6 +243,9 @@ impl SetupWizard {
             hints.push(
                 "- Use memory_store/memory_recall for exact memory access, and memory_list when you need to discover keys first. Prefer namespaced memory keys like `project.alpha.decision`, and add `kind`/`tags`/`freshness` when storing durable memory.",
             );
+            hints.push(
+                "- Inspect lifecycle hints from memory_list (`lifecycle_state`, `review_at`, `expires_at`, `promotion_candidate`) before reusing or promoting old memory into MEMORY.md.",
+            );
         }
 
         if hints.is_empty() {

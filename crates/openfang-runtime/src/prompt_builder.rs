@@ -371,6 +371,7 @@ pub fn build_memory_section(memories: &[(String, String)]) -> String {
          - Use memory_store for durable preferences, decisions, and continuity points. Prefer namespaced keys like `project.alpha.decision` or `pref.editor.theme`.\n\
          - When storing memory, include governance metadata when useful: `kind`, `tags`, `freshness`, and `conflict_policy`.\n\
          - Bare memory keys are normalized into the `general.` namespace; reserve internal keys such as `session_*` for system-managed state.\n\
+         - Use memory_list lifecycle fields (`lifecycle_state`, `review_at`, `expires_at`, `promotion_candidate`) when deciding whether a memory is stale or should graduate into `MEMORY.md`.\n\
          - Treat injected memory context as historical guidance, not as a replacement for checking current state.",
     );
     if !memories.is_empty() {
@@ -1143,7 +1144,7 @@ mod tests {
         let section = build_memory_section(&memories);
         // Should be capped at 500 + "..."
         assert!(section.contains("..."));
-        assert!(section.len() < 1400);
+        assert!(section.len() < 1600);
     }
 
     #[test]

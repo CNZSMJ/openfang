@@ -10,8 +10,9 @@ use openfang_skills::registry::SkillRegistry;
 use openfang_types::memory::{
     build_memory_record_metadata, canonicalize_memory_namespace, canonicalize_user_memory_key,
     collect_memory_metadata, is_internal_memory_key, is_memory_metadata_key,
-    memory_key_matches_prefix, memory_key_namespace, memory_lookup_candidates,
-    memory_metadata_key, MemoryConflictPolicy, MemoryFreshness,
+    memory_key_matches_prefix, memory_key_namespace, memory_lifecycle_snapshot,
+    memory_lookup_candidates, memory_metadata_key, MemoryConflictPolicy, MemoryFreshness,
+    MemoryLifecycleState,
 };
 use openfang_types::taint::{TaintLabel, TaintSink, TaintedValue};
 use openfang_types::tool::{ToolDefinition, ToolResult};
@@ -1163,6 +1164,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "properties": {
                     "namespace": { "type": "string", "description": "Optional namespace to restrict results, for example `project` or `pref`." },
                     "prefix": { "type": "string", "description": "Optional key prefix to filter by (for example `project.alpha.` or `pref.`)" },
+                    "lifecycle": { "type": "string", "enum": ["active", "stale", "expired"], "description": "Optional lifecycle state filter for governed records." },
                     "limit": { "type": "integer", "description": "Maximum number of entries to return (default 20, max 100)" },
                     "include_values": { "type": "boolean", "description": "Whether to include stored values in the result (default true)" },
                     "include_internal": { "type": "boolean", "description": "Whether to include internal OpenFang keys such as session summaries and scheduler state (default false)." }
@@ -2350,6 +2352,12 @@ fn tool_memory_list(
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|v| !v.is_empty());
+    let lifecycle: Option<MemoryLifecycleState> = input
+        .get("lifecycle")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|e| format!("Invalid 'lifecycle' parameter: {e}"))?;
     let limit = input
         .get("limit")
         .and_then(|v| v.as_u64())
@@ -2385,6 +2393,14 @@ fn tool_memory_list(
                 continue;
             }
         }
+        let lifecycle_snapshot = metadata_map
+            .get(&key)
+            .map(|metadata| memory_lifecycle_snapshot(metadata, chrono::Utc::now()));
+        if let Some(lifecycle) = lifecycle {
+            if lifecycle_snapshot.as_ref().map(|s| s.state) != Some(lifecycle) {
+                continue;
+            }
+        }
         filtered.push((key, value));
     }
 
@@ -2411,6 +2427,7 @@ fn tool_memory_list(
             let namespace = memory_key_namespace(&key);
             let internal = is_internal_memory_key(&key);
             let metadata = metadata_map.get(&key);
+            let lifecycle = metadata.map(|m| memory_lifecycle_snapshot(m, chrono::Utc::now()));
             if include_values {
                 serde_json::json!({
                     "key": key,
@@ -2422,6 +2439,10 @@ fn tool_memory_list(
                     "freshness": metadata.as_ref().map(|m| m.freshness.clone()),
                     "source": metadata.as_ref().map(|m| m.source.clone()),
                     "updated_at": metadata.as_ref().map(|m| m.updated_at.to_rfc3339()),
+                    "lifecycle_state": lifecycle.as_ref().map(|snapshot| snapshot.state),
+                    "review_at": lifecycle.as_ref().map(|snapshot| snapshot.review_at.to_rfc3339()),
+                    "expires_at": lifecycle.as_ref().and_then(|snapshot| snapshot.expires_at.map(|ts| ts.to_rfc3339())),
+                    "promotion_candidate": lifecycle.as_ref().map(|snapshot| snapshot.promotion_candidate).unwrap_or(false),
                     "value": value
                 })
             } else {
@@ -2434,7 +2455,11 @@ fn tool_memory_list(
                     "tags": metadata.as_ref().map(|m| m.tags.clone()).unwrap_or_default(),
                     "freshness": metadata.as_ref().map(|m| m.freshness.clone()),
                     "source": metadata.as_ref().map(|m| m.source.clone()),
-                    "updated_at": metadata.as_ref().map(|m| m.updated_at.to_rfc3339())
+                    "updated_at": metadata.as_ref().map(|m| m.updated_at.to_rfc3339()),
+                    "lifecycle_state": lifecycle.as_ref().map(|snapshot| snapshot.state),
+                    "review_at": lifecycle.as_ref().map(|snapshot| snapshot.review_at.to_rfc3339()),
+                    "expires_at": lifecycle.as_ref().and_then(|snapshot| snapshot.expires_at.map(|ts| ts.to_rfc3339())),
+                    "promotion_candidate": lifecycle.as_ref().map(|snapshot| snapshot.promotion_candidate).unwrap_or(false)
                 })
             }
         })

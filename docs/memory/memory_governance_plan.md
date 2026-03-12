@@ -2,7 +2,7 @@
 
 ## 1. 文档定位
 
-本文档描述的是从 `custom/0.1.0` 基线切出 `memory-governance` 阶段后，第一批实际落地的治理规则与后续推进顺序。
+本文档描述的是从 `custom/0.1.0` 基线切出 `memory-governance` 阶段后，当前已经落地的治理规则与后续推进顺序。
 
 它聚焦的是共享 KV memory 的治理边界，不覆盖 embedding / hybrid retrieval，也不尝试一次性解决完整 prompt attention architecture。
 
@@ -75,12 +75,39 @@
   - `include_internal`
   - `limit`
 
+### 3.7 Lifecycle 快照与晋升候选
+
+- governed 记录现在会基于 metadata 计算 lifecycle snapshot，不改底层 `kv_store` 结构，也不额外持久化一份 lifecycle 状态。
+- 当前窗口规则为：
+  - `freshness=rolling`
+    - `review_at = updated_at + 7 days`
+    - `expires_at = updated_at + 30 days`
+  - `freshness=durable`
+    - `review_at = updated_at + 30 days`
+    - `expires_at = null`
+  - `freshness=archival`
+    - `review_at = updated_at + 180 days`
+    - `expires_at = null`
+- lifecycle state 由读取时刻动态计算：
+  - 到达 `review_at` 之前为 `active`
+  - 到达 `review_at` 之后、且未到 `expires_at` 时为 `stale`
+  - 到达 `expires_at` 之后为 `expired`
+- 当前晋升到 agent workspace `MEMORY.md` 的候选标准只做“可观测提示”，不做自动写入：
+  - `freshness=durable`
+  - `kind` 属于 `preference` / `decision` / `constraint` / `profile` / `project_state`
+- `memory_list` tool 与 `/api/memory/agents/:id/kv` 现在都支持 `lifecycle=active|stale|expired` 过滤，并在响应中返回：
+  - `lifecycle_state`
+  - `review_at`
+  - `expires_at`
+  - `promotion_candidate`
+- 单条读取 `/api/memory/agents/:id/kv/:key` 也会返回同样的 lifecycle 字段，方便 UI 或后续 retrieval 直接消费。
+
 ## 4. 当前不做的事情
 
-本阶段第一批实现明确不做：
+本阶段当前实现明确不做：
 
 1. 不改 `kv_store` 表结构。
-2. 不引入 TTL、垃圾回收或自动清理仲裁。
+2. 不引入自动 TTL 删除、垃圾回收或后台清理仲裁。
 3. 不引入 tag 索引或 semantic / hybrid retrieval。
 4. 不把治理规则继续散落到 prompt runtime 之外的多套实现中。
 5. 不做一次性全量 legacy bare key 迁移。
@@ -92,20 +119,20 @@
 - `crates/openfang-runtime/src/tool_runner.rs`
   - tool 输入规范化
   - metadata sidecar 写入
-  - `memory_list` 默认隐藏内部 key，并返回 governed 字段
+  - `memory_list` 默认隐藏内部 key，并返回 governed + lifecycle 字段
 - `crates/openfang-runtime/src/prompt_builder.rs`
-  - prompt 协议补充 namespaced key 约束
+  - prompt 协议补充 namespaced key 约束和 lifecycle 使用提示
 - `crates/openfang-kernel/src/wizard.rs`
-  - setup hint 补充 namespaced key 指导
+  - setup hint 补充 namespaced key 与 lifecycle 指导
 - `crates/openfang-api/src/routes.rs`
   - memory API 对齐治理规则
-  - API 列表过滤与 governed metadata 折叠
+  - API 列表过滤、governed metadata 折叠与 lifecycle 返回
 
 ## 6. 下一步建议
 
 在当前切口稳定后，下一步按以下顺序推进：
 
-1. 引入 lifecycle 策略：过期、降级、晋升到 `MEMORY.md` 的标准。
-2. 评估是否增加显式 cleanup / migrate 工具，消化 legacy bare key 和陈旧 governed 记录。
-3. 为 `memory_list` 增加更强的 tag 过滤能力。
-4. 给后续 embedding / hybrid retrieval 预留对 `kind` / `tags` / `freshness` 的消费接口。
+1. 评估是否增加显式 cleanup / migrate 工具，消化 legacy bare key 和陈旧 governed 记录。
+2. 为 `memory_list` 增加更强的 tag 过滤能力。
+3. 给后续 embedding / hybrid retrieval 预留对 `kind` / `tags` / `freshness` / `lifecycle_state` 的消费接口。
+4. 决定 lifecycle snapshot 是否需要被 dashboard 或后续 prompt orchestration 直接消费，而不仅仅停留在 API/tool 可见层。

@@ -2788,6 +2788,7 @@ pub async fn get_template(Path(name): Path<String>) -> impl IntoResponse {
 pub struct MemoryListQuery {
     pub namespace: Option<String>,
     pub prefix: Option<String>,
+    pub lifecycle: Option<openfang_types::memory::MemoryLifecycleState>,
     pub limit: Option<usize>,
     pub include_internal: Option<bool>,
 }
@@ -2824,6 +2825,7 @@ pub async fn get_agent_kv(
             );
         }
     }
+    let lifecycle = query.lifecycle;
     let limit = query.limit.map(|v| v.min(100)).unwrap_or(100);
 
     match state.kernel.memory.list_kv(agent_id) {
@@ -2852,8 +2854,28 @@ pub async fn get_agent_kv(
                         })
                         .unwrap_or(true)
                 })
+                .filter(|(k, _)| {
+                    lifecycle
+                        .map(|state| {
+                            metadata_map
+                                .get(k)
+                                .map(|metadata| {
+                                    openfang_types::memory::memory_lifecycle_snapshot(
+                                        metadata,
+                                        chrono::Utc::now(),
+                                    )
+                                    .state
+                                        == state
+                                })
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(true)
+                })
                 .map(|(k, v)| {
                     let metadata = metadata_map.get(&k);
+                    let lifecycle = metadata.map(|m| {
+                        openfang_types::memory::memory_lifecycle_snapshot(m, chrono::Utc::now())
+                    });
                     serde_json::json!({
                         "key": k,
                         "namespace": openfang_types::memory::memory_key_namespace(&k),
@@ -2864,6 +2886,10 @@ pub async fn get_agent_kv(
                         "freshness": metadata.as_ref().map(|m| m.freshness.clone()),
                         "source": metadata.as_ref().map(|m| m.source.clone()),
                         "updated_at": metadata.as_ref().map(|m| m.updated_at.to_rfc3339()),
+                        "lifecycle_state": lifecycle.as_ref().map(|snapshot| snapshot.state),
+                        "review_at": lifecycle.as_ref().map(|snapshot| snapshot.review_at.to_rfc3339()),
+                        "expires_at": lifecycle.as_ref().and_then(|snapshot| snapshot.expires_at.map(|ts| ts.to_rfc3339())),
+                        "promotion_candidate": lifecycle.as_ref().map(|snapshot| snapshot.promotion_candidate).unwrap_or(false),
                         "value": v
                     })
                 })
@@ -2909,6 +2935,9 @@ pub async fn get_agent_kv_key(
                         serde_json::from_value::<openfang_types::memory::MemoryRecordMetadata>(value)
                             .ok()
                     });
+                let lifecycle = metadata
+                    .as_ref()
+                    .map(|metadata| openfang_types::memory::memory_lifecycle_snapshot(metadata, chrono::Utc::now()));
                 return (
                     StatusCode::OK,
                     Json(serde_json::json!({
@@ -2922,6 +2951,10 @@ pub async fn get_agent_kv_key(
                         "freshness": metadata.as_ref().map(|m| m.freshness.clone()),
                         "source": metadata.as_ref().map(|m| m.source.clone()),
                         "updated_at": metadata.as_ref().map(|m| m.updated_at.to_rfc3339()),
+                        "lifecycle_state": lifecycle.as_ref().map(|snapshot| snapshot.state),
+                        "review_at": lifecycle.as_ref().map(|snapshot| snapshot.review_at.to_rfc3339()),
+                        "expires_at": lifecycle.as_ref().and_then(|snapshot| snapshot.expires_at.map(|ts| ts.to_rfc3339())),
+                        "promotion_candidate": lifecycle.as_ref().map(|snapshot| snapshot.promotion_candidate).unwrap_or(false),
                         "value": val
                     })),
                 );
