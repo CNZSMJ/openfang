@@ -35,10 +35,20 @@ pub struct MarketplaceClient {
 impl MarketplaceClient {
     /// Create a new marketplace client.
     pub fn new(config: MarketplaceConfig) -> Self {
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+            if let Ok(auth_value) =
+                reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token))
+            {
+                headers.insert(reqwest::header::AUTHORIZATION, auth_value);
+            }
+        }
+
         Self {
             config,
             http: reqwest::Client::builder()
                 .user_agent("openfang-skills/0.1")
+                .default_headers(headers)
                 .build()
                 .expect("Failed to build HTTP client"),
         }
