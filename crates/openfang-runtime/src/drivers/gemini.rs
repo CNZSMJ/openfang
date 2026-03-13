@@ -16,9 +16,6 @@ use openfang_types::message::{
 };
 use openfang_types::tool::ToolCall;
 use serde::{Deserialize, Serialize};
-use std::fs::OpenOptions;
-use std::io::Write;
-use std::path::Path;
 use tracing::{debug, warn};
 use zeroize::Zeroizing;
 
@@ -229,8 +226,6 @@ fn parse_gemini_error(body: &str) -> String {
     body.to_string()
 }
 
-const GEMINI_DEBUG_LOG_MAX_CHARS: usize = 200_000;
-
 fn split_next_sse_event(buffer: &mut String) -> Option<String> {
     let lf_pos = buffer.find("\n\n");
     let crlf_pos = buffer.find("\r\n\r\n");
@@ -250,58 +245,6 @@ fn split_next_sse_event(buffer: &mut String) -> Option<String> {
     let event_text = buffer[..pos].to_string();
     *buffer = buffer[pos + delimiter_len..].to_string();
     Some(event_text)
-}
-
-fn log_gemini_debug(workspace_root: Option<&Path>, event_type: &str, model: &str, content: &str) {
-    let Some(root) = workspace_root else { return };
-    let log_dir = root.join("logs");
-    if let Err(e) = std::fs::create_dir_all(&log_dir) {
-        warn!("Failed to create Gemini debug log directory: {e}");
-        return;
-    }
-
-    let log_path = log_dir.join("gemini-driver.log");
-    let mut file = match OpenOptions::new().create(true).append(true).open(&log_path) {
-        Ok(file) => file,
-        Err(e) => {
-            warn!("Failed to open gemini-driver.log for writing: {e}");
-            return;
-        }
-    };
-
-    let timestamp = chrono::Local::now().to_rfc3339();
-    let separator = "=".repeat(80);
-    let sub_separator = "-".repeat(80);
-    let (display_content, truncated) = if content.chars().count() > GEMINI_DEBUG_LOG_MAX_CHARS {
-        (
-            content
-                .chars()
-                .take(GEMINI_DEBUG_LOG_MAX_CHARS)
-                .collect::<String>(),
-            true,
-        )
-    } else {
-        (content.to_string(), false)
-    };
-
-    if let Err(e) = write!(
-        file,
-        "\n{}\n[{}] {} (Model: {})\n{}\n{}",
-        separator, timestamp, event_type, model, sub_separator, display_content
-    ) {
-        warn!("Failed to write to gemini-driver.log: {e}");
-        return;
-    }
-
-    if truncated {
-        let _ = write!(
-            file,
-            "\n[... CONTENT TRUNCATED AT {} CHARS ...]",
-            GEMINI_DEBUG_LOG_MAX_CHARS
-        );
-    }
-
-    let _ = write!(file, "\n{}\n", separator);
 }
 
 // ── Message conversion ─────────────────────────────────────────────────
@@ -517,7 +460,6 @@ fn convert_response(resp: GeminiResponse) -> Result<CompletionResponse, LlmError
 #[async_trait]
 impl LlmDriver for GeminiDriver {
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
-        let workspace_root = request.workspace_root.as_deref();
         let (contents, system_instruction) = convert_messages(&request.messages, &request.system);
         let tools = convert_tools(&request);
 
@@ -530,8 +472,6 @@ impl LlmDriver for GeminiDriver {
                 max_output_tokens: Some(request.max_tokens),
             }),
         };
-        let request_json = serde_json::to_string_pretty(&gemini_request)
-            .unwrap_or_else(|e| format!("<<failed to serialize Gemini request: {e}>>"));
 
         let max_retries = 3;
         for attempt in 0..=max_retries {
@@ -540,14 +480,8 @@ impl LlmDriver for GeminiDriver {
                 self.base_url, request.model, self.api_key.as_str()
             );
             debug!(url = %url, attempt, "Sending Gemini API request");
-            log_gemini_debug(
-                workspace_root,
-                "REQUEST",
-                &request.model,
-                &format!("Attempt: {attempt}\nEndpoint: generateContent\n{request_json}"),
-            );
 
-            let resp = match self
+            let resp = self
                 .client
                 .post(&url)
                 .header("x-goog-api-key", self.api_key.as_str())
@@ -555,18 +489,7 @@ impl LlmDriver for GeminiDriver {
                 .json(&gemini_request)
                 .send()
                 .await
-            {
-                Ok(resp) => resp,
-                Err(e) => {
-                    log_gemini_debug(
-                        workspace_root,
-                        "HTTP_ERROR",
-                        &request.model,
-                        &format!("Attempt: {attempt}\nEndpoint: generateContent\nError: {e}"),
-                    );
-                    return Err(LlmError::Http(e.to_string()));
-                }
-            };
+                .map_err(|e| LlmError::Http(e.to_string()))?;
 
             let status = resp.status().as_u16();
             let is_success = resp.status().is_success();
@@ -574,12 +497,6 @@ impl LlmDriver for GeminiDriver {
                 .text()
                 .await
                 .map_err(|e| LlmError::Http(e.to_string()))?;
-            log_gemini_debug(
-                workspace_root,
-                "RESPONSE",
-                &request.model,
-                &format!("Attempt: {attempt}\nEndpoint: generateContent\nHTTP Status: {status}\n{body}"),
-            );
 
             if status == 429 || status == 503 {
                 if attempt < max_retries {
@@ -610,25 +527,10 @@ impl LlmDriver for GeminiDriver {
                 return Err(LlmError::Api { status, message });
             }
 
-            let gemini_response: GeminiResponse = serde_json::from_str(&body).map_err(|e| {
-                log_gemini_debug(
-                    workspace_root,
-                    "PARSE_ERROR",
-                    &request.model,
-                    &format!("Endpoint: generateContent\nError: {e}\nBody:\n{body}"),
-                );
-                LlmError::Parse(e.to_string())
-            })?;
+            let gemini_response: GeminiResponse =
+                serde_json::from_str(&body).map_err(|e| LlmError::Parse(e.to_string()))?;
 
-            return convert_response(gemini_response).map_err(|e| {
-                log_gemini_debug(
-                    workspace_root,
-                    "CONVERT_ERROR",
-                    &request.model,
-                    &format!("Endpoint: generateContent\nError: {e}\nBody:\n{body}"),
-                );
-                e
-            });
+            return convert_response(gemini_response);
         }
 
         Err(LlmError::Api {
@@ -642,7 +544,6 @@ impl LlmDriver for GeminiDriver {
         request: CompletionRequest,
         tx: tokio::sync::mpsc::Sender<StreamEvent>,
     ) -> Result<CompletionResponse, LlmError> {
-        let workspace_root = request.workspace_root.as_deref();
         let (contents, system_instruction) = convert_messages(&request.messages, &request.system);
         let tools = convert_tools(&request);
 
@@ -655,8 +556,6 @@ impl LlmDriver for GeminiDriver {
                 max_output_tokens: Some(request.max_tokens),
             }),
         };
-        let request_json = serde_json::to_string_pretty(&gemini_request)
-            .unwrap_or_else(|e| format!("<<failed to serialize Gemini request: {e}>>"));
 
         let max_retries = 3;
         for attempt in 0..=max_retries {
@@ -665,14 +564,8 @@ impl LlmDriver for GeminiDriver {
                 self.base_url, request.model, self.api_key.as_str()
             );
             debug!(url = %url, attempt, "Sending Gemini streaming request");
-            log_gemini_debug(
-                workspace_root,
-                "STREAM_REQUEST",
-                &request.model,
-                &format!("Attempt: {attempt}\nEndpoint: streamGenerateContent\n{request_json}"),
-            );
 
-            let resp = match self
+            let resp = self
                 .client
                 .post(&url)
                 .header("x-goog-api-key", self.api_key.as_str())
@@ -680,20 +573,7 @@ impl LlmDriver for GeminiDriver {
                 .json(&gemini_request)
                 .send()
                 .await
-            {
-                Ok(resp) => resp,
-                Err(e) => {
-                    log_gemini_debug(
-                        workspace_root,
-                        "STREAM_HTTP_ERROR",
-                        &request.model,
-                        &format!(
-                            "Attempt: {attempt}\nEndpoint: streamGenerateContent\nError: {e}"
-                        ),
-                    );
-                    return Err(LlmError::Http(e.to_string()));
-                }
-            };
+                .map_err(|e| LlmError::Http(e.to_string()))?;
 
             let status = resp.status().as_u16();
 
@@ -720,14 +600,6 @@ impl LlmDriver for GeminiDriver {
 
             if !resp.status().is_success() {
                 let body = resp.text().await.unwrap_or_default();
-                log_gemini_debug(
-                    workspace_root,
-                    "STREAM_RESPONSE",
-                    &request.model,
-                    &format!(
-                        "Attempt: {attempt}\nEndpoint: streamGenerateContent\nHTTP Status: {status}\n{body}"
-                    ),
-                );
                 let message = parse_gemini_error(&body);
                 if status == 401 || status == 403 {
                     return Err(LlmError::AuthenticationFailed(message));
@@ -741,34 +613,17 @@ impl LlmDriver for GeminiDriver {
             // Parse SSE stream
             let mut buffer = String::new();
             let mut text_content = String::new();
-            // Track function calls: (name, args_json)
             let mut fn_calls: Vec<(String, serde_json::Value, Option<String>)> = Vec::new();
             let mut finish_reason: Option<String> = None;
             let mut usage = TokenUsage::default();
-            let mut raw_sse = format!(
-                "Attempt: {attempt}\nEndpoint: streamGenerateContent\nHTTP Status: {status}\n"
-            );
 
             let mut byte_stream = resp.bytes_stream();
             while let Some(chunk_result) = byte_stream.next().await {
-                let chunk = chunk_result.map_err(|e| {
-                    log_gemini_debug(
-                        workspace_root,
-                        "STREAM_HTTP_ERROR",
-                        &request.model,
-                        &format!(
-                            "Attempt: {attempt}\nEndpoint: streamGenerateContent\nError while reading SSE chunk: {e}\nPartial stream:\n{raw_sse}"
-                        ),
-                    );
-                    LlmError::Http(e.to_string())
-                })?;
-                let chunk_text = String::from_utf8_lossy(&chunk);
-                buffer.push_str(&chunk_text);
-                raw_sse.push_str(&chunk_text);
+                let chunk = chunk_result.map_err(|e| LlmError::Http(e.to_string()))?;
+                buffer.push_str(&String::from_utf8_lossy(&chunk));
 
                 // Process complete SSE events (delimited by \n\n or \r\n\r\n)
                 while let Some(event_text) = split_next_sse_event(&mut buffer) {
-
                     // Extract the data line (handle both "data: " and "data:" formats)
                     let data = event_text
                         .lines()
@@ -781,17 +636,7 @@ impl LlmDriver for GeminiDriver {
 
                     let json: GeminiResponse = match serde_json::from_str(data) {
                         Ok(v) => v,
-                        Err(e) => {
-                            log_gemini_debug(
-                                workspace_root,
-                                "STREAM_PARSE_ERROR",
-                                &request.model,
-                                &format!(
-                                    "Attempt: {attempt}\nEndpoint: streamGenerateContent\nError: {e}\nEvent data:\n{data}\nRaw stream so far:\n{raw_sse}"
-                                ),
-                            );
-                            continue;
-                        }
+                        Err(_) => continue,
                     };
 
                     // Extract usage from each chunk (last one wins)
@@ -847,8 +692,6 @@ impl LlmDriver for GeminiDriver {
                     }
                 }
             }
-
-            log_gemini_debug(workspace_root, "STREAM_RESPONSE", &request.model, &raw_sse);
 
             // Build final response
             let mut content = Vec::new();
@@ -1088,7 +931,6 @@ mod tests {
             temperature: 0.7,
             system: None,
             thinking: None,
-            workspace_root: None,
         };
 
         let tools = convert_tools(&request);
@@ -1107,7 +949,6 @@ mod tests {
             temperature: 0.7,
             system: None,
             thinking: None,
-            workspace_root: None,
         };
 
         let tools = convert_tools(&request);

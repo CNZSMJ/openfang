@@ -492,7 +492,6 @@ pub async fn run_agent_loop_with_session_message(
             temperature: manifest.model.temperature,
             system: Some(system_prompt.clone()),
             thinking: None,
-            workspace_root: workspace_root.map(std::path::Path::to_path_buf),
         };
 
         // Log LLM Input
@@ -1443,7 +1442,6 @@ pub async fn run_agent_loop_streaming(
             temperature: manifest.model.temperature,
             system: Some(system_prompt.clone()),
             thinking: None,
-            workspace_root: workspace_root.map(std::path::Path::to_path_buf),
         };
 
         // Log LLM Input (streaming)

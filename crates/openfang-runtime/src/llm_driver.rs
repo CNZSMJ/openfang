@@ -6,7 +6,6 @@ use async_trait::async_trait;
 use openfang_types::message::{ContentBlock, Message, StopReason, TokenUsage};
 use openfang_types::tool::{ToolCall, ToolDefinition};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 use thiserror::Error;
 
 /// Error type for LLM driver operations.
@@ -66,8 +65,6 @@ pub struct CompletionRequest {
     pub system: Option<String>,
     /// Extended thinking configuration (if supported by the model).
     pub thinking: Option<openfang_types::config::ThinkingConfig>,
-    /// Optional workspace root for provider-local debug logs.
-    pub workspace_root: Option<PathBuf>,
 }
 
 /// A response from an LLM completion.
@@ -281,7 +278,6 @@ mod tests {
             temperature: 0.0,
             system: None,
             thinking: None,
-            workspace_root: None,
         };
 
         let response = driver.stream(request, tx).await.unwrap();

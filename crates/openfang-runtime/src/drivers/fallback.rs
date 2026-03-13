@@ -160,7 +160,6 @@ mod tests {
             temperature: 0.0,
             system: None,
             thinking: None,
-            workspace_root: None,
         }
     }
 

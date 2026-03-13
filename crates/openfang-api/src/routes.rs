@@ -6953,7 +6953,6 @@ pub async fn test_provider(
                 temperature: 0.0,
                 system: None,
                 thinking: None,
-                workspace_root: None,
             };
             match driver.complete(test_req).await {
                 Ok(_) => {

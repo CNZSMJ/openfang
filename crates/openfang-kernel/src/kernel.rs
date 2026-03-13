@@ -2514,7 +2514,6 @@ impl OpenFangKernel {
                 temperature: manifest.model.temperature,
                 system: Some(manifest.model.system_prompt.clone()),
                 thinking: None,
-                workspace_root: None,
             };
             let (complexity, routed_model) = router.select_model(&probe);
             info!(
