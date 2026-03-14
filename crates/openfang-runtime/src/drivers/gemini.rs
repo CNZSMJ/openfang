@@ -62,23 +62,63 @@ struct GeminiContent {
 
 /// A part within a content entry.
 #[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(untagged)]
-enum GeminiPart {
-    Text {
-        text: String,
-    },
-    InlineData {
-        #[serde(rename = "inlineData")]
-        inline_data: GeminiInlineData,
-    },
-    FunctionCall {
-        #[serde(rename = "functionCall")]
-        function_call: GeminiFunctionCallData,
-    },
-    FunctionResponse {
-        #[serde(rename = "functionResponse")]
-        function_response: GeminiFunctionResponseData,
-    },
+struct GeminiPart {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    #[serde(rename = "inlineData", default, skip_serializing_if = "Option::is_none")]
+    inline_data: Option<GeminiInlineData>,
+    #[serde(rename = "functionCall", default, skip_serializing_if = "Option::is_none")]
+    function_call: Option<GeminiFunctionCallData>,
+    #[serde(
+        rename = "functionResponse",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    function_response: Option<GeminiFunctionResponseData>,
+    #[serde(rename = "thoughtSignature", default, skip_serializing_if = "Option::is_none")]
+    thought_signature: Option<String>,
+}
+
+impl GeminiPart {
+    fn text(text: String) -> Self {
+        Self {
+            text: Some(text),
+            inline_data: None,
+            function_call: None,
+            function_response: None,
+            thought_signature: None,
+        }
+    }
+
+    fn inline_data(inline_data: GeminiInlineData) -> Self {
+        Self {
+            text: None,
+            inline_data: Some(inline_data),
+            function_call: None,
+            function_response: None,
+            thought_signature: None,
+        }
+    }
+
+    fn function_call(function_call: GeminiFunctionCallData, thought_signature: Option<String>) -> Self {
+        Self {
+            text: None,
+            inline_data: None,
+            function_call: Some(function_call),
+            function_response: None,
+            thought_signature,
+        }
+    }
+
+    fn function_response(function_response: GeminiFunctionResponseData) -> Self {
+        Self {
+            text: None,
+            inline_data: None,
+            function_call: None,
+            function_response: Some(function_response),
+            thought_signature: None,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -92,9 +132,6 @@ struct GeminiInlineData {
 struct GeminiFunctionCallData {
     name: String,
     args: serde_json::Value,
-    /// Gemini 2.5+ thinking models return this on functionCall parts.
-    #[serde(rename = "thoughtSignature", default, skip_serializing_if = "Option::is_none")]
-    thought_signature: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -189,6 +226,27 @@ fn parse_gemini_error(body: &str) -> String {
     body.to_string()
 }
 
+fn split_next_sse_event(buffer: &mut String) -> Option<String> {
+    let lf_pos = buffer.find("\n\n");
+    let crlf_pos = buffer.find("\r\n\r\n");
+    let (pos, delimiter_len) = match (lf_pos, crlf_pos) {
+        (Some(lf), Some(crlf)) => {
+            if lf <= crlf {
+                (lf, 2)
+            } else {
+                (crlf, 4)
+            }
+        }
+        (Some(lf), None) => (lf, 2),
+        (None, Some(crlf)) => (crlf, 4),
+        (None, None) => return None,
+    };
+
+    let event_text = buffer[..pos].to_string();
+    *buffer = buffer[pos + delimiter_len..].to_string();
+    Some(event_text)
+}
+
 // ── Message conversion ─────────────────────────────────────────────────
 
 /// Convert OpenFang messages into Gemini content entries.
@@ -213,30 +271,33 @@ fn convert_messages(
         };
 
         let parts = match &msg.content {
-            MessageContent::Text(text) => vec![GeminiPart::Text { text: text.clone() }],
+            MessageContent::Text(text) => vec![GeminiPart::text(text.clone())],
             MessageContent::Blocks(blocks) => {
                 let mut parts = Vec::new();
                 for block in blocks {
                     match block {
                         ContentBlock::Text { text } => {
-                            parts.push(GeminiPart::Text { text: text.clone() });
+                            parts.push(GeminiPart::text(text.clone()));
                         }
-                        ContentBlock::ToolUse { name, input, .. } => {
-                            parts.push(GeminiPart::FunctionCall {
-                                function_call: GeminiFunctionCallData {
+                        ContentBlock::ToolUse {
+                            name,
+                            input,
+                            thought_signature,
+                            ..
+                        } => {
+                            parts.push(GeminiPart::function_call(
+                                GeminiFunctionCallData {
                                     name: name.clone(),
                                     args: input.clone(),
-                                    thought_signature: None,
                                 },
-                            });
+                                thought_signature.clone(),
+                            ));
                         }
                         ContentBlock::Image { media_type, data } => {
-                            parts.push(GeminiPart::InlineData {
-                                inline_data: GeminiInlineData {
+                            parts.push(GeminiPart::inline_data(GeminiInlineData {
                                     mime_type: media_type.clone(),
                                     data: data.clone(),
-                                },
-                            });
+                                }));
                         }
                         ContentBlock::ToolResult {
                             content, tool_name, ..
@@ -246,12 +307,12 @@ fn convert_messages(
                             } else {
                                 tool_name.clone()
                             };
-                            parts.push(GeminiPart::FunctionResponse {
-                                function_response: GeminiFunctionResponseData {
+                            parts.push(GeminiPart::function_response(
+                                GeminiFunctionResponseData {
                                     name: fn_name,
                                     response: serde_json::json!({ "result": content }),
                                 },
-                            });
+                            ));
                         }
                         ContentBlock::Thinking { .. } => {}
                         _ => {}
@@ -289,7 +350,7 @@ fn extract_system(messages: &[Message], system: &Option<String>) -> Option<Gemin
 
     Some(GeminiContent {
         role: None, // systemInstruction doesn't use a role
-        parts: vec![GeminiPart::Text { text }],
+        parts: vec![GeminiPart::text(text)],
     })
 }
 
@@ -333,28 +394,25 @@ fn convert_response(resp: GeminiResponse) -> Result<CompletionResponse, LlmError
     match candidate.content {
         Some(gemini_content) => {
             for part in gemini_content.parts {
-                match part {
-                    GeminiPart::Text { text } => {
-                        if !text.is_empty() {
-                            content.push(ContentBlock::Text { text });
-                        }
+                if let Some(text) = part.text {
+                    if !text.is_empty() {
+                        content.push(ContentBlock::Text { text });
                     }
-                    GeminiPart::FunctionCall { function_call } => {
-                        let id = format!("call_{}", uuid::Uuid::new_v4().simple());
-                        content.push(ContentBlock::ToolUse {
-                            id: id.clone(),
-                            name: function_call.name.clone(),
-                            input: function_call.args.clone(),
-                        });
-                        tool_calls.push(ToolCall {
-                            id,
-                            name: function_call.name,
-                            input: function_call.args,
-                        });
-                    }
-                    GeminiPart::InlineData { .. } | GeminiPart::FunctionResponse { .. } => {
-                        // Shouldn't normally appear in responses, ignore
-                    }
+                }
+                if let Some(function_call) = part.function_call {
+                    let id = format!("call_{}", uuid::Uuid::new_v4().simple());
+                    content.push(ContentBlock::ToolUse {
+                        id: id.clone(),
+                        name: function_call.name.clone(),
+                        input: function_call.args.clone(),
+                        thought_signature: part.thought_signature.clone(),
+                    });
+                    tool_calls.push(ToolCall {
+                        id,
+                        name: function_call.name,
+                        input: function_call.args,
+                        thought_signature: part.thought_signature,
+                    });
                 }
             }
         }
@@ -434,6 +492,11 @@ impl LlmDriver for GeminiDriver {
                 .map_err(|e| LlmError::Http(e.to_string()))?;
 
             let status = resp.status().as_u16();
+            let is_success = resp.status().is_success();
+            let body = resp
+                .text()
+                .await
+                .map_err(|e| LlmError::Http(e.to_string()))?;
 
             if status == 429 || status == 503 {
                 if attempt < max_retries {
@@ -453,8 +516,7 @@ impl LlmDriver for GeminiDriver {
                 });
             }
 
-            if !resp.status().is_success() {
-                let body = resp.text().await.unwrap_or_default();
+            if !is_success {
                 let message = parse_gemini_error(&body);
                 if status == 401 || status == 403 {
                     return Err(LlmError::AuthenticationFailed(message));
@@ -465,10 +527,6 @@ impl LlmDriver for GeminiDriver {
                 return Err(LlmError::Api { status, message });
             }
 
-            let body = resp
-                .text()
-                .await
-                .map_err(|e| LlmError::Http(e.to_string()))?;
             let gemini_response: GeminiResponse =
                 serde_json::from_str(&body).map_err(|e| LlmError::Parse(e.to_string()))?;
 
@@ -555,8 +613,7 @@ impl LlmDriver for GeminiDriver {
             // Parse SSE stream
             let mut buffer = String::new();
             let mut text_content = String::new();
-            // Track function calls: (name, args_json)
-            let mut fn_calls: Vec<(String, serde_json::Value)> = Vec::new();
+            let mut fn_calls: Vec<(String, serde_json::Value, Option<String>)> = Vec::new();
             let mut finish_reason: Option<String> = None;
             let mut usage = TokenUsage::default();
 
@@ -566,10 +623,7 @@ impl LlmDriver for GeminiDriver {
                 buffer.push_str(&String::from_utf8_lossy(&chunk));
 
                 // Process complete SSE events (delimited by \n\n or \r\n\r\n)
-                while let Some(pos) = buffer.find("\n\n") {
-                    let event_text = buffer[..pos].to_string();
-                    buffer = buffer[pos + 2..].to_string();
-
+                while let Some(event_text) = split_next_sse_event(&mut buffer) {
                     // Extract the data line (handle both "data: " and "data:" formats)
                     let data = event_text
                         .lines()
@@ -598,42 +652,40 @@ impl LlmDriver for GeminiDriver {
 
                         if let Some(ref content) = candidate.content {
                             for part in &content.parts {
-                                match part {
-                                    GeminiPart::Text { text } => {
-                                        if !text.is_empty() {
-                                            text_content.push_str(text);
-                                            let _ = tx
-                                                .send(StreamEvent::TextDelta { text: text.clone() })
-                                                .await;
-                                        }
+                                if let Some(text) = &part.text {
+                                    if !text.is_empty() {
+                                        text_content.push_str(text);
+                                        let _ = tx
+                                            .send(StreamEvent::TextDelta { text: text.clone() })
+                                            .await;
                                     }
-                                    GeminiPart::FunctionCall { function_call } => {
-                                        let id = format!("call_{}", uuid::Uuid::new_v4().simple());
-                                        let _ = tx
-                                            .send(StreamEvent::ToolUseStart {
-                                                id: id.clone(),
-                                                name: function_call.name.clone(),
-                                            })
-                                            .await;
-                                        let args_str = serde_json::to_string(&function_call.args)
-                                            .unwrap_or_default();
-                                        let _ = tx
-                                            .send(StreamEvent::ToolInputDelta { text: args_str })
-                                            .await;
-                                        let _ = tx
-                                            .send(StreamEvent::ToolUseEnd {
-                                                id,
-                                                name: function_call.name.clone(),
-                                                input: function_call.args.clone(),
-                                            })
-                                            .await;
-                                        fn_calls.push((
-                                            function_call.name.clone(),
-                                            function_call.args.clone(),
-                                        ));
-                                    }
-                                    GeminiPart::InlineData { .. }
-                                    | GeminiPart::FunctionResponse { .. } => {}
+                                }
+                                if let Some(function_call) = &part.function_call {
+                                    let id = format!("call_{}", uuid::Uuid::new_v4().simple());
+                                    let _ = tx
+                                        .send(StreamEvent::ToolUseStart {
+                                            id: id.clone(),
+                                            name: function_call.name.clone(),
+                                        })
+                                        .await;
+                                    let args_str =
+                                        serde_json::to_string(&function_call.args).unwrap_or_default();
+                                    let _ = tx
+                                        .send(StreamEvent::ToolInputDelta { text: args_str })
+                                        .await;
+                                    let _ = tx
+                                        .send(StreamEvent::ToolUseEnd {
+                                            id,
+                                            name: function_call.name.clone(),
+                                            input: function_call.args.clone(),
+                                            thought_signature: part.thought_signature.clone(),
+                                        })
+                                        .await;
+                                    fn_calls.push((
+                                        function_call.name.clone(),
+                                        function_call.args.clone(),
+                                        part.thought_signature.clone(),
+                                    ));
                                 }
                             }
                         }
@@ -649,17 +701,19 @@ impl LlmDriver for GeminiDriver {
                 content.push(ContentBlock::Text { text: text_content });
             }
 
-            for (name, args) in fn_calls {
+            for (name, args, thought_signature) in fn_calls {
                 let id = format!("call_{}", uuid::Uuid::new_v4().simple());
                 content.push(ContentBlock::ToolUse {
                     id: id.clone(),
                     name: name.clone(),
                     input: args.clone(),
+                    thought_signature: thought_signature.clone(),
                 });
                 tool_calls.push(ToolCall {
                     id,
                     name,
                     input: args,
+                    thought_signature,
                 });
             }
 
@@ -715,15 +769,11 @@ mod tests {
         let req = GeminiRequest {
             contents: vec![GeminiContent {
                 role: Some("user".to_string()),
-                parts: vec![GeminiPart::Text {
-                    text: "Hello".to_string(),
-                }],
+                parts: vec![GeminiPart::text("Hello".to_string())],
             }],
             system_instruction: Some(GeminiContent {
                 role: None,
-                parts: vec![GeminiPart::Text {
-                    text: "You are helpful.".to_string(),
-                }],
+                parts: vec![GeminiPart::text("You are helpful.".to_string())],
             }),
             tools: vec![],
             generation_config: Some(GenerationConfig {
@@ -782,7 +832,8 @@ mod tests {
                         "functionCall": {
                             "name": "web_search",
                             "args": {"query": "rust programming"}
-                        }
+                        },
+                        "thoughtSignature": "sig-123"
                     }]
                 },
                 "finishReason": "STOP"
@@ -801,7 +852,40 @@ mod tests {
             completion.tool_calls[0].input,
             serde_json::json!({"query": "rust programming"})
         );
+        assert_eq!(
+            completion.tool_calls[0].thought_signature.as_deref(),
+            Some("sig-123")
+        );
+        match &completion.content[0] {
+            ContentBlock::ToolUse {
+                thought_signature, ..
+            } => assert_eq!(thought_signature.as_deref(), Some("sig-123")),
+            _ => panic!("Expected tool use block"),
+        }
         assert_eq!(completion.stop_reason, StopReason::ToolUse);
+    }
+
+    #[test]
+    fn test_convert_messages_preserves_tool_use_thought_signature() {
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: MessageContent::Blocks(vec![ContentBlock::ToolUse {
+                id: "tool_1".to_string(),
+                name: "file_list".to_string(),
+                input: serde_json::json!({"path": "."}),
+                thought_signature: Some("sig-abc".to_string()),
+            }]),
+        }];
+
+        let (contents, _) = convert_messages(&messages, &None);
+        assert_eq!(contents.len(), 1);
+        let part = &contents[0].parts[0];
+        let function_call = part
+            .function_call
+            .as_ref()
+            .expect("Expected function call part");
+        assert_eq!(function_call.name, "file_list");
+        assert_eq!(part.thought_signature.as_deref(), Some("sig-abc"));
     }
 
     #[test]
@@ -815,10 +899,7 @@ mod tests {
         assert!(sys_instruction.is_some());
         let sys = sys_instruction.unwrap();
         assert!(sys.role.is_none());
-        match &sys.parts[0] {
-            GeminiPart::Text { text } => assert_eq!(text, "Be helpful."),
-            _ => panic!("Expected text part"),
-        }
+        assert_eq!(sys.parts[0].text.as_deref(), Some("Be helpful."));
     }
 
     #[test]
@@ -880,9 +961,7 @@ mod tests {
             candidates: vec![GeminiCandidate {
                 content: Some(GeminiContent {
                     role: Some("model".to_string()),
-                    parts: vec![GeminiPart::Text {
-                        text: "Hello!".to_string(),
-                    }],
+                    parts: vec![GeminiPart::text("Hello!".to_string())],
                 }),
                 finish_reason: Some("STOP".to_string()),
             }],
@@ -918,9 +997,7 @@ mod tests {
             candidates: vec![GeminiCandidate {
                 content: Some(GeminiContent {
                     role: Some("model".to_string()),
-                    parts: vec![GeminiPart::Text {
-                        text: "Truncated...".to_string(),
-                    }],
+                    parts: vec![GeminiPart::text("Truncated...".to_string())],
                 }),
                 finish_reason: Some("MAX_TOKENS".to_string()),
             }],
@@ -949,10 +1026,7 @@ mod tests {
         let system = Some("Be concise.".to_string());
         let result = extract_system(&messages, &system);
         assert!(result.is_some());
-        match &result.unwrap().parts[0] {
-            GeminiPart::Text { text } => assert_eq!(text, "Be concise."),
-            _ => panic!("Expected text"),
-        }
+        assert_eq!(result.unwrap().parts[0].text.as_deref(), Some("Be concise."));
     }
 
     #[test]
@@ -966,10 +1040,10 @@ mod tests {
         ];
         let result = extract_system(&messages, &None);
         assert!(result.is_some());
-        match &result.unwrap().parts[0] {
-            GeminiPart::Text { text } => assert_eq!(text, "System prompt here."),
-            _ => panic!("Expected text"),
-        }
+        assert_eq!(
+            result.unwrap().parts[0].text.as_deref(),
+            Some("System prompt here.")
+        );
     }
 
     #[test]

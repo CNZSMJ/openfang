@@ -26,6 +26,9 @@ pub struct ToolCall {
     pub name: String,
     /// The input parameters.
     pub input: serde_json::Value,
+    /// Provider-specific metadata needed to continue a tool-calling turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
 }
 
 /// Result of a tool execution.

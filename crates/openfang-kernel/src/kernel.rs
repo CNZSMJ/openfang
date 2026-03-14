@@ -5458,7 +5458,11 @@ impl KernelHandle for OpenFangKernel {
         } else {
             CronDelivery::None
         };
-        let one_shot = job_json["one_shot"].as_bool().unwrap_or(false);
+        let one_shot = job_json["one_shot"].as_bool().unwrap_or_else(|| {
+            // For At-scheduled jobs without an explicit one_shot value,
+            // default to true to prevent accidental infinite loops.
+            matches!(schedule, CronSchedule::At { .. })
+        });
 
         let aid = openfang_types::agent::AgentId(
             uuid::Uuid::parse_str(agent_id).map_err(|e| format!("Invalid agent ID: {e}"))?,

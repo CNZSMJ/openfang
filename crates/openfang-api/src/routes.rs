@@ -526,6 +526,7 @@ pub async fn get_agent_session(
                                     id,
                                     name,
                                     input,
+                                    ..
                                 } => {
                                     let tool_idx = tools.len();
                                     tools.push(serde_json::json!({
