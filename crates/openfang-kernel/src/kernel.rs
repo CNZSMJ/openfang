@@ -5458,7 +5458,7 @@ impl KernelHandle for OpenFangKernel {
         } else {
             CronDelivery::None
         };
-        let one_shot = job_json["one_shot"].as_bool().unwrap_or_else(|| {
+        let one_shot = job_json["one_shot"].as_bool().unwrap_or({
             // For At-scheduled jobs without an explicit one_shot value,
             // default to true to prevent accidental infinite loops.
             matches!(schedule, CronSchedule::At { .. })
