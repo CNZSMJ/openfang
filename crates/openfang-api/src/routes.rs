@@ -2911,6 +2911,12 @@ pub struct MemoryListQuery {
     pub include_internal: Option<bool>,
 }
 
+#[derive(Default, serde::Deserialize)]
+pub struct MemoryCleanupRequest {
+    pub apply: Option<bool>,
+    pub limit: Option<usize>,
+}
+
 fn extract_memory_list_tags(uri: &axum::http::Uri) -> Vec<String> {
     uri.query()
         .map(|query| {
@@ -3376,6 +3382,218 @@ pub async fn delete_agent_kv_key(
             })),
         )
     }
+}
+
+/// POST /api/memory/agents/:id/kv/cleanup — Audit or apply governance cleanup actions.
+pub async fn cleanup_agent_kv(
+    State(state): State<Arc<AppState>>,
+    Path(_id): Path<String>,
+    Json(body): Json<MemoryCleanupRequest>,
+) -> impl IntoResponse {
+    let agent_id = openfang_kernel::kernel::shared_memory_agent_id();
+    let apply = body.apply.unwrap_or(false);
+    let limit = body.limit.map(|value| value.min(200)).unwrap_or(200);
+
+    let pairs = match state.kernel.memory.list_kv(agent_id) {
+        Ok(pairs) => pairs,
+        Err(e) => {
+            tracing::warn!("Memory list_kv failed during cleanup planning: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Memory operation failed"})),
+            );
+        }
+    };
+
+    let mut plan = openfang_types::memory::plan_memory_cleanup(&pairs);
+    if plan.findings.len() > limit {
+        plan.findings.truncate(limit);
+    }
+
+    let mut migrated_legacy_keys = 0usize;
+    let mut deleted_legacy_keys = 0usize;
+    let mut deleted_orphan_metadata = 0usize;
+    let mut backfilled_metadata = 0usize;
+
+    if apply {
+        for finding in &plan.findings {
+            match finding.action {
+                openfang_types::memory::MemoryCleanupAction::MigrateLegacyKey => {
+                    let Some(canonical_key) = finding.canonical_key.as_deref() else {
+                        continue;
+                    };
+                    let legacy_value =
+                        match state.kernel.memory.structured_get(agent_id, &finding.key) {
+                            Ok(Some(value)) => value,
+                            Ok(None) => continue,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Memory get failed for legacy key '{}' during cleanup: {e}",
+                                    finding.key
+                                );
+                                return (
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    Json(serde_json::json!({"error": "Memory operation failed"})),
+                                );
+                            }
+                        };
+                    if let Err(e) =
+                        state
+                            .kernel
+                            .memory
+                            .structured_set(agent_id, canonical_key, legacy_value)
+                    {
+                        tracing::warn!("Memory set failed for canonical key '{canonical_key}' during cleanup: {e}");
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({"error": "Memory operation failed"})),
+                        );
+                    }
+                    let metadata = match openfang_types::memory::build_memory_record_metadata(
+                        canonical_key,
+                        None,
+                        &[],
+                        None,
+                        openfang_types::memory::MEMORY_CLEANUP_SOURCE,
+                    ) {
+                        Ok(metadata) => metadata,
+                        Err(error) => {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({ "error": error })),
+                            );
+                        }
+                    };
+                    let metadata_key =
+                        match openfang_types::memory::memory_metadata_key(canonical_key) {
+                            Ok(metadata_key) => metadata_key,
+                            Err(error) => {
+                                return (
+                                    StatusCode::BAD_REQUEST,
+                                    Json(serde_json::json!({ "error": error })),
+                                );
+                            }
+                        };
+                    if let Err(e) = state.kernel.memory.structured_set(
+                        agent_id,
+                        &metadata_key,
+                        serde_json::to_value(&metadata).unwrap_or(serde_json::Value::Null),
+                    ) {
+                        tracing::warn!(
+                            "Memory metadata set failed for key '{metadata_key}' during cleanup: {e}"
+                        );
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({"error": "Memory operation failed"})),
+                        );
+                    }
+                    if let Err(e) = state
+                        .kernel
+                        .memory
+                        .structured_delete(agent_id, &finding.key)
+                    {
+                        tracing::warn!(
+                            "Memory delete failed for legacy key '{}' during cleanup: {e}",
+                            finding.key
+                        );
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({"error": "Memory operation failed"})),
+                        );
+                    }
+                    migrated_legacy_keys += 1;
+                }
+                openfang_types::memory::MemoryCleanupAction::DeleteLegacyKey => {
+                    if let Err(e) = state
+                        .kernel
+                        .memory
+                        .structured_delete(agent_id, &finding.key)
+                    {
+                        tracing::warn!("Memory delete failed for duplicate legacy key '{}' during cleanup: {e}", finding.key);
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({"error": "Memory operation failed"})),
+                        );
+                    }
+                    deleted_legacy_keys += 1;
+                }
+                openfang_types::memory::MemoryCleanupAction::DeleteOrphanMetadata => {
+                    let Some(metadata_key) = finding.metadata_key.as_deref() else {
+                        continue;
+                    };
+                    if let Err(e) = state
+                        .kernel
+                        .memory
+                        .structured_delete(agent_id, metadata_key)
+                    {
+                        tracing::warn!("Memory delete failed for orphan metadata key '{metadata_key}' during cleanup: {e}");
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({"error": "Memory operation failed"})),
+                        );
+                    }
+                    deleted_orphan_metadata += 1;
+                }
+                openfang_types::memory::MemoryCleanupAction::BackfillMetadata => {
+                    let Some(canonical_key) = finding.canonical_key.as_deref() else {
+                        continue;
+                    };
+                    let metadata = match openfang_types::memory::build_memory_record_metadata(
+                        canonical_key,
+                        None,
+                        &[],
+                        None,
+                        openfang_types::memory::MEMORY_CLEANUP_SOURCE,
+                    ) {
+                        Ok(metadata) => metadata,
+                        Err(error) => {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({ "error": error })),
+                            );
+                        }
+                    };
+                    let Some(metadata_key) = finding.metadata_key.as_deref() else {
+                        continue;
+                    };
+                    if let Err(e) = state.kernel.memory.structured_set(
+                        agent_id,
+                        metadata_key,
+                        serde_json::to_value(&metadata).unwrap_or(serde_json::Value::Null),
+                    ) {
+                        tracing::warn!(
+                            "Memory metadata set failed for key '{metadata_key}' during cleanup backfill: {e}"
+                        );
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({"error": "Memory operation failed"})),
+                        );
+                    }
+                    backfilled_metadata += 1;
+                }
+            }
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": if apply { "applied" } else { "audit" },
+            "apply": apply,
+            "summary": {
+                "findings": plan.findings.len(),
+                "migrate_legacy_key": plan.findings.iter().filter(|finding| finding.action == openfang_types::memory::MemoryCleanupAction::MigrateLegacyKey).count(),
+                "delete_legacy_key": plan.findings.iter().filter(|finding| finding.action == openfang_types::memory::MemoryCleanupAction::DeleteLegacyKey).count(),
+                "delete_orphan_metadata": plan.findings.iter().filter(|finding| finding.action == openfang_types::memory::MemoryCleanupAction::DeleteOrphanMetadata).count(),
+                "backfill_metadata": plan.findings.iter().filter(|finding| finding.action == openfang_types::memory::MemoryCleanupAction::BackfillMetadata).count(),
+                "applied_migrate_legacy_key": migrated_legacy_keys,
+                "applied_delete_legacy_key": deleted_legacy_keys,
+                "applied_delete_orphan_metadata": deleted_orphan_metadata,
+                "applied_backfill_metadata": backfilled_metadata
+            },
+            "findings": plan.findings
+        })),
+    )
 }
 
 /// GET /api/health — Minimal liveness probe (public, no auth required).

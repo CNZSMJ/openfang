@@ -14,6 +14,8 @@ pub const DEFAULT_USER_MEMORY_NAMESPACE: &str = "general";
 pub const MEMORY_METADATA_PREFIX: &str = "__openfang_memory_meta.";
 /// Current schema version for governed structured memory metadata.
 pub const MEMORY_METADATA_SCHEMA_VERSION: u32 = 1;
+/// Source label used when cleanup backfills governed metadata.
+pub const MEMORY_CLEANUP_SOURCE: &str = "memory_cleanup_api";
 
 /// Unique identifier for a memory fragment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -128,6 +130,11 @@ pub fn is_internal_memory_key(key: &str) -> bool {
 /// True when the key is an internal sidecar metadata key.
 pub fn is_memory_metadata_key(key: &str) -> bool {
     key.starts_with(MEMORY_METADATA_PREFIX)
+}
+
+/// True when the key is a user-managed legacy bare key that predates namespacing.
+pub fn is_legacy_user_memory_key(key: &str) -> bool {
+    !is_internal_memory_key(key) && !is_memory_metadata_key(key) && !key.contains('.')
 }
 
 fn is_valid_memory_key_char(ch: char) -> bool {
@@ -348,6 +355,104 @@ pub fn memory_tags_match(entry_tags: &[String], filter_tags: &[String]) -> bool 
     filter_tags
         .iter()
         .all(|filter_tag| entry_tags.iter().any(|entry_tag| entry_tag == filter_tag))
+}
+
+/// Proposed governance cleanup action for a memory entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryCleanupAction {
+    MigrateLegacyKey,
+    DeleteLegacyKey,
+    DeleteOrphanMetadata,
+    BackfillMetadata,
+}
+
+/// A single governance cleanup finding derived from a raw KV snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryCleanupFinding {
+    pub action: MemoryCleanupAction,
+    pub key: String,
+    pub canonical_key: Option<String>,
+    pub metadata_key: Option<String>,
+}
+
+/// Cleanup plan derived from a raw KV snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct MemoryCleanupPlan {
+    pub findings: Vec<MemoryCleanupFinding>,
+}
+
+/// Build a governance cleanup plan for legacy bare keys and sidecar inconsistencies.
+pub fn plan_memory_cleanup(entries: &[(String, serde_json::Value)]) -> MemoryCleanupPlan {
+    let metadata_map = collect_memory_metadata(entries);
+    let primary_keys: HashSet<String> = entries
+        .iter()
+        .map(|(key, _)| key)
+        .filter(|key| !is_memory_metadata_key(key))
+        .cloned()
+        .collect();
+
+    let mut findings = Vec::new();
+
+    for key in &primary_keys {
+        if is_internal_memory_key(key) {
+            continue;
+        }
+
+        if is_legacy_user_memory_key(key) {
+            let canonical_key = canonicalize_user_memory_key(key).ok();
+            let action = match canonical_key.as_deref() {
+                Some(canonical_key) if primary_keys.contains(canonical_key) => {
+                    MemoryCleanupAction::DeleteLegacyKey
+                }
+                Some(_) => MemoryCleanupAction::MigrateLegacyKey,
+                None => continue,
+            };
+            findings.push(MemoryCleanupFinding {
+                action,
+                key: key.clone(),
+                canonical_key,
+                metadata_key: None,
+            });
+            continue;
+        }
+
+        if !metadata_map.contains_key(key) {
+            findings.push(MemoryCleanupFinding {
+                action: MemoryCleanupAction::BackfillMetadata,
+                key: key.clone(),
+                canonical_key: Some(key.clone()),
+                metadata_key: memory_metadata_key(key).ok(),
+            });
+        }
+    }
+
+    for (key, _) in entries {
+        if !is_memory_metadata_key(key) {
+            continue;
+        }
+        let Some(primary_key) = memory_key_from_metadata_key(key) else {
+            continue;
+        };
+        if !primary_keys.contains(&primary_key) {
+            findings.push(MemoryCleanupFinding {
+                action: MemoryCleanupAction::DeleteOrphanMetadata,
+                key: primary_key,
+                canonical_key: None,
+                metadata_key: Some(key.clone()),
+            });
+        }
+    }
+
+    findings.sort_by(|a, b| {
+        a.key.cmp(&b.key).then_with(|| {
+            let a_meta = a.metadata_key.as_deref().unwrap_or("");
+            let b_meta = b.metadata_key.as_deref().unwrap_or("");
+            a_meta.cmp(b_meta)
+        })
+    });
+
+    MemoryCleanupPlan { findings }
 }
 
 /// Build the internal sidecar key that stores governance metadata.
@@ -733,6 +838,8 @@ mod tests {
             "session_2026-03-13_summary"
         );
         assert!(is_internal_memory_key("__openfang_schedules"));
+        assert!(is_legacy_user_memory_key("user_name"));
+        assert!(!is_legacy_user_memory_key("general.user_name"));
     }
 
     #[test]
@@ -833,6 +940,65 @@ mod tests {
 
         let collected = collect_memory_metadata(&entries);
         assert_eq!(collected["general.user_name"].kind, "fact");
+    }
+
+    #[test]
+    fn test_plan_memory_cleanup_detects_legacy_orphan_and_missing_metadata() {
+        let governed_metadata = build_memory_record_metadata(
+            "general.user_name",
+            Some("fact"),
+            &[],
+            None,
+            "memory_store_tool",
+        )
+        .unwrap();
+        let entries = vec![
+            ("user_name".to_string(), serde_json::json!("Alice")),
+            (
+                "general.user_name".to_string(),
+                serde_json::json!("Alice v2"),
+            ),
+            (
+                memory_metadata_key("general.user_name").unwrap(),
+                serde_json::to_value(governed_metadata).unwrap(),
+            ),
+            (
+                "project.alpha.status".to_string(),
+                serde_json::json!("green"),
+            ),
+            (
+                "__openfang_memory_meta.pref.theme".to_string(),
+                serde_json::json!({
+                    "schema_version": MEMORY_METADATA_SCHEMA_VERSION,
+                    "key": "pref.theme",
+                    "namespace": "pref",
+                    "kind": "preference",
+                    "tags": [],
+                    "freshness": "durable",
+                    "source": "memory_store_tool",
+                    "updated_at": Utc::now().to_rfc3339(),
+                }),
+            ),
+        ];
+
+        let plan = plan_memory_cleanup(&entries);
+
+        assert!(plan.findings.iter().any(|finding| {
+            finding.action == MemoryCleanupAction::DeleteLegacyKey
+                && finding.key == "user_name"
+                && finding.canonical_key.as_deref() == Some("general.user_name")
+        }));
+        assert!(plan.findings.iter().any(|finding| {
+            finding.action == MemoryCleanupAction::BackfillMetadata
+                && finding.key == "project.alpha.status"
+                && finding.metadata_key.as_deref()
+                    == Some("__openfang_memory_meta.project.alpha.status")
+        }));
+        assert!(plan.findings.iter().any(|finding| {
+            finding.action == MemoryCleanupAction::DeleteOrphanMetadata
+                && finding.key == "pref.theme"
+                && finding.metadata_key.as_deref() == Some("__openfang_memory_meta.pref.theme")
+        }));
     }
 
     #[test]

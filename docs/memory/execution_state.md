@@ -63,6 +63,11 @@
   - `memory_list` tool 支持 `tags` 过滤，命中规则为“记录需包含全部请求 tag”
   - `/api/memory/agents/:id/kv` 支持 `tags` 查询参数，兼容重复参数与逗号分隔输入
   - `openfang-types::memory` 新增共享 helper，统一 tag filter 规范化与匹配语义，供 tool/API/后续 retrieval 复用
+- 已落地 legacy cleanup 切口：
+  - `/api/memory/agents/:id/kv/cleanup` 新增显式 audit/apply 入口
+  - cleanup plan 会识别 legacy bare key、orphan metadata sidecar、以及 canonical key 缺失 metadata 三类问题
+  - `apply=true` 时会执行迁移 legacy bare key、删除 orphan sidecar、回填默认 governed metadata
+  - cleanup 规划逻辑已下沉到 `openfang-types::memory::plan_memory_cleanup`
 - 已完成本轮验证：
   - `cargo build --workspace --lib`
   - `cargo test --workspace`
@@ -72,6 +77,12 @@
     - `GET /api/memory/agents/assistant/kv?tags=profile&tags=ui&limit=10` 仅返回 `pref.tag_filter.theme`
     - `GET /api/memory/agents/assistant/kv?tags=project,alpha&limit=10` 仅返回 `project.tag_filter.note`
     - 真实 `assistant` message 后 `daily_spend` 从 `0.04491296` 增到 `0.045257900000000004`
+  - live cleanup 验证通过：
+    - `POST /api/memory/agents/assistant/kv/cleanup {"apply":false}` 返回 `migrate_legacy_key` / `backfill_metadata` / `delete_orphan_metadata` audit 结果
+    - `POST /api/memory/agents/assistant/kv/cleanup {"apply":true}` 实际完成 legacy bare key 迁移、metadata 回填与 orphan sidecar 删除
+    - cleanup 后 `GET /api/memory/agents/assistant/kv/cleanup_legacy_probe` 返回 `key=general.cleanup_legacy_probe` 且 `source=memory_cleanup_api`
+    - cleanup 后 `project.cleanup_probe.note` 返回 `governed=true` 且 `source=memory_cleanup_api`
+    - 真实 `assistant` message 后 `daily_spend` 从 `0.04600507` 增到 `0.04670917`
   - live lifecycle 验证结果：
     - `pref.lifecycle_test.theme` 返回 `lifecycle_state=active`、`review_at=2026-04-11T18:31:27.386977+00:00`、`expires_at=null`、`promotion_candidate=true`
     - `project.lifecycle_probe.note` 返回 `lifecycle_state=active`、`review_at=2026-03-19T18:31:27.389653+00:00`、`expires_at=2026-04-11T18:31:27.389653+00:00`、`promotion_candidate=false`
@@ -80,12 +91,12 @@
 
 ## 进行中
 
-- 继续推进 Phase 1 后续切口：legacy 清理策略，以及治理元数据在后续检索路径中的消费方式。
+- 继续推进 Phase 1 后续切口：治理元数据在后续检索路径中的消费方式，以及 cleanup 能力是否需要进入 tool/dashboard。
 
 ## 下一步动作
 
-- 评估是否需要为 legacy bare key 和 governed sidecar 做一次后台迁移或清理工具，避免长期双写遗留。
 - 明确后续 embedding / hybrid retrieval 如何消费 `kind` / `tags` / `freshness` / `lifecycle_state` 等治理字段。
+- 评估 cleanup audit/apply 是否需要进入 tool 层或 dashboard，而不只停留在 API。
 - 评估 lifecycle snapshot 是否需要进入 dashboard 或 prompt orchestration 的更高层，而不只停留在 API/tool 响应中。
 - 在切换电脑或结束一轮实质性工作前，持续更新本文件。
 

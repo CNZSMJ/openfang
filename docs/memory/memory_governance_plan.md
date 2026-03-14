@@ -111,6 +111,21 @@
   - 判断 governed metadata 是否满足 tag 过滤
 - 这样 tool、API 与后续 retrieval 消费方可以复用同一套治理过滤语义，而不是各自实现一遍。
 
+### 3.9 Legacy Cleanup Audit / Apply
+
+- `/api/memory/agents/:id/kv/cleanup` 现在提供显式治理清理入口，支持：
+  - `apply=false`：只返回 audit 结果，不改数据
+  - `apply=true`：按治理规则执行修复
+- 当前 cleanup plan 会识别三类问题：
+  - legacy bare key：迁移到 canonical `general.<key>`，或在 canonical 已存在时删除重复 bare key
+  - orphan metadata sidecar：删除缺失主记录的 sidecar
+  - missing metadata：为 canonical 用户 key 回填默认 governed metadata
+- cleanup 回填 metadata 时，默认使用：
+  - `kind=fact`
+  - `freshness=durable`
+  - `source=memory_cleanup_api`
+- cleanup 规划逻辑已收敛到 `openfang-types::memory::plan_memory_cleanup`，避免 API 层再次内联一套规则。
+
 ## 4. 当前不做的事情
 
 本阶段当前实现明确不做：
@@ -125,6 +140,7 @@
 
 - `crates/openfang-types/src/memory.rs`
   - memory key 规范化、namespace 提取、prefix/tag 匹配、兼容 lookup helper
+  - cleanup audit plan（legacy key / orphan metadata / missing metadata）
 - `crates/openfang-runtime/src/tool_runner.rs`
   - tool 输入规范化
   - metadata sidecar 写入
@@ -138,12 +154,13 @@
   - memory API 对齐治理规则
   - API 列表过滤、governed metadata 折叠与 lifecycle 返回
   - API 列表 tags 过滤
+  - cleanup audit/apply endpoint
 
 ## 6. 下一步建议
 
 在当前切口稳定后，下一步按以下顺序推进：
 
-1. 评估是否增加显式 cleanup / migrate 工具，消化 legacy bare key 和陈旧 governed 记录。
+1. 评估是否需要把 cleanup audit/apply 进一步暴露给 tool 层或 dashboard，而不只停留在 API。
 2. 评估是否需要在 dashboard / higher-level orchestration 中直接暴露 tag + lifecycle snapshot，而不只停留在 tool/API 层。
 3. 给后续 embedding / hybrid retrieval 预留对 `kind` / `tags` / `freshness` / `lifecycle_state` 的消费接口。
 4. 决定 lifecycle snapshot 是否需要进入更高层 prompt orchestration，而不仅仅停留在当前提示文案与 API/tool 可见层。
