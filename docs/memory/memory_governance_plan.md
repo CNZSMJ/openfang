@@ -102,6 +102,15 @@
   - `promotion_candidate`
 - 单条读取 `/api/memory/agents/:id/kv/:key` 也会返回同样的 lifecycle 字段，方便 UI 或后续 retrieval 直接消费。
 
+### 3.8 Tag 过滤与治理消费边界
+
+- `memory_list` tool 现在支持 `tags` 过滤；只有包含全部请求 tag 的 governed 记录才会返回。
+- `/api/memory/agents/:id/kv` 同样支持 `tags` 查询参数，可通过重复参数或逗号分隔形式传入多个 tag。
+- `openfang-types::memory` 新增共享 helper，用于：
+  - 规范化 tag 过滤输入
+  - 判断 governed metadata 是否满足 tag 过滤
+- 这样 tool、API 与后续 retrieval 消费方可以复用同一套治理过滤语义，而不是各自实现一遍。
+
 ## 4. 当前不做的事情
 
 本阶段当前实现明确不做：
@@ -115,24 +124,26 @@
 ## 5. 代码落点
 
 - `crates/openfang-types/src/memory.rs`
-  - memory key 规范化、namespace 提取、prefix 匹配、兼容 lookup helper
+  - memory key 规范化、namespace 提取、prefix/tag 匹配、兼容 lookup helper
 - `crates/openfang-runtime/src/tool_runner.rs`
   - tool 输入规范化
   - metadata sidecar 写入
   - `memory_list` 默认隐藏内部 key，并返回 governed + lifecycle 字段
+  - `memory_list` tags 过滤
 - `crates/openfang-runtime/src/prompt_builder.rs`
-  - prompt 协议补充 namespaced key 约束和 lifecycle 使用提示
+  - prompt 协议补充 namespaced key 约束，以及 tags/lifecycle 使用提示
 - `crates/openfang-kernel/src/wizard.rs`
-  - setup hint 补充 namespaced key 与 lifecycle 指导
+  - setup hint 补充 namespaced key、tags 与 lifecycle 指导
 - `crates/openfang-api/src/routes.rs`
   - memory API 对齐治理规则
   - API 列表过滤、governed metadata 折叠与 lifecycle 返回
+  - API 列表 tags 过滤
 
 ## 6. 下一步建议
 
 在当前切口稳定后，下一步按以下顺序推进：
 
 1. 评估是否增加显式 cleanup / migrate 工具，消化 legacy bare key 和陈旧 governed 记录。
-2. 为 `memory_list` 增加更强的 tag 过滤能力。
+2. 评估是否需要在 dashboard / higher-level orchestration 中直接暴露 tag + lifecycle snapshot，而不只停留在 tool/API 层。
 3. 给后续 embedding / hybrid retrieval 预留对 `kind` / `tags` / `freshness` / `lifecycle_state` 的消费接口。
-4. 决定 lifecycle snapshot 是否需要被 dashboard 或后续 prompt orchestration 直接消费，而不仅仅停留在 API/tool 可见层。
+4. 决定 lifecycle snapshot 是否需要进入更高层 prompt orchestration，而不仅仅停留在当前提示文案与 API/tool 可见层。

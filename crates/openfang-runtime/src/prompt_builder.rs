@@ -155,17 +155,23 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
         if let Some(section) = build_soul_section(ctx.soul_md.as_deref()) {
             sections.push(section);
         }
-        if let Some(section) =
-            build_workspace_file_section("Local Environment", "TOOLS.md", ctx.tools_md.as_deref(), 1600)
-        {
+        if let Some(section) = build_workspace_file_section(
+            "Local Environment",
+            "TOOLS.md",
+            ctx.tools_md.as_deref(),
+            1600,
+        ) {
             sections.push(section);
         }
         if let Some(section) = build_identity_md_section(ctx.identity_md.as_deref()) {
             sections.push(section);
         }
-        if let Some(section) =
-            build_workspace_file_section("User Preferences", "USER.md", ctx.user_md.as_deref(), 1200)
-        {
+        if let Some(section) = build_workspace_file_section(
+            "User Preferences",
+            "USER.md",
+            ctx.user_md.as_deref(),
+            1200,
+        ) {
             sections.push(section);
         }
         if let Some(section) = build_workspace_file_section(
@@ -185,9 +191,12 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
         if let Some(section) = build_soul_section(ctx.soul_md.as_deref()) {
             sections.push(section);
         }
-        if let Some(section) =
-            build_workspace_file_section("Local Environment", "TOOLS.md", ctx.tools_md.as_deref(), 1600)
-        {
+        if let Some(section) = build_workspace_file_section(
+            "Local Environment",
+            "TOOLS.md",
+            ctx.tools_md.as_deref(),
+            1600,
+        ) {
             sections.push(section);
         }
         if let Some(section) = build_workspace_file_section(
@@ -367,7 +376,7 @@ pub fn build_memory_section(memories: &[(String, String)]) -> String {
     let mut out = String::from(
         "## Memory Recall\n\
          - Use memory_recall when you know the exact key for prior decisions, preferences, or stored state.\n\
-         - If the exact key is unclear, use memory_list to inspect matching keys before guessing.\n\
+         - If the exact key is unclear, use memory_list to inspect matching keys before guessing. Filter by `namespace`, `prefix`, `tags`, or `lifecycle` when narrowing candidates.\n\
          - Use memory_store for durable preferences, decisions, and continuity points. Prefer namespaced keys like `project.alpha.decision` or `pref.editor.theme`.\n\
          - When storing memory, include governance metadata when useful: `kind`, `tags`, `freshness`, and `conflict_policy`.\n\
          - Bare memory keys are normalized into the `general.` namespace; reserve internal keys such as `session_*` for system-managed state.\n\
@@ -466,7 +475,10 @@ fn build_workspace_file_section(
     if sanitized.is_empty() || is_placeholder_workspace_file(name, &sanitized) {
         return None;
     }
-    Some(format!("## {section_title}\n{}", cap_str(&sanitized, max_chars)))
+    Some(format!(
+        "## {section_title}\n{}",
+        cap_str(&sanitized, max_chars)
+    ))
 }
 
 fn build_soul_section(soul_md: Option<&str>) -> Option<String> {
@@ -496,10 +508,7 @@ fn build_identity_md_section(identity_md: Option<&str>) -> Option<String> {
     }
 
     if !parsed.metadata.is_empty() {
-        parts.push(format!(
-            "Identity traits: {}.",
-            parsed.metadata.join(", ")
-        ));
+        parts.push(format!("Identity traits: {}.", parsed.metadata.join(", ")));
     }
 
     let joined = parts.join("\n").trim().to_string();
@@ -649,7 +658,8 @@ fn is_placeholder_user_md(content: &str) -> bool {
 }
 
 fn is_placeholder_tools_md(content: &str) -> bool {
-    let normalized = normalize_placeholder_text(&strip_redundant_leading_heading("TOOLS.md", content));
+    let normalized =
+        normalize_placeholder_text(&strip_redundant_leading_heading("TOOLS.md", content));
     normalized
         == normalize_placeholder_text(&strip_redundant_leading_heading(
             "TOOLS.md",
@@ -801,7 +811,9 @@ pub fn tool_category(name: &str) -> &'static str {
         "skill_install" | "skill_create" => "Skill Management",
         _ if name.starts_with("mcp_") && name.contains("web_search") => "Web",
         _ if name.starts_with("mcp_")
-            && (name.contains("image") || name.contains("vision") || name.contains("screenshot")) =>
+            && (name.contains("image")
+                || name.contains("vision")
+                || name.contains("screenshot")) =>
         {
             "Media"
         }
@@ -884,7 +896,9 @@ pub fn tool_hint(name: &str) -> &'static str {
 
         // Discovery
         "tool_search" => "discover relevant deferred tools on demand",
-        "tool_get_instructions" => "load additional guidance for a discovered instructional resource",
+        "tool_get_instructions" => {
+            "load additional guidance for a discovered instructional resource"
+        }
 
         _ => "",
     }
@@ -1022,9 +1036,12 @@ mod tests {
         );
         ctx.soul_md = Some("# SOUL.md\nStay sharp.".to_string());
         ctx.agents_md = Some("# AGENTS.md\n- Be useful.".to_string());
-        ctx.tools_md = Some("# TOOLS.md - Local Environment Notes\n- Use debug binaries.\n".to_string());
+        ctx.tools_md =
+            Some("# TOOLS.md - Local Environment Notes\n- Use debug binaries.\n".to_string());
         ctx.user_md = Some("# User\n- Name: Alice".to_string());
-        ctx.memory_md = Some("# Long-Term Memory\n- Prefer project.arch decisions over ad hoc choices.".to_string());
+        ctx.memory_md = Some(
+            "# Long-Term Memory\n- Prefer project.arch decisions over ad hoc choices.".to_string(),
+        );
 
         let prompt = build_system_prompt(&ctx);
         let agents_pos = prompt.find("## Guidelines").unwrap();
@@ -1157,7 +1174,10 @@ mod tests {
     #[test]
     fn test_skills_section_present() {
         let mut ctx = basic_ctx();
-        ctx.granted_tools = vec!["tool_search".to_string(), "tool_get_instructions".to_string()];
+        ctx.granted_tools = vec![
+            "tool_search".to_string(),
+            "tool_get_instructions".to_string(),
+        ];
         ctx.skills = vec![SkillInfo {
             name: "github".to_string(),
             description: "GitHub automation workflows".to_string(),
@@ -1176,7 +1196,10 @@ mod tests {
     #[test]
     fn test_tool_discovery_section_present() {
         let mut ctx = basic_ctx();
-        ctx.granted_tools = vec!["tool_search".to_string(), "tool_get_instructions".to_string()];
+        ctx.granted_tools = vec![
+            "tool_search".to_string(),
+            "tool_get_instructions".to_string(),
+        ];
         let prompt = build_system_prompt(&ctx);
         assert!(prompt.contains("## Tool Discovery"));
         assert!(prompt.contains("tool_search"));
@@ -1187,7 +1210,10 @@ mod tests {
     #[test]
     fn test_skills_section_keeps_prompt_only_skill() {
         let mut ctx = basic_ctx();
-        ctx.granted_tools = vec!["tool_search".to_string(), "tool_get_instructions".to_string()];
+        ctx.granted_tools = vec![
+            "tool_search".to_string(),
+            "tool_get_instructions".to_string(),
+        ];
         ctx.skills = vec![SkillInfo {
             name: "obsidian".to_string(),
             description: "Markdown vault guidance".to_string(),
@@ -1359,7 +1385,10 @@ mod tests {
     #[test]
     fn test_memory_md_section_present() {
         let mut ctx = basic_ctx();
-        ctx.memory_md = Some("# Long-Term Memory\n- Remember project.alpha.status before proposing changes.".to_string());
+        ctx.memory_md = Some(
+            "# Long-Term Memory\n- Remember project.alpha.status before proposing changes."
+                .to_string(),
+        );
         let prompt = build_system_prompt(&ctx);
         assert!(prompt.contains("## Long-Term Memory"));
         assert!(prompt.contains("project.alpha.status"));
@@ -1441,8 +1470,9 @@ mod tests {
     #[test]
     fn test_workspace_context_present() {
         let mut ctx = basic_ctx();
-        ctx.workspace_context =
-            Some("## Workspace Context\n- Project: project (Rust)\n- Git repository: yes".to_string());
+        ctx.workspace_context = Some(
+            "## Workspace Context\n- Project: project (Rust)\n- Git repository: yes".to_string(),
+        );
         let prompt = build_system_prompt(&ctx);
         assert!(prompt.contains("## Workspace Context"));
         assert!(prompt.contains("Project: project"));
@@ -1458,9 +1488,8 @@ mod tests {
         let prompt = build_system_prompt(&ctx);
         assert!(prompt.contains("## Identity"));
         assert!(prompt.contains("Role: helper"));
-        assert!(prompt.contains(
-            "Identity traits: archetype assistant, vibe sharp, greeting style blunt."
-        ));
+        assert!(prompt
+            .contains("Identity traits: archetype assistant, vibe sharp, greeting style blunt."));
         assert!(!prompt.contains("\n# Identity\n"));
         assert!(!prompt.contains("name: Assistant"));
         assert!(!prompt.contains("archetype: assistant"));
@@ -1474,9 +1503,7 @@ mod tests {
                 .to_string(),
         );
         let prompt = build_system_prompt(&ctx);
-        assert!(prompt.contains(
-            "Identity traits: archetype assistant, greeting style blunt."
-        ));
+        assert!(prompt.contains("Identity traits: archetype assistant, greeting style blunt."));
         assert!(!prompt.contains("vibe "));
         assert!(!prompt.contains("emoji"));
     }

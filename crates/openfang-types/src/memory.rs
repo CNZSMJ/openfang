@@ -200,7 +200,9 @@ pub fn memory_key_namespace(key: &str) -> Option<String> {
     if is_internal_memory_key(&canonical) {
         return None;
     }
-    canonical.split_once('.').map(|(namespace, _)| namespace.to_string())
+    canonical
+        .split_once('.')
+        .map(|(namespace, _)| namespace.to_string())
 }
 
 /// Build lookup candidates for a user-facing key, preserving backward compatibility.
@@ -235,9 +237,7 @@ pub fn memory_key_matches_prefix(key: &str, prefix: &str) -> Result<bool, String
         return Ok(false);
     }
 
-    Ok(key.starts_with(&format!(
-        "{DEFAULT_USER_MEMORY_NAMESPACE}.{trimmed}"
-    )))
+    Ok(key.starts_with(&format!("{DEFAULT_USER_MEMORY_NAMESPACE}.{trimmed}")))
 }
 
 /// Freshness class for governed structured memory.
@@ -328,6 +328,26 @@ pub fn canonicalize_memory_tags(tags: &[String]) -> Result<Vec<String>, String> 
         }
     }
     Ok(out)
+}
+
+/// Normalize tag filters from repeated query params or comma-delimited input.
+pub fn canonicalize_memory_tag_filters(tags: &[String]) -> Result<Vec<String>, String> {
+    let flattened: Vec<String> = tags
+        .iter()
+        .flat_map(|tag| tag.split(','))
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+
+    canonicalize_memory_tags(&flattened)
+}
+
+/// True when an entry contains every requested normalized tag.
+pub fn memory_tags_match(entry_tags: &[String], filter_tags: &[String]) -> bool {
+    filter_tags
+        .iter()
+        .all(|filter_tag| entry_tags.iter().any(|entry_tag| entry_tag == filter_tag))
 }
 
 /// Build the internal sidecar key that stores governance metadata.
@@ -424,8 +444,8 @@ pub fn memory_lifecycle_snapshot(
     now: DateTime<Utc>,
 ) -> MemoryLifecycleSnapshot {
     let review_at = metadata.updated_at + lifecycle_review_window(&metadata.freshness);
-    let expires_at = lifecycle_expiry_window(&metadata.freshness)
-        .map(|duration| metadata.updated_at + duration);
+    let expires_at =
+        lifecycle_expiry_window(&metadata.freshness).map(|duration| metadata.updated_at + duration);
     let state = match expires_at {
         Some(expires_at) if now >= expires_at => MemoryLifecycleState::Expired,
         _ if now >= review_at => MemoryLifecycleState::Stale,
@@ -749,7 +769,11 @@ mod tests {
         let metadata = build_memory_record_metadata(
             "user_name",
             Some("Preference"),
-            &["Name".to_string(), "Name".to_string(), "Profile".to_string()],
+            &[
+                "Name".to_string(),
+                "Name".to_string(),
+                "Profile".to_string(),
+            ],
             Some(MemoryFreshness::Rolling),
             "memory_store_tool",
         )
@@ -758,20 +782,47 @@ mod tests {
         assert_eq!(metadata.key, "general.user_name");
         assert_eq!(metadata.namespace, "general");
         assert_eq!(metadata.kind, "preference");
-        assert_eq!(metadata.tags, vec!["name".to_string(), "profile".to_string()]);
+        assert_eq!(
+            metadata.tags,
+            vec!["name".to_string(), "profile".to_string()]
+        );
         assert_eq!(metadata.freshness, MemoryFreshness::Rolling);
     }
 
     #[test]
-    fn test_collect_memory_metadata_ignores_non_metadata_entries() {
-        let metadata = build_memory_record_metadata(
-            "user_name",
-            Some("fact"),
-            &[],
-            None,
-            "memory_store_tool",
-        )
+    fn test_canonicalize_memory_tag_filters_flattens_csv_and_deduplicates() {
+        let filters = canonicalize_memory_tag_filters(&[
+            "Profile, project".to_string(),
+            "profile".to_string(),
+        ])
         .unwrap();
+
+        assert_eq!(filters, vec!["profile".to_string(), "project".to_string()]);
+    }
+
+    #[test]
+    fn test_memory_tags_match_requires_all_requested_tags() {
+        let entry_tags = vec![
+            "profile".to_string(),
+            "project".to_string(),
+            "alpha".to_string(),
+        ];
+
+        assert!(memory_tags_match(
+            &entry_tags,
+            &["profile".to_string(), "alpha".to_string()]
+        ));
+        assert!(!memory_tags_match(
+            &entry_tags,
+            &["profile".to_string(), "missing".to_string()]
+        ));
+    }
+
+    #[test]
+    fn test_collect_memory_metadata_ignores_non_metadata_entries() {
+        let metadata =
+            build_memory_record_metadata("user_name", Some("fact"), &[], None, "memory_store_tool")
+                .unwrap();
         let entries = vec![
             ("general.user_name".to_string(), serde_json::json!("Alice")),
             (

@@ -8,11 +8,11 @@ use crate::mcp;
 use crate::web_search::{parse_ddg_results, WebToolsContext};
 use openfang_skills::registry::SkillRegistry;
 use openfang_types::memory::{
-    build_memory_record_metadata, canonicalize_memory_namespace, canonicalize_user_memory_key,
-    collect_memory_metadata, is_internal_memory_key, is_memory_metadata_key,
-    memory_key_matches_prefix, memory_key_namespace, memory_lifecycle_snapshot,
-    memory_lookup_candidates, memory_metadata_key, MemoryConflictPolicy, MemoryFreshness,
-    MemoryLifecycleState,
+    build_memory_record_metadata, canonicalize_memory_namespace, canonicalize_memory_tag_filters,
+    canonicalize_user_memory_key, collect_memory_metadata, is_internal_memory_key,
+    is_memory_metadata_key, memory_key_matches_prefix, memory_key_namespace,
+    memory_lifecycle_snapshot, memory_lookup_candidates, memory_metadata_key, memory_tags_match,
+    MemoryConflictPolicy, MemoryFreshness, MemoryLifecycleState,
 };
 use openfang_types::taint::{TaintLabel, TaintSink, TaintedValue};
 use openfang_types::tool::{ToolDefinition, ToolResult};
@@ -44,20 +44,11 @@ fn check_taint_shell_exec(command: &str) -> Option<String> {
     // Layer 1: Block shell metacharacters that enable command injection.
     // Uses the same validator as subprocess_sandbox and docker_sandbox.
     if let Some(reason) = crate::subprocess_sandbox::contains_shell_metacharacters(command) {
-        return Some(format!(
-            "Shell metacharacter injection blocked: {reason}"
-        ));
+        return Some(format!("Shell metacharacter injection blocked: {reason}"));
     }
 
     // Layer 2: Heuristic patterns for injected external URLs / base64 payloads
-    let suspicious_patterns = [
-        "curl ",
-        "wget ",
-        "| sh",
-        "| bash",
-        "base64 -d",
-        "eval ",
-    ];
+    let suspicious_patterns = ["curl ", "wget ", "| sh", "| bash", "base64 -d", "eval "];
     for pattern in &suspicious_patterns {
         if command.contains(pattern) {
             let mut labels = HashSet::new();
@@ -263,11 +254,7 @@ impl<'a> ToolRunner<'a> {
         .await
     }
 
-    fn execute_tool_search(
-        &mut self,
-        tool_use_id: &str,
-        input: &serde_json::Value,
-    ) -> ToolResult {
+    fn execute_tool_search(&mut self, tool_use_id: &str, input: &serde_json::Value) -> ToolResult {
         let query = input["query"].as_str().unwrap_or("").trim();
         let top_k = input["top_k"].as_u64().unwrap_or(3) as usize;
         let results = self.search_discovery_items(query, top_k);
@@ -295,11 +282,7 @@ impl<'a> ToolRunner<'a> {
         }
     }
 
-    fn search_discovery_items(
-        &self,
-        query: &str,
-        top_k: usize,
-    ) -> Vec<RankedToolSearchItem> {
+    fn search_discovery_items(&self, query: &str, top_k: usize) -> Vec<RankedToolSearchItem> {
         if query.trim().is_empty() || top_k == 0 {
             return Vec::new();
         }
@@ -321,7 +304,11 @@ impl<'a> ToolRunner<'a> {
             let Some(entry) = self.hidden_tools.remove(tool_name) else {
                 continue;
             };
-            if self.visible_tool_names.iter().any(|name| name == &entry.tool.name) {
+            if self
+                .visible_tool_names
+                .iter()
+                .any(|name| name == &entry.tool.name)
+            {
                 continue;
             }
             self.visible_tool_names.push(entry.tool.name.clone());
@@ -329,10 +316,7 @@ impl<'a> ToolRunner<'a> {
         }
     }
 
-    fn search_hidden_tools(
-        &self,
-        query: &str,
-    ) -> Vec<RankedToolSearchItem> {
+    fn search_hidden_tools(&self, query: &str) -> Vec<RankedToolSearchItem> {
         let normalized_query = query.trim().to_lowercase();
         if normalized_query.is_empty() {
             return Vec::new();
@@ -1158,12 +1142,13 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         },
         tool_definition! {
             name: "memory_list".to_string(),
-            description: "List shared memory entries, optionally filtered by namespace or key prefix. Use when you need to discover available memory keys before recalling a specific one.".to_string(),
+            description: "List shared memory entries, optionally filtered by namespace, key prefix, tags, or lifecycle. Use when you need to discover available memory keys before recalling a specific one.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "namespace": { "type": "string", "description": "Optional namespace to restrict results, for example `project` or `pref`." },
                     "prefix": { "type": "string", "description": "Optional key prefix to filter by (for example `project.alpha.` or `pref.`)" },
+                    "tags": { "type": "array", "items": { "type": "string" }, "description": "Optional governance tags filter. Returned entries must include all requested tags." },
                     "lifecycle": { "type": "string", "enum": ["active", "stale", "expired"], "description": "Optional lifecycle state filter for governed records." },
                     "limit": { "type": "integer", "description": "Maximum number of entries to return (default 20, max 100)" },
                     "include_values": { "type": "boolean", "description": "Whether to include stored values in the result (default true)" },
@@ -2241,7 +2226,9 @@ fn resolve_memory_lookup_keys(input: &serde_json::Value) -> Result<(String, Vec<
         let namespace = canonicalize_memory_namespace(namespace)?;
         return Ok((
             raw_key.clone(),
-            vec![canonicalize_user_memory_key(&format!("{namespace}.{raw_key}"))?],
+            vec![canonicalize_user_memory_key(&format!(
+                "{namespace}.{raw_key}"
+            ))?],
         ));
     }
 
@@ -2269,7 +2256,8 @@ fn tool_memory_store(
         .get("tags")
         .and_then(|v| v.as_array())
         .map(|items| {
-            items.iter()
+            items
+                .iter()
                 .filter_map(|item| item.as_str().map(|s| s.to_string()))
                 .collect()
         })
@@ -2297,15 +2285,12 @@ fn tool_memory_store(
     }
 
     kh.memory_store(&key, value.clone())?;
-    let metadata = build_memory_record_metadata(
-        &key,
-        kind,
-        &tags,
-        freshness,
-        "memory_store_tool",
-    )?;
+    let metadata = build_memory_record_metadata(&key, kind, &tags, freshness, "memory_store_tool")?;
     let metadata_key = memory_metadata_key(&key)?;
-    kh.memory_store(&metadata_key, serde_json::to_value(&metadata).map_err(|e| e.to_string())?)?;
+    kh.memory_store(
+        &metadata_key,
+        serde_json::to_value(&metadata).map_err(|e| e.to_string())?,
+    )?;
     if key == requested_key {
         Ok(format!("Stored value under key '{key}'."))
     } else {
@@ -2323,8 +2308,7 @@ fn tool_memory_recall(
     let (requested_key, candidates) = resolve_memory_lookup_keys(input)?;
     for key in candidates {
         if let Some(val) = kh.memory_recall(&key)? {
-            let rendered =
-                serde_json::to_string_pretty(&val).unwrap_or_else(|_| val.to_string());
+            let rendered = serde_json::to_string_pretty(&val).unwrap_or_else(|_| val.to_string());
             if key == requested_key {
                 return Ok(rendered);
             }
@@ -2352,6 +2336,21 @@ fn tool_memory_list(
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|v| !v.is_empty());
+    let tag_filters = canonicalize_memory_tag_filters(&match input.get("tags") {
+        Some(serde_json::Value::Array(tags)) => tags
+            .iter()
+            .map(|tag| {
+                tag.as_str()
+                    .map(ToOwned::to_owned)
+                    .ok_or("Invalid 'tags' parameter: expected an array of strings.".to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(serde_json::Value::String(tag)) => vec![tag.clone()],
+        Some(_) => {
+            return Err("Invalid 'tags' parameter: expected an array of strings.".to_string());
+        }
+        None => Vec::new(),
+    })?;
     let lifecycle: Option<MemoryLifecycleState> = input
         .get("lifecycle")
         .cloned()
@@ -2392,6 +2391,14 @@ fn tool_memory_list(
             if !memory_key_matches_prefix(&key, prefix)? {
                 continue;
             }
+        }
+        let metadata = metadata_map.get(&key);
+        if !tag_filters.is_empty()
+            && !metadata
+                .map(|metadata| memory_tags_match(&metadata.tags, &tag_filters))
+                .unwrap_or(false)
+        {
+            continue;
         }
         let lifecycle_snapshot = metadata_map
             .get(&key)
@@ -3969,8 +3976,11 @@ async fn tool_canvas_present(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use openfang_skills::registry::SkillRegistry;
+    use std::collections::HashMap;
     use std::fs;
+    use std::sync::Mutex;
     use tempfile::tempdir;
 
     fn make_skill_registry() -> SkillRegistry {
@@ -4004,6 +4014,126 @@ input_schema = { type = "object", properties = { issue = { type = "string" } } }
         // Keep the tempdir alive by leaking it for the duration of the test process.
         std::mem::forget(temp);
         registry
+    }
+
+    #[derive(Default)]
+    struct TestKernel {
+        memory: Mutex<HashMap<String, serde_json::Value>>,
+    }
+
+    impl TestKernel {
+        fn with_memory(entries: Vec<(String, serde_json::Value)>) -> Self {
+            Self {
+                memory: Mutex::new(entries.into_iter().collect()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl KernelHandle for TestKernel {
+        async fn spawn_agent(
+            &self,
+            _manifest_toml: &str,
+            _parent_id: Option<&str>,
+        ) -> Result<(String, String), String> {
+            Err("not implemented".to_string())
+        }
+
+        async fn send_to_agent(&self, _agent_id: &str, _message: &str) -> Result<String, String> {
+            Err("not implemented".to_string())
+        }
+
+        fn list_agents(&self) -> Vec<crate::kernel_handle::AgentInfo> {
+            vec![]
+        }
+
+        fn kill_agent(&self, _agent_id: &str) -> Result<(), String> {
+            Err("not implemented".to_string())
+        }
+
+        fn memory_store(&self, key: &str, value: serde_json::Value) -> Result<(), String> {
+            self.memory.lock().unwrap().insert(key.to_string(), value);
+            Ok(())
+        }
+
+        fn memory_recall(&self, key: &str) -> Result<Option<serde_json::Value>, String> {
+            Ok(self.memory.lock().unwrap().get(key).cloned())
+        }
+
+        fn memory_list(
+            &self,
+            prefix: Option<&str>,
+            limit: Option<usize>,
+        ) -> Result<Vec<(String, serde_json::Value)>, String> {
+            let mut entries: Vec<(String, serde_json::Value)> = self
+                .memory
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(key, _)| prefix.map(|prefix| key.starts_with(prefix)).unwrap_or(true))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            if let Some(limit) = limit {
+                entries.truncate(limit);
+            }
+            Ok(entries)
+        }
+
+        fn find_agents(&self, _query: &str) -> Vec<crate::kernel_handle::AgentInfo> {
+            vec![]
+        }
+
+        async fn task_post(
+            &self,
+            _title: &str,
+            _description: &str,
+            _assigned_to: Option<&str>,
+            _created_by: Option<&str>,
+        ) -> Result<String, String> {
+            Err("not implemented".to_string())
+        }
+
+        async fn task_claim(&self, _agent_id: &str) -> Result<Option<serde_json::Value>, String> {
+            Err("not implemented".to_string())
+        }
+
+        async fn task_complete(&self, _task_id: &str, _result: &str) -> Result<(), String> {
+            Err("not implemented".to_string())
+        }
+
+        async fn task_list(&self, _status: Option<&str>) -> Result<Vec<serde_json::Value>, String> {
+            Err("not implemented".to_string())
+        }
+
+        async fn publish_event(
+            &self,
+            _event_type: &str,
+            _payload: serde_json::Value,
+        ) -> Result<(), String> {
+            Err("not implemented".to_string())
+        }
+
+        async fn knowledge_add_entity(
+            &self,
+            _entity: openfang_types::memory::Entity,
+        ) -> Result<String, String> {
+            Err("not implemented".to_string())
+        }
+
+        async fn knowledge_add_relation(
+            &self,
+            _relation: openfang_types::memory::Relation,
+        ) -> Result<String, String> {
+            Err("not implemented".to_string())
+        }
+
+        async fn knowledge_query(
+            &self,
+            _pattern: openfang_types::memory::GraphPattern,
+        ) -> Result<Vec<openfang_types::memory::GraphMatch>, String> {
+            Err("not implemented".to_string())
+        }
     }
 
     #[test]
@@ -4074,10 +4204,78 @@ input_schema = { type = "object", properties = { issue = { type = "string" } } }
         // Skill discovery tools
         assert!(names.contains(&"tool_search"));
         assert!(names.contains(&"tool_get_instructions"));
+        let memory_list = tools
+            .iter()
+            .find(|tool| tool.name == "memory_list")
+            .expect("memory_list tool should exist");
+        assert!(memory_list.input_schema["properties"]["tags"].is_object());
         assert!(
             tools.iter().all(|tool| !tool.defer_loading),
             "builtin tools should remain visible by default; defer_loading is reserved for skill/MCP rollout"
         );
+    }
+
+    #[tokio::test]
+    async fn test_memory_list_filters_by_all_requested_tags() {
+        let themed_metadata = build_memory_record_metadata(
+            "pref.editor.theme",
+            Some("preference"),
+            &["ui".to_string(), "profile".to_string()],
+            Some(MemoryFreshness::Durable),
+            "memory_store_tool",
+        )
+        .unwrap();
+        let project_metadata = build_memory_record_metadata(
+            "project.alpha.status",
+            Some("project_state"),
+            &["project".to_string(), "alpha".to_string()],
+            Some(MemoryFreshness::Durable),
+            "memory_store_tool",
+        )
+        .unwrap();
+        let kernel: Arc<dyn KernelHandle> = Arc::new(TestKernel::with_memory(vec![
+            ("pref.editor.theme".to_string(), serde_json::json!("dark")),
+            (
+                memory_metadata_key("pref.editor.theme").unwrap(),
+                serde_json::to_value(themed_metadata).unwrap(),
+            ),
+            (
+                "project.alpha.status".to_string(),
+                serde_json::json!("green"),
+            ),
+            (
+                memory_metadata_key("project.alpha.status").unwrap(),
+                serde_json::to_value(project_metadata).unwrap(),
+            ),
+            ("general.ungoverned".to_string(), serde_json::json!("note")),
+        ]));
+
+        let result = execute_tool(
+            "test-id",
+            "memory_list",
+            &serde_json::json!({"tags": ["profile", "ui"]}),
+            Some(&kernel),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(!result.is_error, "{}", result.content);
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&result.content).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["key"], "pref.editor.theme");
+        assert_eq!(rows[0]["tags"], serde_json::json!(["ui", "profile"]));
     }
 
     #[test]
@@ -4202,7 +4400,9 @@ input_schema = { type = "object", properties = { issue = { type = "string" } } }
         assert!(result.content.contains("\"kind\": \"tool\""));
         assert!(result.content.contains("\"source\": \"skill\""));
         assert!(result.content.contains("github-helper"));
-        assert!(runner.visible_tool_names().contains(&"github_comment".to_string()));
+        assert!(runner
+            .visible_tool_names()
+            .contains(&"github_comment".to_string()));
     }
 
     #[tokio::test]
@@ -4290,9 +4490,10 @@ input_schema = { type = "object", properties = { issue = { type = "string" } } }
         assert!(!result.is_error);
         assert!(result.content.contains("docker_exec"));
         assert!(result.content.contains("\"source\": \"builtin\""));
-        assert!(runner.visible_tool_names().contains(&"docker_exec".to_string()));
+        assert!(runner
+            .visible_tool_names()
+            .contains(&"docker_exec".to_string()));
     }
-
 
     #[tokio::test]
     async fn test_tool_search_expands_deferred_mcp_tools() {

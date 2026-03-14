@@ -241,7 +241,7 @@ impl SetupWizard {
         }
         if has("memory_store") {
             hints.push(
-                "- Use memory_store/memory_recall for exact memory access, and memory_list when you need to discover keys first. Prefer namespaced memory keys like `project.alpha.decision`, and add `kind`/`tags`/`freshness` when storing durable memory.",
+                "- Use memory_store/memory_recall for exact memory access, and memory_list when you need to discover keys first. Prefer namespaced memory keys like `project.alpha.decision`, add `kind`/`tags`/`freshness` when storing durable memory, and use memory_list tag filters to narrow results before recall.",
             );
             hints.push(
                 "- Inspect lifecycle hints from memory_list (`lifecycle_state`, `review_at`, `expires_at`, `promotion_candidate`) before reusing or promoting old memory into MEMORY.md.",
