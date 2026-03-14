@@ -171,6 +171,64 @@
   - `llm.log` 中有完整 tool_use / tool_result 记录，且 `/api/budget` 的真实 spend 增量可见
 - 这一步把 cleanup 从“运维/API 管理动作”推进成了“agent 可自助执行的治理动作”，后续若要做 dashboard 按钮或 orchestration hook，就不必再重新设计一套 cleanup 语义。
 
+### 3.12 Lifecycle / Tag Snapshot 进入 Dashboard
+
+- dashboard 的 Memory 页现在不再只是 `key / value / delete` 的简单 KV 浏览器，而是开始直接消费 governed memory 响应中的治理字段。
+- 当前 dashboard 已展示：
+  - `namespace`
+  - `kind`
+  - `freshness`
+  - `tags`
+  - `source`
+  - `lifecycle_state`
+  - `review_at`
+  - `expires_at`
+  - `promotion_candidate`
+- dashboard Memory 页新增了与治理 API 对齐的过滤器：
+  - `namespace`
+  - `lifecycle`
+  - `tags`
+  - `include_internal`
+  - 本地 search
+- 这样 dashboard 不需要另起一套前端私有过滤语义，而是直接沿用现有 memory API 的治理查询参数。
+- 页面顶部还新增了 summary cards，用于快速观察：
+  - loaded keys
+  - governed count
+  - active / stale count
+  - promotion candidates
+- Add/Edit key 表单也已同步支持可选：
+  - `kind`
+  - `tags`
+  - `freshness`
+- 这使 dashboard 从“只能改 value 的 KV 控制台”提升成了“能观察和编辑治理元数据的 Memory 工作台”。
+- live verification 已确认这条链路不是静态页面装饰：
+  - dashboard HTML 已包含 `Memory Filters` / `Promotion Candidates` / `Active / Stale`
+  - 通过 API 写入 `pref.dashboard_lifecycle_probe.theme` 后，单条读取返回了完整 lifecycle + promotion 字段
+  - list API 也能通过 namespace / tags / lifecycle 查询命中同一 probe，说明 dashboard 过滤器与后端语义一致
+- 这一步仍然没有把 lifecycle / promotion 真正提升为“prompt orchestration 的决策输入”，但它已经让治理状态进入了可操作、可观测的 UI 层，为后续 orchestration 提供了更稳定的人工 inspection 面。
+
+### 3.13 Cleanup Audit / Apply 进入 Dashboard
+
+- dashboard 的 Memory 页现在新增了 `Governance Cleanup` 面板，直接消费现有 `/api/memory/agents/:id/kv/cleanup` 接口，而不是再造一套前端私有 cleanup 语义。
+- 当前 dashboard 已支持：
+  - 配置 cleanup `limit`
+  - 手动触发 audit
+  - 手动触发 apply，并在执行前二次确认
+  - 展示 audit/apply 模式、最近一次运行时间与 applied summary
+  - 展示 findings / migrate legacy / orphan metadata / backfill metadata 四类 summary cards
+  - 展示逐条 finding 明细，包括 `action` / `key` / `canonical_key` / `metadata_key`
+- apply cleanup 完成后，dashboard 会自动刷新当前 memory 列表，因此 legacy bare key 迁移、orphan sidecar 删除与 metadata 回填的结果可以立即在同一页观察到。
+- 这样 cleanup 现在同时具备三层可达入口：
+  - API：运维或脚本显式调用
+  - tool：agent 自助治理
+  - dashboard：人工 inspection 与手动治理
+- 这一步的意义不是新增 cleanup 规则，而是把既有 cleanup 规则推进成真正可操作的治理工作台，减少“需要 curl 才能治理”的摩擦。
+- live verification 已确认这条 UI 链路真实工作：
+  - dashboard HTML 已出现 `Governance Cleanup` / `Audit Cleanup` / `Apply Cleanup`
+  - 注入 legacy bare key、missing metadata 与 orphan sidecar 三类 probe 后，cleanup audit 返回了对应 findings；同一轮里也顺带暴露出几条原本就存在的 shared legacy bare key
+  - cleanup apply 后，canonical key 与 metadata 回填可被 API 读回，而 orphan sidecar 已删除；验证过程中被一并迁移的无关 shared legacy bare key 已恢复回原状
+  - 现有 `Researcher` 与 `assistant` agent 的真实 message 分别命中了既有的 MiniMax tool-result id 错误与 Gemini `thought_signature` 错误，因此最终用一个临时无工具 MiniMax verifier agent 补齐了真实 LLM + `/api/budget` 增量验证
+
 ## 4. 当前不做的事情
 
 本阶段当前实现明确不做：
@@ -210,6 +268,5 @@
 在当前切口稳定后，下一步按以下顺序推进：
 
 1. 决定 governed prompt candidates 的 query-aware 打分是否需要继续引入停用词、短语匹配或 namespace/kind 显式 hint。
-2. 评估是否需要把 cleanup audit/apply 进一步暴露到 dashboard 或 orchestration hook，而不只停留在 API + tool。
-3. 评估是否需要在 dashboard / higher-level orchestration 中直接暴露 tag + lifecycle snapshot，而不只停留在 tool/API 层。
-4. 决定 lifecycle snapshot 是否需要进入更高层 prompt orchestration，而不仅仅停留在当前提示文案与 API/tool 可见层。
+2. 评估是否需要把 cleanup audit/apply 进一步暴露到 orchestration hook，而不只停留在 API + tool + dashboard。
+3. 决定 lifecycle / promotion snapshot 是否需要进入更高层 prompt orchestration，而不仅仅停留在当前提示文案、dashboard 与 API/tool 可见层。

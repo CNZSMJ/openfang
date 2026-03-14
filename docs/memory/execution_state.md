@@ -72,6 +72,16 @@
   - runtime builtin tool 新增 `memory_cleanup`，支持 `apply` / `limit` 参数，并直接消费共享 cleanup plan
   - `KernelHandle` 新增 shared memory delete bridge，供 tool 层执行 legacy key 删除、orphan sidecar 删除与 metadata 回填
   - prompt builder / setup wizard 已把 `memory_cleanup` 纳入 memory capability 指导，提示 agent 先 audit 再 apply
+- 已落地 dashboard governance consumption 切口：
+  - dashboard Memory 页现在会显示 governed `kind` / `freshness` / `tags` / `source` 与 `lifecycle_state` / `review_at` / `expires_at` / `promotion_candidate`
+  - dashboard Memory 页新增 namespace / lifecycle / tags / include-internal 过滤入口，并直接复用 memory API 的治理查询参数
+  - dashboard Memory 页新增 governed summary cards，快速暴露 governed、active/stale、promotion candidate 等治理计数
+  - dashboard Add/Edit key 表单现在支持可选 `kind` / `tags` / `freshness`，不再只能写裸 value
+- 已落地 dashboard cleanup workspace 切口：
+  - dashboard Memory 页新增 `Governance Cleanup` 面板，可直接触发 cleanup audit / apply，而不必离开 UI 或手写 API 请求
+  - cleanup 面板支持 `limit` 输入、audit/apply 状态提示、action summary cards，以及 findings 明细表
+  - dashboard cleanup 会直接消费现有 `/api/memory/agents/:id/kv/cleanup` 返回的 `summary` / `findings`，不再另起一套前端私有语义
+  - apply cleanup 后 dashboard 会自动刷新当前 memory 列表，方便立即观察 legacy key 迁移、orphan sidecar 删除与 metadata 回填效果
 - 已落地 governed retrieval consumption 切口：
   - `openfang-types::memory` 新增 `select_governed_memory_prompt_candidates`，统一为 runtime / 后续 retrieval 选择 governed KV 候选
   - runtime 动态 memory context 现在会额外注入 `Governed memory candidates`，不再只依赖 semantic recall 与 `session_*` 摘要
@@ -117,22 +127,35 @@
     - 该轮真实 message 的回复明确返回 `general.tool_cleanup_legacy_probe` 与 `project.tool_cleanup.status`，并确认 orphan metadata 已删除
     - `/api/budget` 中 `daily_spend` 从 `0.05844012` 增到 `0.06483442`，`/api/budget/agents` 中新增 verifier agent 花费 `0.0063943`
     - live 验证后已删除 probe，并把与本次 probe 无关的 shared legacy key 迁移恢复回原状
+  - live dashboard governance 验证通过：
+    - dashboard HTML 中已出现 `Memory Filters` / `Promotion Candidates` / `Active / Stale` 新文案
+    - 通过 memory API 写入 `pref.dashboard_lifecycle_probe.theme` 后，`GET /api/memory/agents/{id}/kv/pref.dashboard_lifecycle_probe.theme` 返回 `governed=true`、`lifecycle_state=active`、`promotion_candidate=true`、`tags=["dashboard","lifecycle_probe"]`
+    - list API 也可通过 `namespace=pref`、`tags=dashboard`、`lifecycle=active` 等查询参数命中该 probe，证明 dashboard 过滤链路接线有效
+    - 真实 `Researcher` message 后 `daily_spend` 从 `0.06483442` 增到 `0.10918752`，`/api/budget/agents` 中新增 `Researcher` 花费 `0.0443531`
+    - dashboard probe 已删除，daemon 已按流程停止
+  - live dashboard cleanup 验证通过：
+    - dashboard HTML 中已出现 `Governance Cleanup` / `Audit Cleanup` / `Apply Cleanup` 新文案
+    - 通过本地 shared KV 注入 `dashboard_cleanup_probe` legacy bare key、`project.dashboard_cleanup.note` canonical key 与 `pref.dashboard_cleanup.orphan` orphan metadata sidecar 后，`POST /api/memory/agents/{id}/kv/cleanup {"apply":false,"limit":20}` 返回了 probe 对应的 `migrate_legacy_key` / `backfill_metadata` / `delete_orphan_metadata`，同时也暴露出几条原本就存在的 shared legacy bare key
+    - 随后 `POST /api/memory/agents/{id}/kv/cleanup {"apply":true,"limit":20}` 实际完成 `general.dashboard_cleanup_probe` 迁移、orphan sidecar 删除与 `project.dashboard_cleanup.note` metadata 回填；一并迁移到 canonical 的无关 shared legacy bare key 已在验证后恢复回原状
+    - cleanup 后单条读取确认 `general.dashboard_cleanup_probe` 与 `project.dashboard_cleanup.note` 都具备 governed metadata，而 `pref.dashboard_cleanup.orphan` sidecar 已不存在
+    - 真实 LLM 验证阶段，现有 `Researcher` 与 `assistant` agent 分别命中了既有的 MiniMax tool-result id 兼容问题与 Gemini `thought_signature` 问题，因此改为临时创建一个无工具的 MiniMax verifier agent 完成纯文本消息调用
+    - verifier 返回 `Hey there! Great to meet you! 👋`，`daily_spend` 从 `0.10918752` 增到 `0.11277132000000001`；dashboard cleanup probes 与临时 verifier agent 已删除，daemon 已按流程停止
 
 ## 进行中
 
-- 继续推进 Phase 1 后续切口：governed prompt candidates 的 query-aware 规则是否需要更强，以及 lifecycle snapshot 是否需要进入 dashboard 或更高层 orchestration。
+- 继续推进 Phase 1 后续切口：governed prompt candidates 的 query-aware 规则是否需要更强，以及 lifecycle / promotion snapshot 是否需要进入更高层 prompt orchestration。
 
 ## 下一步动作
 
 - 评估 governed prompt candidates 的 query-aware 打分是否需要继续引入停用词、短语匹配、namespace/kind hint 或显式过滤。
-- 评估 lifecycle snapshot 是否需要进入 dashboard 或 prompt orchestration 的更高层，而不只停留在 API/tool 响应中。
+- 评估 lifecycle / promotion snapshot 是否需要进入 prompt orchestration 的更高层，而不只停留在 dashboard + API/tool 可见层。
 - 在切换电脑或结束一轮实质性工作前，持续更新本文件。
 
 ## 风险与阻塞
 
 - `cargo clippy --workspace --all-targets -- -D warnings` 当前仍被 `openfang-cli/src/main.rs` 中既有问题阻塞；按仓库约束，本轮未修改 `openfang-cli`。
 - 当前 embedding provider 本地端点 `http://localhost:11434/v1/embeddings` 离线，live LLM 调用期间会回退到 text search；这不阻塞本轮 KV governance 验证，但会影响 embedding recall 路径验证。
-- 当前 `assistant` agent 的 gemini tool-call 路径仍存在既有 `thought_signature` 兼容问题；本轮 `memory_cleanup` tool live verification 因此改用临时 MiniMax verifier agent 完成。
+- 当前现有 agent 的 tool-call 路径存在两类既有兼容问题：`assistant` 的 gemini path 仍有 `thought_signature` 错误，`Researcher` 的 MiniMax path 也出现了 tool-result id 不匹配；因此本轮 dashboard cleanup live LLM verification 同样改用临时无工具 MiniMax verifier agent 完成。
 - 如果后续启动工作时不先读取本文件，分支纪律和连续性可能重新漂移。
 
 ## 验证清单

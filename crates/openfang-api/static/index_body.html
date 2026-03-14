@@ -3976,9 +3976,9 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
             <div class="flex justify-between items-center mb-4">
               <div class="info-card" style="flex:1;margin-bottom:0">
                 <h4>Agent Memory</h4>
-                <p>Each agent has its own key-value memory store. Agents use memory to persist preferences, notes, and context between conversations.</p>
+                <p>Browse governed shared memory with lifecycle snapshots, tags, and promotion hints. Filters below map directly to the memory governance API.</p>
               </div>
-              <select class="form-select" style="width:200px;margin-left:16px" x-model="memAgentId" @change="loadKv()">
+              <select class="form-select" style="width:200px;margin-left:16px" x-model="memAgentId" @change="selectMemoryAgent()">
                 <option value="">Select agent...</option>
                 <template x-for="a in $store.app.agents" :key="a.id">
                   <option :value="a.id" x-text="a.name"></option>
@@ -3992,30 +3992,196 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
               <button class="btn btn-ghost btn-sm" @click="loadKv()">Retry</button>
             </div>
             <div x-show="memAgentId && !memLoading && !memLoadError">
+              <div class="card mb-4">
+                <div class="card-header">Memory Filters</div>
+                <div class="grid grid-cols-4" style="gap:12px">
+                  <div class="form-group" style="margin-bottom:0">
+                    <label>Search</label>
+                    <input class="form-input" x-model="memSearch" placeholder="key, value, tag, source...">
+                  </div>
+                  <div class="form-group" style="margin-bottom:0">
+                    <label>Namespace</label>
+                    <select class="form-select" x-model="memNamespace">
+                      <option value="">All namespaces</option>
+                      <template x-for="ns in availableNamespaces" :key="ns">
+                        <option :value="ns" x-text="ns"></option>
+                      </template>
+                    </select>
+                  </div>
+                  <div class="form-group" style="margin-bottom:0">
+                    <label>Lifecycle</label>
+                    <select class="form-select" x-model="memLifecycle">
+                      <option value="">All lifecycle states</option>
+                      <option value="active">active</option>
+                      <option value="stale">stale</option>
+                      <option value="expired">expired</option>
+                    </select>
+                  </div>
+                  <div class="form-group" style="margin-bottom:0">
+                    <label>Tags</label>
+                    <input class="form-input" x-model="memTags" placeholder="profile, ui">
+                  </div>
+                </div>
+                <div class="flex justify-between items-center mt-3">
+                  <label class="form-checkbox"><input type="checkbox" x-model="memIncludeInternal"> Include internal keys</label>
+                  <div class="flex gap-2">
+                    <button class="btn btn-ghost btn-sm" @click="resetMemoryFilters()">Reset</button>
+                    <button class="btn btn-primary btn-sm" @click="loadKv()">Apply Filters</button>
+                  </div>
+                </div>
+              </div>
+              <div class="card mb-4">
+                <div class="card-header">Governance Cleanup</div>
+                <div class="flex justify-between items-start" style="gap:16px;flex-wrap:wrap">
+                  <div style="flex:1;min-width:280px">
+                    <p class="text-sm text-dim" style="margin:0 0 8px 0">Audit or apply shared memory cleanup for legacy bare keys, orphan metadata sidecars, and canonical keys missing governed metadata.</p>
+                    <p class="text-xs text-dim" style="margin:0">This action operates on the shared governed KV store behind all agents, even though the endpoint is scoped under the selected agent.</p>
+                  </div>
+                  <div class="flex items-end" style="gap:12px;flex-wrap:wrap">
+                    <div class="form-group" style="margin-bottom:0;min-width:120px">
+                      <label>Finding Limit</label>
+                      <input class="form-input" type="number" min="1" max="200" x-model="memCleanupLimit">
+                    </div>
+                    <button class="btn btn-ghost btn-sm" @click="runMemoryCleanup(false)" :disabled="memCleanupLoading">
+                      <span x-text="memCleanupLoading ? 'Running...' : 'Audit Cleanup'"></span>
+                    </button>
+                    <button class="btn btn-primary btn-sm" @click="applyMemoryCleanup()" :disabled="memCleanupLoading">
+                      <span x-text="memCleanupLoading ? 'Running...' : 'Apply Cleanup'"></span>
+                    </button>
+                  </div>
+                </div>
+                <div class="error-state mt-3" x-show="memCleanupError">
+                  <span class="error-icon">!</span>
+                  <p x-text="memCleanupError"></p>
+                </div>
+                <div class="mt-3" x-show="memCleanupResult">
+                  <div class="flex justify-between items-center mb-3" style="gap:12px;flex-wrap:wrap">
+                    <div class="flex items-center gap-2">
+                      <span class="badge" :class="memCleanupResult && memCleanupResult.apply ? 'badge-created' : 'badge-dim'" x-text="memCleanupResult && memCleanupResult.apply ? 'applied' : 'audit'"></span>
+                      <span class="text-xs text-dim">Last run: <span x-text="formatTimestamp(memCleanupRanAt)"></span></span>
+                    </div>
+                    <span class="text-xs text-dim" x-show="cleanupAppliedSummary" x-text="cleanupAppliedSummary"></span>
+                  </div>
+                  <div class="grid grid-cols-4" style="gap:12px">
+                    <template x-for="card in cleanupSummaryCards" :key="card.label">
+                      <div class="stat-card">
+                        <div class="stat-value" :class="card.className" x-text="card.value"></div>
+                        <div class="stat-label" x-text="card.label"></div>
+                      </div>
+                    </template>
+                  </div>
+                  <div class="table-wrap mt-3" x-show="memCleanupResult.findings && memCleanupResult.findings.length">
+                    <table>
+                      <thead><tr><th>Action</th><th>Key</th><th>Canonical Key</th><th>Metadata Key</th></tr></thead>
+                      <tbody>
+                        <template x-for="finding in (memCleanupResult.findings || [])" :key="finding.action + ':' + finding.key + ':' + (finding.metadata_key || '')">
+                          <tr>
+                            <td><span class="badge" :class="cleanupActionClass(finding.action)" x-text="cleanupActionLabel(finding.action)"></span></td>
+                            <td><code x-text="finding.key"></code></td>
+                            <td><code x-text="finding.canonical_key || '-'"></code></td>
+                            <td><code x-text="finding.metadata_key || '-'"></code></td>
+                          </tr>
+                        </template>
+                      </tbody>
+                    </table>
+                  </div>
+                  <div class="empty-state mt-3" x-show="memCleanupResult.summary && !memCleanupResult.summary.findings">
+                    <h4>No governance cleanup findings</h4>
+                    <p class="hint">The current shared KV snapshot already matches the Phase 1 governance rules.</p>
+                  </div>
+                </div>
+              </div>
+              <div class="grid grid-cols-4 mb-4" style="gap:12px">
+                <div class="stat-card">
+                  <div class="stat-value" x-text="memoryStats.total"></div>
+                  <div class="stat-label">Loaded Keys</div>
+                </div>
+                <div class="stat-card">
+                  <div class="stat-value stat-value-success" x-text="memoryStats.governed"></div>
+                  <div class="stat-label">Governed</div>
+                </div>
+                <div class="stat-card">
+                  <div class="stat-value" :class="memoryStats.stale ? 'stat-value-warning' : 'stat-value-success'" x-text="memoryStats.active + ' / ' + memoryStats.stale"></div>
+                  <div class="stat-label">Active / Stale</div>
+                </div>
+                <div class="stat-card">
+                  <div class="stat-value" :class="memoryStats.promotion ? 'stat-value-accent' : ''" x-text="memoryStats.promotion"></div>
+                  <div class="stat-label">Promotion Candidates</div>
+                </div>
+              </div>
               <div class="flex justify-between items-center mb-4">
-                <span class="text-sm text-dim" x-text="kvPairs.length + ' key(s)'"></span>
+                <span class="text-sm text-dim" x-text="filteredKvPairs.length + ' shown / ' + kvPairs.length + ' loaded'"></span>
                 <button class="btn btn-primary btn-sm" @click="showAdd = true">+ Add Key</button>
               </div>
-              <div class="table-wrap" x-show="kvPairs.length">
+              <div class="table-wrap" x-show="filteredKvPairs.length">
                 <table>
-                  <thead><tr><th>Key</th><th>Value</th><th style="width:140px">Actions</th></tr></thead>
+                  <thead><tr><th>Key</th><th>Value</th><th>Governance</th><th>Lifecycle</th><th style="width:140px">Actions</th></tr></thead>
                   <tbody>
-                    <template x-for="kv in kvPairs" :key="kv.key">
+                    <template x-for="kv in filteredKvPairs" :key="kv.key">
                       <tr>
-                        <td class="font-bold" style="white-space:nowrap" x-text="kv.key"></td>
+                        <td style="min-width:220px">
+                          <div class="font-bold" style="white-space:nowrap" x-text="kv.key"></div>
+                          <div class="text-xs text-dim mt-1">
+                            <span class="badge badge-dim" x-text="kv.namespace || 'no-namespace'"></span>
+                            <span class="badge" :class="kv.internal ? 'badge-error' : 'badge-muted'" x-text="kv.internal ? 'internal' : 'user'"></span>
+                          </div>
+                        </td>
                         <td>
                           <template x-if="editingKey !== kv.key">
-                            <pre style="font-size:11px;max-width:400px;overflow:auto;white-space:pre-wrap;margin:0;color:var(--text-dim)" x-text="typeof kv.value === 'object' ? JSON.stringify(kv.value, null, 2) : String(kv.value)"></pre>
+                            <pre style="font-size:11px;max-width:400px;overflow:auto;white-space:pre-wrap;margin:0;color:var(--text-dim)" x-text="memoryValueText(kv.value)"></pre>
                           </template>
                           <template x-if="editingKey === kv.key">
                             <div>
                               <textarea class="form-textarea" x-model="editingValue" style="font-size:11px;min-height:60px;font-family:var(--font-mono)"></textarea>
+                              <div class="grid grid-cols-3 mt-2" style="gap:8px">
+                                <div class="form-group" style="margin-bottom:0">
+                                  <label>Kind</label>
+                                  <input class="form-input" x-model="editingKind" placeholder="fact">
+                                </div>
+                                <div class="form-group" style="margin-bottom:0">
+                                  <label>Tags</label>
+                                  <input class="form-input" x-model="editingTags" placeholder="profile, ui">
+                                </div>
+                                <div class="form-group" style="margin-bottom:0">
+                                  <label>Freshness</label>
+                                  <select class="form-select" x-model="editingFreshness">
+                                    <option value="">default</option>
+                                    <option value="rolling">rolling</option>
+                                    <option value="durable">durable</option>
+                                    <option value="archival">archival</option>
+                                  </select>
+                                </div>
+                              </div>
                               <div class="flex gap-2 mt-2">
                                 <button class="btn btn-primary btn-sm" @click="saveEdit()">Save</button>
                                 <button class="btn btn-ghost btn-sm" @click="cancelEdit()">Cancel</button>
                               </div>
                             </div>
                           </template>
+                        </td>
+                        <td style="min-width:220px">
+                          <div class="flex flex-wrap gap-1 mb-2">
+                            <span class="badge" :class="kv.governed ? 'badge-success' : 'badge-muted'" x-text="kv.governed ? 'governed' : 'ungoverned'"></span>
+                            <span class="badge badge-dim" x-show="kv.kind" x-text="kv.kind"></span>
+                            <span class="badge badge-dim" x-show="kv.freshness" x-text="kv.freshness"></span>
+                          </div>
+                          <div class="text-xs text-dim" x-show="kv.source">
+                            source: <span x-text="kv.source"></span>
+                          </div>
+                          <div class="flex flex-wrap gap-1 mt-2" x-show="kv.tags && kv.tags.length">
+                            <template x-for="tag in (kv.tags || [])" :key="kv.key + '-' + tag">
+                              <span class="badge badge-muted" x-text="tag"></span>
+                            </template>
+                          </div>
+                        </td>
+                        <td style="min-width:220px">
+                          <div class="flex flex-wrap gap-1 mb-2">
+                            <span class="badge" :class="lifecycleBadgeClass(kv.lifecycle_state)" x-text="kv.lifecycle_state || 'none'"></span>
+                            <span class="badge badge-created" x-show="kv.promotion_candidate">promotion</span>
+                          </div>
+                          <div class="text-xs text-dim">review: <span x-text="formatTimestamp(kv.review_at)"></span></div>
+                          <div class="text-xs text-dim">expires: <span x-text="formatTimestamp(kv.expires_at)"></span></div>
+                          <div class="text-xs text-dim">updated: <span x-text="formatTimestamp(kv.updated_at)"></span></div>
                         </td>
                         <td>
                           <div class="flex gap-2">
@@ -4033,12 +4199,36 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                 <p class="hint">This agent has no memory entries yet. Agents create memory entries automatically during conversations, or you can add them manually.</p>
                 <button class="btn btn-primary mt-4" @click="showAdd = true">+ Add First Key</button>
               </div>
+              <div class="empty-state" x-show="kvPairs.length && !filteredKvPairs.length">
+                <h4>No keys match the current filters</h4>
+                <p class="hint">Adjust search, namespace, lifecycle, or tag filters to widen the governed memory view.</p>
+                <button class="btn btn-ghost mt-4" @click="resetMemoryFilters()">Reset Filters</button>
+              </div>
               <template x-if="showAdd">
                 <div class="modal-overlay" @click.self="showAdd = false" @keydown.escape.window="showAdd = false">
                   <div class="modal">
                     <div class="modal-header"><h3>Add Key</h3><button class="modal-close" @click="showAdd = false">&times;</button></div>
                     <div class="form-group"><label>Key</label><input class="form-input" x-model="newKey" placeholder="my_key"></div>
                     <div class="form-group"><label>Value (JSON)</label><textarea class="form-textarea" x-model="newValue" placeholder='"hello"'></textarea></div>
+                    <div class="grid grid-cols-3" style="gap:8px">
+                      <div class="form-group">
+                        <label>Kind</label>
+                        <input class="form-input" x-model="newKind" placeholder="fact">
+                      </div>
+                      <div class="form-group">
+                        <label>Tags</label>
+                        <input class="form-input" x-model="newTags" placeholder="profile, ui">
+                      </div>
+                      <div class="form-group">
+                        <label>Freshness</label>
+                        <select class="form-select" x-model="newFreshness">
+                          <option value="">default</option>
+                          <option value="rolling">rolling</option>
+                          <option value="durable">durable</option>
+                          <option value="archival">archival</option>
+                        </select>
+                      </div>
+                    </div>
                     <button class="btn btn-primary btn-block" @click="addKey()">Save</button>
                   </div>
                 </div>
