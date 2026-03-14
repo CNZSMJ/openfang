@@ -155,17 +155,23 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
         if let Some(section) = build_soul_section(ctx.soul_md.as_deref()) {
             sections.push(section);
         }
-        if let Some(section) =
-            build_workspace_file_section("Local Environment", "TOOLS.md", ctx.tools_md.as_deref(), 1600)
-        {
+        if let Some(section) = build_workspace_file_section(
+            "Local Environment",
+            "TOOLS.md",
+            ctx.tools_md.as_deref(),
+            1600,
+        ) {
             sections.push(section);
         }
         if let Some(section) = build_identity_md_section(ctx.identity_md.as_deref()) {
             sections.push(section);
         }
-        if let Some(section) =
-            build_workspace_file_section("User Preferences", "USER.md", ctx.user_md.as_deref(), 1200)
-        {
+        if let Some(section) = build_workspace_file_section(
+            "User Preferences",
+            "USER.md",
+            ctx.user_md.as_deref(),
+            1200,
+        ) {
             sections.push(section);
         }
         if let Some(section) = build_workspace_file_section(
@@ -185,9 +191,12 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
         if let Some(section) = build_soul_section(ctx.soul_md.as_deref()) {
             sections.push(section);
         }
-        if let Some(section) =
-            build_workspace_file_section("Local Environment", "TOOLS.md", ctx.tools_md.as_deref(), 1600)
-        {
+        if let Some(section) = build_workspace_file_section(
+            "Local Environment",
+            "TOOLS.md",
+            ctx.tools_md.as_deref(),
+            1600,
+        ) {
             sections.push(section);
         }
         if let Some(section) = build_workspace_file_section(
@@ -332,9 +341,17 @@ pub fn build_canonical_context_message(ctx: &PromptContext) -> Option<String> {
 /// and recent session summaries for the current turn.
 pub fn build_memory_context_message(
     recalled_memories: &[String],
+    cleanup_maintenance_signals: &[String],
+    governed_memory_signals: &[String],
+    governed_memory_candidates: &[String],
     recent_session_summaries: &[String],
 ) -> Option<String> {
-    if recalled_memories.is_empty() && recent_session_summaries.is_empty() {
+    if recalled_memories.is_empty()
+        && cleanup_maintenance_signals.is_empty()
+        && governed_memory_signals.is_empty()
+        && governed_memory_candidates.is_empty()
+        && recent_session_summaries.is_empty()
+    {
         return None;
     }
 
@@ -347,8 +364,45 @@ pub fn build_memory_context_message(
         }
     }
 
-    if !recent_session_summaries.is_empty() {
+    if !cleanup_maintenance_signals.is_empty() {
         if !recalled_memories.is_empty() {
+            out.push('\n');
+        }
+        out.push_str("Governance maintenance signals:\n");
+        for signal in cleanup_maintenance_signals.iter().take(4) {
+            out.push_str(&format!("- {}\n", cap_str(signal, 320)));
+        }
+    }
+
+    if !governed_memory_signals.is_empty() {
+        if !recalled_memories.is_empty() || !cleanup_maintenance_signals.is_empty() {
+            out.push('\n');
+        }
+        out.push_str("Governance attention signals:\n");
+        for signal in governed_memory_signals.iter().take(4) {
+            out.push_str(&format!("- {}\n", cap_str(signal, 320)));
+        }
+    }
+
+    if !governed_memory_candidates.is_empty() {
+        if !recalled_memories.is_empty()
+            || !cleanup_maintenance_signals.is_empty()
+            || !governed_memory_signals.is_empty()
+        {
+            out.push('\n');
+        }
+        out.push_str("Governed memory candidates:\n");
+        for memory in governed_memory_candidates.iter().take(4) {
+            out.push_str(&format!("- {}\n", cap_str(memory, 320)));
+        }
+    }
+
+    if !recent_session_summaries.is_empty() {
+        if !recalled_memories.is_empty()
+            || !cleanup_maintenance_signals.is_empty()
+            || !governed_memory_signals.is_empty()
+            || !governed_memory_candidates.is_empty()
+        {
             out.push('\n');
         }
         out.push_str("Recent session summaries:\n");
@@ -367,8 +421,12 @@ pub fn build_memory_section(memories: &[(String, String)]) -> String {
     let mut out = String::from(
         "## Memory Recall\n\
          - Use memory_recall when you know the exact key for prior decisions, preferences, or stored state.\n\
-         - If the exact key is unclear, use memory_list to inspect matching keys before guessing.\n\
-         - Use memory_store for durable preferences, decisions, and continuity points.\n\
+         - If the exact key is unclear, use memory_list to inspect matching keys before guessing. Filter by `namespace`, `prefix`, `tags`, or `lifecycle` when narrowing candidates.\n\
+         - Use memory_store for durable preferences, decisions, and continuity points. Prefer namespaced keys like `project.alpha.decision` or `pref.editor.theme`.\n\
+         - When storing memory, include governance metadata when useful: `kind`, `tags`, `freshness`, and `conflict_policy`.\n\
+         - Bare memory keys are normalized into the `general.` namespace; reserve internal keys such as `session_*` for system-managed state.\n\
+         - Use memory_list lifecycle fields (`lifecycle_state`, `review_at`, `expires_at`, `promotion_candidate`) when deciding whether a memory is stale or should graduate into `MEMORY.md`.\n\
+         - If memory_list reveals legacy bare keys, orphan metadata, or missing governed metadata, use memory_cleanup to audit first and apply repairs deliberately.\n\
          - Treat injected memory context as historical guidance, not as a replacement for checking current state.",
     );
     if !memories.is_empty() {
@@ -463,7 +521,10 @@ fn build_workspace_file_section(
     if sanitized.is_empty() || is_placeholder_workspace_file(name, &sanitized) {
         return None;
     }
-    Some(format!("## {section_title}\n{}", cap_str(&sanitized, max_chars)))
+    Some(format!(
+        "## {section_title}\n{}",
+        cap_str(&sanitized, max_chars)
+    ))
 }
 
 fn build_soul_section(soul_md: Option<&str>) -> Option<String> {
@@ -493,10 +554,7 @@ fn build_identity_md_section(identity_md: Option<&str>) -> Option<String> {
     }
 
     if !parsed.metadata.is_empty() {
-        parts.push(format!(
-            "Identity traits: {}.",
-            parsed.metadata.join(", ")
-        ));
+        parts.push(format!("Identity traits: {}.", parsed.metadata.join(", ")));
     }
 
     let joined = parts.join("\n").trim().to_string();
@@ -646,7 +704,8 @@ fn is_placeholder_user_md(content: &str) -> bool {
 }
 
 fn is_placeholder_tools_md(content: &str) -> bool {
-    let normalized = normalize_placeholder_text(&strip_redundant_leading_heading("TOOLS.md", content));
+    let normalized =
+        normalize_placeholder_text(&strip_redundant_leading_heading("TOOLS.md", content));
     normalized
         == normalize_placeholder_text(&strip_redundant_leading_heading(
             "TOOLS.md",
@@ -780,7 +839,9 @@ pub fn tool_category(name: &str) -> &'static str {
 
         "shell_exec" | "shell_background" => "Shell",
 
-        "memory_store" | "memory_recall" | "memory_delete" | "memory_list" => "Memory",
+        "memory_store" | "memory_recall" | "memory_delete" | "memory_list" | "memory_cleanup" => {
+            "Memory"
+        }
 
         "agent_send" | "agent_spawn" | "agent_list" | "agent_kill" => "Agents",
 
@@ -798,7 +859,9 @@ pub fn tool_category(name: &str) -> &'static str {
         "skill_install" | "skill_create" => "Skill Management",
         _ if name.starts_with("mcp_") && name.contains("web_search") => "Web",
         _ if name.starts_with("mcp_")
-            && (name.contains("image") || name.contains("vision") || name.contains("screenshot")) =>
+            && (name.contains("image")
+                || name.contains("vision")
+                || name.contains("screenshot")) =>
         {
             "Media"
         }
@@ -844,6 +907,7 @@ pub fn tool_hint(name: &str) -> &'static str {
         "memory_recall" => "search memory for relevant context",
         "memory_delete" => "delete a memory entry",
         "memory_list" => "list stored memory keys",
+        "memory_cleanup" => "audit or repair governed memory metadata",
 
         // Agents
         "agent_send" => "send a message to another agent",
@@ -881,7 +945,9 @@ pub fn tool_hint(name: &str) -> &'static str {
 
         // Discovery
         "tool_search" => "discover relevant deferred tools on demand",
-        "tool_get_instructions" => "load additional guidance for a discovered instructional resource",
+        "tool_get_instructions" => {
+            "load additional guidance for a discovered instructional resource"
+        }
 
         _ => "",
     }
@@ -1019,9 +1085,12 @@ mod tests {
         );
         ctx.soul_md = Some("# SOUL.md\nStay sharp.".to_string());
         ctx.agents_md = Some("# AGENTS.md\n- Be useful.".to_string());
-        ctx.tools_md = Some("# TOOLS.md - Local Environment Notes\n- Use debug binaries.\n".to_string());
+        ctx.tools_md =
+            Some("# TOOLS.md - Local Environment Notes\n- Use debug binaries.\n".to_string());
         ctx.user_md = Some("# User\n- Name: Alice".to_string());
-        ctx.memory_md = Some("# Long-Term Memory\n- Prefer project.arch decisions over ad hoc choices.".to_string());
+        ctx.memory_md = Some(
+            "# Long-Term Memory\n- Prefer project.arch decisions over ad hoc choices.".to_string(),
+        );
 
         let prompt = build_system_prompt(&ctx);
         let agents_pos = prompt.find("## Guidelines").unwrap();
@@ -1084,6 +1153,7 @@ mod tests {
         assert_eq!(tool_category("browser_navigate"), "Browser");
         assert_eq!(tool_category("shell_exec"), "Shell");
         assert_eq!(tool_category("memory_store"), "Memory");
+        assert_eq!(tool_category("memory_cleanup"), "Memory");
         assert_eq!(tool_category("agent_send"), "Agents");
         assert_eq!(tool_category("mcp_minimax_web_search"), "Web");
         assert_eq!(tool_category("mcp_minimax_understand_image"), "Media");
@@ -1099,6 +1169,10 @@ mod tests {
         assert!(!tool_hint("file_read").is_empty());
         assert!(!tool_hint("browser_navigate").is_empty());
         assert_eq!(tool_hint("cron_cancel"), "cancel a scheduled task");
+        assert_eq!(
+            tool_hint("memory_cleanup"),
+            "audit or repair governed memory metadata"
+        );
         assert!(tool_hint("some_unknown_tool").is_empty());
     }
 
@@ -1108,6 +1182,7 @@ mod tests {
         assert!(section.contains("## Memory Recall"));
         assert!(section.contains("memory_recall"));
         assert!(section.contains("memory_list"));
+        assert!(section.contains("memory_cleanup"));
         assert!(!section.contains("Recalled memories"));
     }
 
@@ -1141,7 +1216,7 @@ mod tests {
         let section = build_memory_section(&memories);
         // Should be capped at 500 + "..."
         assert!(section.contains("..."));
-        assert!(section.len() < 1200);
+        assert!(section.len() < 1800);
     }
 
     #[test]
@@ -1154,7 +1229,10 @@ mod tests {
     #[test]
     fn test_skills_section_present() {
         let mut ctx = basic_ctx();
-        ctx.granted_tools = vec!["tool_search".to_string(), "tool_get_instructions".to_string()];
+        ctx.granted_tools = vec![
+            "tool_search".to_string(),
+            "tool_get_instructions".to_string(),
+        ];
         ctx.skills = vec![SkillInfo {
             name: "github".to_string(),
             description: "GitHub automation workflows".to_string(),
@@ -1173,7 +1251,10 @@ mod tests {
     #[test]
     fn test_tool_discovery_section_present() {
         let mut ctx = basic_ctx();
-        ctx.granted_tools = vec!["tool_search".to_string(), "tool_get_instructions".to_string()];
+        ctx.granted_tools = vec![
+            "tool_search".to_string(),
+            "tool_get_instructions".to_string(),
+        ];
         let prompt = build_system_prompt(&ctx);
         assert!(prompt.contains("## Tool Discovery"));
         assert!(prompt.contains("tool_search"));
@@ -1184,7 +1265,10 @@ mod tests {
     #[test]
     fn test_skills_section_keeps_prompt_only_skill() {
         let mut ctx = basic_ctx();
-        ctx.granted_tools = vec!["tool_search".to_string(), "tool_get_instructions".to_string()];
+        ctx.granted_tools = vec![
+            "tool_search".to_string(),
+            "tool_get_instructions".to_string(),
+        ];
         ctx.skills = vec![SkillInfo {
             name: "obsidian".to_string(),
             description: "Markdown vault guidance".to_string(),
@@ -1356,7 +1440,10 @@ mod tests {
     #[test]
     fn test_memory_md_section_present() {
         let mut ctx = basic_ctx();
-        ctx.memory_md = Some("# Long-Term Memory\n- Remember project.alpha.status before proposing changes.".to_string());
+        ctx.memory_md = Some(
+            "# Long-Term Memory\n- Remember project.alpha.status before proposing changes."
+                .to_string(),
+        );
         let prompt = build_system_prompt(&ctx);
         assert!(prompt.contains("## Long-Term Memory"));
         assert!(prompt.contains("project.alpha.status"));
@@ -1381,20 +1468,30 @@ mod tests {
                 "[project.alpha] Architecture decision: use Axum".to_string(),
                 "User prefers concise summaries".to_string(),
             ],
+            &["Run memory_cleanup before reuse: migrate legacy key [theme] to [general.theme]"
+                .to_string()],
+            &["Review stale memory before reuse: [project.alpha.status] (kind=project_state, review_at=2026-03-10T00:00:00Z, tags=project,alpha)".to_string()],
+            &["[pref.editor.theme] (kind=preference, freshness=durable, lifecycle=active, tags=profile,ui) solarized dark".to_string()],
             &["session_2026-03-11_alpha: Reviewed prompt pipeline".to_string()],
         )
         .unwrap();
 
         assert!(message.contains("[Memory context]"));
         assert!(message.contains("Relevant recalled memories"));
+        assert!(message.contains("Governance maintenance signals"));
+        assert!(message.contains("Governance attention signals"));
+        assert!(message.contains("Governed memory candidates"));
         assert!(message.contains("Recent session summaries"));
         assert!(message.contains("Architecture decision"));
+        assert!(message.contains("Run memory_cleanup before reuse"));
+        assert!(message.contains("Review stale memory before reuse"));
+        assert!(message.contains("pref.editor.theme"));
         assert!(message.contains("Reviewed prompt pipeline"));
     }
 
     #[test]
     fn test_memory_context_message_omitted_when_empty() {
-        assert!(build_memory_context_message(&[], &[]).is_none());
+        assert!(build_memory_context_message(&[], &[], &[], &[], &[]).is_none());
     }
 
     #[test]
@@ -1438,8 +1535,9 @@ mod tests {
     #[test]
     fn test_workspace_context_present() {
         let mut ctx = basic_ctx();
-        ctx.workspace_context =
-            Some("## Workspace Context\n- Project: project (Rust)\n- Git repository: yes".to_string());
+        ctx.workspace_context = Some(
+            "## Workspace Context\n- Project: project (Rust)\n- Git repository: yes".to_string(),
+        );
         let prompt = build_system_prompt(&ctx);
         assert!(prompt.contains("## Workspace Context"));
         assert!(prompt.contains("Project: project"));
@@ -1455,9 +1553,8 @@ mod tests {
         let prompt = build_system_prompt(&ctx);
         assert!(prompt.contains("## Identity"));
         assert!(prompt.contains("Role: helper"));
-        assert!(prompt.contains(
-            "Identity traits: archetype assistant, vibe sharp, greeting style blunt."
-        ));
+        assert!(prompt
+            .contains("Identity traits: archetype assistant, vibe sharp, greeting style blunt."));
         assert!(!prompt.contains("\n# Identity\n"));
         assert!(!prompt.contains("name: Assistant"));
         assert!(!prompt.contains("archetype: assistant"));
@@ -1471,9 +1568,7 @@ mod tests {
                 .to_string(),
         );
         let prompt = build_system_prompt(&ctx);
-        assert!(prompt.contains(
-            "Identity traits: archetype assistant, greeting style blunt."
-        ));
+        assert!(prompt.contains("Identity traits: archetype assistant, greeting style blunt."));
         assert!(!prompt.contains("vibe "));
         assert!(!prompt.contains("emoji"));
     }

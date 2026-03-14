@@ -2,10 +2,20 @@
 
 use crate::agent::AgentId;
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::collections::HashSet;
 use uuid::Uuid;
+
+/// Default namespace for user-managed structured memory keys.
+pub const DEFAULT_USER_MEMORY_NAMESPACE: &str = "general";
+/// Internal sidecar prefix used to store governance metadata for user memory keys.
+pub const MEMORY_METADATA_PREFIX: &str = "__openfang_memory_meta.";
+/// Current schema version for governed structured memory metadata.
+pub const MEMORY_METADATA_SCHEMA_VERSION: u32 = 1;
+/// Source label used when cleanup backfills governed metadata.
+pub const MEMORY_CLEANUP_SOURCE: &str = "memory_cleanup_api";
 
 /// Unique identifier for a memory fragment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -109,6 +119,990 @@ impl MemoryFilter {
             scope: Some(scope.into()),
             ..Default::default()
         }
+    }
+}
+
+/// True when the key belongs to an OpenFang-reserved internal namespace.
+pub fn is_internal_memory_key(key: &str) -> bool {
+    key.starts_with("session_") || key.starts_with("__openfang_")
+}
+
+/// True when the key is an internal sidecar metadata key.
+pub fn is_memory_metadata_key(key: &str) -> bool {
+    key.starts_with(MEMORY_METADATA_PREFIX)
+}
+
+/// True when the key is a user-managed legacy bare key that predates namespacing.
+pub fn is_legacy_user_memory_key(key: &str) -> bool {
+    !is_internal_memory_key(key) && !is_memory_metadata_key(key) && !key.contains('.')
+}
+
+fn is_valid_memory_key_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.')
+}
+
+fn is_valid_memory_namespace(namespace: &str) -> bool {
+    !namespace.is_empty()
+        && namespace
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+}
+
+fn is_valid_memory_key_shape(key: &str) -> bool {
+    if key.is_empty() || key.starts_with('.') || key.ends_with('.') || key.contains("..") {
+        return false;
+    }
+
+    key.chars().all(is_valid_memory_key_char)
+}
+
+fn is_valid_memory_prefix_shape(prefix: &str) -> bool {
+    if prefix.is_empty() || prefix.starts_with('.') || prefix.contains("..") {
+        return false;
+    }
+
+    prefix.chars().all(is_valid_memory_key_char)
+}
+
+/// Normalize a user-facing memory namespace.
+pub fn canonicalize_memory_namespace(namespace: &str) -> Result<String, String> {
+    let trimmed = namespace.trim();
+    if !is_valid_memory_namespace(trimmed) {
+        return Err(format!(
+            "Invalid memory namespace '{trimmed}'. Use letters, numbers, '_' or '-'."
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Normalize a user-facing memory key into a namespaced form.
+///
+/// Internal keys such as `session_*` and `__openfang_*` remain unchanged.
+/// Bare user keys are promoted into the `general.` namespace.
+pub fn canonicalize_user_memory_key(key: &str) -> Result<String, String> {
+    let trimmed = key.trim();
+    if trimmed.is_empty() {
+        return Err("Memory key cannot be empty.".to_string());
+    }
+    if !is_valid_memory_key_shape(trimmed) {
+        return Err(format!(
+            "Invalid memory key '{trimmed}'. Use letters, numbers, '.', '_' or '-'."
+        ));
+    }
+
+    if is_internal_memory_key(trimmed) {
+        return Ok(trimmed.to_string());
+    }
+
+    if trimmed.contains('.') {
+        return Ok(trimmed.to_string());
+    }
+
+    Ok(format!("{DEFAULT_USER_MEMORY_NAMESPACE}.{trimmed}"))
+}
+
+/// Return the effective namespace for a memory key.
+pub fn memory_key_namespace(key: &str) -> Option<String> {
+    let canonical = canonicalize_user_memory_key(key).ok()?;
+    if is_internal_memory_key(&canonical) {
+        return None;
+    }
+    canonical
+        .split_once('.')
+        .map(|(namespace, _)| namespace.to_string())
+}
+
+/// Build lookup candidates for a user-facing key, preserving backward compatibility.
+pub fn memory_lookup_candidates(key: &str) -> Result<Vec<String>, String> {
+    let trimmed = key.trim();
+    let canonical = canonicalize_user_memory_key(trimmed)?;
+    if canonical == trimmed {
+        Ok(vec![canonical])
+    } else {
+        Ok(vec![canonical, trimmed.to_string()])
+    }
+}
+
+/// Match a stored key against a user-facing prefix.
+pub fn memory_key_matches_prefix(key: &str, prefix: &str) -> Result<bool, String> {
+    let trimmed = prefix.trim();
+    if trimmed.is_empty() {
+        return Ok(true);
+    }
+
+    if !is_valid_memory_prefix_shape(trimmed) {
+        return Err(format!(
+            "Invalid memory prefix '{trimmed}'. Use letters, numbers, '.', '_' or '-'."
+        ));
+    }
+
+    if key.starts_with(trimmed) {
+        return Ok(true);
+    }
+
+    if is_internal_memory_key(trimmed) || trimmed.contains('.') {
+        return Ok(false);
+    }
+
+    Ok(key.starts_with(&format!("{DEFAULT_USER_MEMORY_NAMESPACE}.{trimmed}")))
+}
+
+/// Freshness class for governed structured memory.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryFreshness {
+    Rolling,
+    #[default]
+    Durable,
+    Archival,
+}
+
+/// Conflict policy used by governed writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryConflictPolicy {
+    #[default]
+    Overwrite,
+    SkipIfExists,
+}
+
+/// Governance metadata stored alongside a user-managed KV entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryRecordMetadata {
+    pub schema_version: u32,
+    pub key: String,
+    pub namespace: String,
+    pub kind: String,
+    pub tags: Vec<String>,
+    pub freshness: MemoryFreshness,
+    pub source: String,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Derived lifecycle state for a governed memory record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryLifecycleState {
+    Active,
+    Stale,
+    Expired,
+}
+
+/// Computed lifecycle snapshot used by API/tool responses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryLifecycleSnapshot {
+    pub state: MemoryLifecycleState,
+    pub review_at: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub promotion_candidate: bool,
+}
+
+/// Governed structured memory candidate selected for prompt-level retrieval.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GovernedMemoryPromptCandidate {
+    pub key: String,
+    pub value: serde_json::Value,
+    pub metadata: MemoryRecordMetadata,
+    pub lifecycle: MemoryLifecycleSnapshot,
+}
+
+/// Action-oriented governance signal used for prompt orchestration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GovernedMemoryOrchestrationSignal {
+    pub key: String,
+    pub metadata: MemoryRecordMetadata,
+    pub lifecycle: MemoryLifecycleSnapshot,
+}
+
+/// Governance snapshot summarizing review and promotion actions for prompts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct GovernedMemoryOrchestrationSnapshot {
+    pub stale_review: Vec<GovernedMemoryOrchestrationSignal>,
+    pub promotion_candidates: Vec<GovernedMemoryOrchestrationSignal>,
+}
+
+fn is_valid_memory_meta_token(token: &str) -> bool {
+    !token.is_empty()
+        && token
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+}
+
+/// Normalize a memory kind token.
+pub fn canonicalize_memory_kind(kind: &str) -> Result<String, String> {
+    let trimmed = kind.trim().to_lowercase();
+    if !is_valid_memory_meta_token(&trimmed) {
+        return Err(format!(
+            "Invalid memory kind '{kind}'. Use letters, numbers, '_' or '-'."
+        ));
+    }
+    Ok(trimmed)
+}
+
+/// Normalize, lowercase, deduplicate, and validate memory tags.
+pub fn canonicalize_memory_tags(tags: &[String]) -> Result<Vec<String>, String> {
+    if tags.len() > 8 {
+        return Err("Too many memory tags. Maximum is 8.".to_string());
+    }
+
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for tag in tags {
+        let normalized = tag.trim().to_lowercase();
+        if !is_valid_memory_meta_token(&normalized) {
+            return Err(format!(
+                "Invalid memory tag '{tag}'. Use letters, numbers, '_' or '-'."
+            ));
+        }
+        if seen.insert(normalized.clone()) {
+            out.push(normalized);
+        }
+    }
+    Ok(out)
+}
+
+/// Normalize tag filters from repeated query params or comma-delimited input.
+pub fn canonicalize_memory_tag_filters(tags: &[String]) -> Result<Vec<String>, String> {
+    let flattened: Vec<String> = tags
+        .iter()
+        .flat_map(|tag| tag.split(','))
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+
+    canonicalize_memory_tags(&flattened)
+}
+
+/// True when an entry contains every requested normalized tag.
+pub fn memory_tags_match(entry_tags: &[String], filter_tags: &[String]) -> bool {
+    filter_tags
+        .iter()
+        .all(|filter_tag| entry_tags.iter().any(|entry_tag| entry_tag == filter_tag))
+}
+
+/// Proposed governance cleanup action for a memory entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryCleanupAction {
+    MigrateLegacyKey,
+    DeleteLegacyKey,
+    DeleteOrphanMetadata,
+    BackfillMetadata,
+}
+
+/// A single governance cleanup finding derived from a raw KV snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryCleanupFinding {
+    pub action: MemoryCleanupAction,
+    pub key: String,
+    pub canonical_key: Option<String>,
+    pub metadata_key: Option<String>,
+}
+
+/// Cleanup plan derived from a raw KV snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct MemoryCleanupPlan {
+    pub findings: Vec<MemoryCleanupFinding>,
+}
+
+/// Cleanup finding surfaced as a prompt-time governance maintenance signal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryCleanupOrchestrationSignal {
+    pub action: MemoryCleanupAction,
+    pub key: String,
+    pub canonical_key: Option<String>,
+    pub metadata_key: Option<String>,
+}
+
+/// Cleanup maintenance snapshot grouped for prompt orchestration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct MemoryCleanupOrchestrationSnapshot {
+    pub legacy_repairs: Vec<MemoryCleanupOrchestrationSignal>,
+    pub metadata_repairs: Vec<MemoryCleanupOrchestrationSignal>,
+    pub orphan_metadata: Vec<MemoryCleanupOrchestrationSignal>,
+}
+
+/// Build a governance cleanup plan for legacy bare keys and sidecar inconsistencies.
+pub fn plan_memory_cleanup(entries: &[(String, serde_json::Value)]) -> MemoryCleanupPlan {
+    let metadata_map = collect_memory_metadata(entries);
+    let primary_keys: HashSet<String> = entries
+        .iter()
+        .map(|(key, _)| key)
+        .filter(|key| !is_memory_metadata_key(key))
+        .cloned()
+        .collect();
+
+    let mut findings = Vec::new();
+
+    for key in &primary_keys {
+        if is_internal_memory_key(key) {
+            continue;
+        }
+
+        if is_legacy_user_memory_key(key) {
+            let canonical_key = canonicalize_user_memory_key(key).ok();
+            let action = match canonical_key.as_deref() {
+                Some(canonical_key) if primary_keys.contains(canonical_key) => {
+                    MemoryCleanupAction::DeleteLegacyKey
+                }
+                Some(_) => MemoryCleanupAction::MigrateLegacyKey,
+                None => continue,
+            };
+            findings.push(MemoryCleanupFinding {
+                action,
+                key: key.clone(),
+                canonical_key,
+                metadata_key: None,
+            });
+            continue;
+        }
+
+        if !metadata_map.contains_key(key) {
+            findings.push(MemoryCleanupFinding {
+                action: MemoryCleanupAction::BackfillMetadata,
+                key: key.clone(),
+                canonical_key: Some(key.clone()),
+                metadata_key: memory_metadata_key(key).ok(),
+            });
+        }
+    }
+
+    for (key, _) in entries {
+        if !is_memory_metadata_key(key) {
+            continue;
+        }
+        let Some(primary_key) = memory_key_from_metadata_key(key) else {
+            continue;
+        };
+        if !primary_keys.contains(&primary_key) {
+            findings.push(MemoryCleanupFinding {
+                action: MemoryCleanupAction::DeleteOrphanMetadata,
+                key: primary_key,
+                canonical_key: None,
+                metadata_key: Some(key.clone()),
+            });
+        }
+    }
+
+    findings.sort_by(|a, b| {
+        a.key.cmp(&b.key).then_with(|| {
+            let a_meta = a.metadata_key.as_deref().unwrap_or("");
+            let b_meta = b.metadata_key.as_deref().unwrap_or("");
+            a_meta.cmp(b_meta)
+        })
+    });
+
+    MemoryCleanupPlan { findings }
+}
+
+fn memory_cleanup_action_sort_rank(action: &MemoryCleanupAction) -> u8 {
+    match action {
+        MemoryCleanupAction::MigrateLegacyKey => 0,
+        MemoryCleanupAction::DeleteLegacyKey => 1,
+        MemoryCleanupAction::BackfillMetadata => 2,
+        MemoryCleanupAction::DeleteOrphanMetadata => 3,
+    }
+}
+
+/// Summarize cleanup findings into prompt-time maintenance buckets.
+pub fn summarize_memory_cleanup_for_orchestration(
+    entries: &[(String, serde_json::Value)],
+    limit_per_bucket: usize,
+) -> MemoryCleanupOrchestrationSnapshot {
+    if limit_per_bucket == 0 {
+        return MemoryCleanupOrchestrationSnapshot::default();
+    }
+
+    let mut legacy_repairs = Vec::new();
+    let mut metadata_repairs = Vec::new();
+    let mut orphan_metadata = Vec::new();
+
+    let mut findings = plan_memory_cleanup(entries).findings;
+    findings.sort_by(|a, b| {
+        memory_cleanup_action_sort_rank(&a.action)
+            .cmp(&memory_cleanup_action_sort_rank(&b.action))
+            .then_with(|| a.key.cmp(&b.key))
+            .then_with(|| a.canonical_key.cmp(&b.canonical_key))
+            .then_with(|| a.metadata_key.cmp(&b.metadata_key))
+    });
+
+    for finding in findings {
+        let signal = MemoryCleanupOrchestrationSignal {
+            action: finding.action.clone(),
+            key: finding.key.clone(),
+            canonical_key: finding.canonical_key.clone(),
+            metadata_key: finding.metadata_key.clone(),
+        };
+
+        match finding.action {
+            MemoryCleanupAction::MigrateLegacyKey | MemoryCleanupAction::DeleteLegacyKey => {
+                if legacy_repairs.len() < limit_per_bucket {
+                    legacy_repairs.push(signal);
+                }
+            }
+            MemoryCleanupAction::BackfillMetadata => {
+                if metadata_repairs.len() < limit_per_bucket {
+                    metadata_repairs.push(signal);
+                }
+            }
+            MemoryCleanupAction::DeleteOrphanMetadata => {
+                if orphan_metadata.len() < limit_per_bucket {
+                    orphan_metadata.push(signal);
+                }
+            }
+        }
+    }
+
+    MemoryCleanupOrchestrationSnapshot {
+        legacy_repairs,
+        metadata_repairs,
+        orphan_metadata,
+    }
+}
+
+/// Build the internal sidecar key that stores governance metadata.
+pub fn memory_metadata_key(key: &str) -> Result<String, String> {
+    let canonical = canonicalize_user_memory_key(key)?;
+    if is_internal_memory_key(&canonical) {
+        return Err("Internal memory keys do not use governed metadata sidecars.".to_string());
+    }
+    Ok(format!("{MEMORY_METADATA_PREFIX}{canonical}"))
+}
+
+/// Parse the governed user key represented by a metadata sidecar key.
+pub fn memory_key_from_metadata_key(metadata_key: &str) -> Option<String> {
+    metadata_key
+        .strip_prefix(MEMORY_METADATA_PREFIX)
+        .map(|key| key.to_string())
+}
+
+/// Build metadata for a governed structured memory entry.
+pub fn build_memory_record_metadata(
+    key: &str,
+    kind: Option<&str>,
+    tags: &[String],
+    freshness: Option<MemoryFreshness>,
+    source: &str,
+) -> Result<MemoryRecordMetadata, String> {
+    let canonical_key = canonicalize_user_memory_key(key)?;
+    if is_internal_memory_key(&canonical_key) {
+        return Err("Internal memory keys cannot be wrapped in governed metadata.".to_string());
+    }
+
+    let namespace = memory_key_namespace(&canonical_key)
+        .ok_or("Governed memory keys must have a namespace.".to_string())?;
+    let kind = canonicalize_memory_kind(kind.unwrap_or("fact"))?;
+    let tags = canonicalize_memory_tags(tags)?;
+    let source = canonicalize_memory_kind(source)?;
+
+    Ok(MemoryRecordMetadata {
+        schema_version: MEMORY_METADATA_SCHEMA_VERSION,
+        key: canonical_key,
+        namespace,
+        kind,
+        tags,
+        freshness: freshness.unwrap_or_default(),
+        source,
+        updated_at: Utc::now(),
+    })
+}
+
+/// Extract all governed metadata sidecars from a raw KV list.
+pub fn collect_memory_metadata(
+    entries: &[(String, serde_json::Value)],
+) -> HashMap<String, MemoryRecordMetadata> {
+    let mut out = HashMap::new();
+    for (key, value) in entries {
+        let Some(primary_key) = memory_key_from_metadata_key(key) else {
+            continue;
+        };
+        let Ok(metadata) = serde_json::from_value::<MemoryRecordMetadata>(value.clone()) else {
+            continue;
+        };
+        out.insert(primary_key, metadata);
+    }
+    out
+}
+
+fn lifecycle_review_window(freshness: &MemoryFreshness) -> Duration {
+    match freshness {
+        MemoryFreshness::Rolling => Duration::days(7),
+        MemoryFreshness::Durable => Duration::days(30),
+        MemoryFreshness::Archival => Duration::days(180),
+    }
+}
+
+fn lifecycle_expiry_window(freshness: &MemoryFreshness) -> Option<Duration> {
+    match freshness {
+        MemoryFreshness::Rolling => Some(Duration::days(30)),
+        MemoryFreshness::Durable | MemoryFreshness::Archival => None,
+    }
+}
+
+/// Determine whether a governed memory record should be considered for promotion into MEMORY.md.
+pub fn is_memory_promotion_candidate(metadata: &MemoryRecordMetadata) -> bool {
+    matches!(metadata.freshness, MemoryFreshness::Durable)
+        && matches!(
+            metadata.kind.as_str(),
+            "preference" | "decision" | "constraint" | "profile" | "project_state"
+        )
+}
+
+/// Compute lifecycle fields for a governed memory record.
+pub fn memory_lifecycle_snapshot(
+    metadata: &MemoryRecordMetadata,
+    now: DateTime<Utc>,
+) -> MemoryLifecycleSnapshot {
+    let review_at = metadata.updated_at + lifecycle_review_window(&metadata.freshness);
+    let expires_at =
+        lifecycle_expiry_window(&metadata.freshness).map(|duration| metadata.updated_at + duration);
+    let state = match expires_at {
+        Some(expires_at) if now >= expires_at => MemoryLifecycleState::Expired,
+        _ if now >= review_at => MemoryLifecycleState::Stale,
+        _ => MemoryLifecycleState::Active,
+    };
+
+    MemoryLifecycleSnapshot {
+        state,
+        review_at,
+        expires_at,
+        promotion_candidate: is_memory_promotion_candidate(metadata),
+    }
+}
+
+fn is_priority_memory_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "preference" | "decision" | "constraint" | "profile" | "project_state"
+    )
+}
+
+fn memory_lifecycle_sort_rank(state: MemoryLifecycleState) -> u8 {
+    match state {
+        MemoryLifecycleState::Active => 0,
+        MemoryLifecycleState::Stale => 1,
+        MemoryLifecycleState::Expired => 2,
+    }
+}
+
+fn memory_freshness_sort_rank(freshness: &MemoryFreshness) -> u8 {
+    match freshness {
+        MemoryFreshness::Durable => 0,
+        MemoryFreshness::Rolling => 1,
+        MemoryFreshness::Archival => 2,
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct MemoryQueryProfile {
+    terms: Vec<String>,
+    phrases: Vec<String>,
+    namespace_hints: Vec<String>,
+    kind_hints: Vec<String>,
+}
+
+impl MemoryQueryProfile {
+    fn is_empty(&self) -> bool {
+        self.terms.is_empty()
+            && self.phrases.is_empty()
+            && self.namespace_hints.is_empty()
+            && self.kind_hints.is_empty()
+    }
+}
+
+fn is_memory_query_stopword(term: &str) -> bool {
+    matches!(
+        term,
+        "a"
+            | "an"
+            | "and"
+            | "are"
+            | "at"
+            | "be"
+            | "before"
+            | "but"
+            | "by"
+            | "can"
+            | "did"
+            | "do"
+            | "does"
+            | "for"
+            | "from"
+            | "how"
+            | "i"
+            | "if"
+            | "in"
+            | "into"
+            | "is"
+            | "it"
+            | "me"
+            | "my"
+            | "now"
+            | "of"
+            | "on"
+            | "or"
+            | "our"
+            | "right"
+            | "should"
+            | "that"
+            | "the"
+            | "their"
+            | "them"
+            | "there"
+            | "these"
+            | "they"
+            | "this"
+            | "to"
+            | "up"
+            | "use"
+            | "we"
+            | "what"
+            | "when"
+            | "where"
+            | "which"
+            | "who"
+            | "why"
+            | "you"
+            | "your"
+    )
+}
+
+fn normalize_memory_query_text(input: &str) -> String {
+    let mut normalized = String::with_capacity(input.len());
+    let mut previous_was_space = false;
+
+    for ch in input.chars() {
+        let normalized_char = if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-') {
+            ch.to_ascii_lowercase()
+        } else {
+            ' '
+        };
+
+        if normalized_char == ' ' {
+            if !previous_was_space && !normalized.is_empty() {
+                normalized.push(' ');
+            }
+            previous_was_space = true;
+        } else {
+            normalized.push(normalized_char);
+            previous_was_space = false;
+        }
+    }
+
+    normalized.trim().to_string()
+}
+
+fn memory_query_terms(query: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    let mut seen = HashSet::new();
+
+    for term in normalize_memory_query_text(query)
+        .split_whitespace()
+        .filter(|term| term.len() >= 2)
+        .filter(|term| !is_memory_query_stopword(term))
+    {
+        let term = term.to_string();
+        if seen.insert(term.clone()) {
+            terms.push(term);
+        }
+    }
+
+    terms
+}
+
+fn memory_query_phrases(terms: &[String]) -> Vec<String> {
+    let mut phrases = Vec::new();
+    let mut seen = HashSet::new();
+
+    for width in [3, 2] {
+        for window in terms.windows(width) {
+            let phrase = window.join(" ");
+            if seen.insert(phrase.clone()) {
+                phrases.push(phrase);
+            }
+        }
+    }
+
+    phrases
+}
+
+fn push_unique_hint(hints: &mut Vec<String>, hint: &str) {
+    if !hints.iter().any(|existing| existing == hint) {
+        hints.push(hint.to_string());
+    }
+}
+
+fn memory_query_profile(query: &str) -> MemoryQueryProfile {
+    let terms = memory_query_terms(query);
+    let phrases = memory_query_phrases(&terms);
+    let mut namespace_hints = Vec::new();
+    let mut kind_hints = Vec::new();
+
+    for term in &terms {
+        match term.as_str() {
+            "blocked" | "blocker" | "launch" | "milestone" | "project" | "qa" | "release"
+            | "roadmap" | "ship" | "shipping" | "status" => {
+                push_unique_hint(&mut namespace_hints, "project");
+                push_unique_hint(&mut kind_hints, "project_state");
+            }
+            "constraint" | "constraints" | "must" | "policy" | "requirement" | "required" => {
+                push_unique_hint(&mut kind_hints, "constraint");
+            }
+            "decide" | "decided" | "decision" | "choice" | "chosen" => {
+                push_unique_hint(&mut kind_hints, "decision");
+            }
+            "prefer" | "preference" | "preferences" | "preferred" | "style" | "theme"
+            | "tone" | "format" | "formatting" | "ux" | "ui" => {
+                push_unique_hint(&mut namespace_hints, "pref");
+                push_unique_hint(&mut kind_hints, "preference");
+            }
+            "profile" | "background" | "bio" => {
+                push_unique_hint(&mut kind_hints, "profile");
+            }
+            _ => {}
+        }
+    }
+
+    MemoryQueryProfile {
+        terms,
+        phrases,
+        namespace_hints,
+        kind_hints,
+    }
+}
+
+fn memory_query_match_score(
+    candidate: &GovernedMemoryPromptCandidate,
+    query_profile: &MemoryQueryProfile,
+) -> usize {
+    if query_profile.is_empty() {
+        return 0;
+    }
+
+    let key_tokens = memory_query_terms(&candidate.key);
+    let normalized_key = normalize_memory_query_text(&candidate.key);
+    let namespace = candidate.metadata.namespace.to_lowercase();
+    let kind = candidate.metadata.kind.to_lowercase();
+    let lowered_tags: Vec<String> = candidate
+        .metadata
+        .tags
+        .iter()
+        .map(|tag| tag.to_lowercase())
+        .collect();
+    let normalized_value = match &candidate.value {
+        serde_json::Value::String(text) => normalize_memory_query_text(text),
+        other => normalize_memory_query_text(&serde_json::to_string(other).unwrap_or_default()),
+    };
+
+    let term_score: usize = query_profile
+        .terms
+        .iter()
+        .map(|term| {
+            let mut score = 0;
+
+            if lowered_tags.iter().any(|tag| tag == term) {
+                score += 8;
+            }
+            if key_tokens.iter().any(|token| token == term) {
+                score += 7;
+            } else if namespace == *term {
+                score += 6;
+            } else if normalized_key.contains(term) {
+                score += 3;
+            }
+            if kind == *term {
+                score += 6;
+            }
+            if normalized_value.contains(term) {
+                score += 2;
+            }
+
+            score
+        })
+        .sum();
+
+    let phrase_score: usize = query_profile
+        .phrases
+        .iter()
+        .map(|phrase| {
+            let mut score = 0;
+
+            if normalized_key.contains(phrase) {
+                score += 10;
+            }
+            if normalized_value.contains(phrase) {
+                score += 5;
+            }
+            if lowered_tags
+                .iter()
+                .map(|tag| normalize_memory_query_text(tag))
+                .any(|tag| tag == *phrase)
+            {
+                score += 6;
+            }
+
+            score
+        })
+        .sum();
+
+    let namespace_hint_score = if query_profile
+        .namespace_hints
+        .iter()
+        .any(|hint| hint == &namespace)
+    {
+        8
+    } else {
+        0
+    };
+    let kind_hint_score = if query_profile.kind_hints.iter().any(|hint| hint == &kind) {
+        7
+    } else {
+        0
+    };
+
+    term_score + phrase_score + namespace_hint_score + kind_hint_score
+}
+
+fn collect_governed_memory_prompt_candidates(
+    entries: &[(String, serde_json::Value)],
+    now: DateTime<Utc>,
+) -> Vec<GovernedMemoryPromptCandidate> {
+    let metadata_map = collect_memory_metadata(entries);
+
+    entries
+        .iter()
+        .filter_map(|(key, value)| {
+            if is_internal_memory_key(key) || is_memory_metadata_key(key) {
+                return None;
+            }
+
+            let metadata = metadata_map.get(key)?.clone();
+            let lifecycle = memory_lifecycle_snapshot(&metadata, now);
+            if lifecycle.state == MemoryLifecycleState::Expired {
+                return None;
+            }
+
+            if !(is_priority_memory_kind(&metadata.kind)
+                || lifecycle.promotion_candidate
+                || !metadata.tags.is_empty())
+            {
+                return None;
+            }
+
+            Some(GovernedMemoryPromptCandidate {
+                key: key.clone(),
+                value: value.clone(),
+                metadata,
+                lifecycle,
+            })
+        })
+        .collect()
+}
+
+fn compare_governed_memory_candidates(
+    a: &GovernedMemoryPromptCandidate,
+    b: &GovernedMemoryPromptCandidate,
+    query_profile: &MemoryQueryProfile,
+) -> std::cmp::Ordering {
+    memory_query_match_score(b, query_profile)
+        .cmp(&memory_query_match_score(a, query_profile))
+        .then_with(|| {
+            memory_lifecycle_sort_rank(a.lifecycle.state).cmp(&memory_lifecycle_sort_rank(b.lifecycle.state))
+        })
+        .then_with(|| (!a.lifecycle.promotion_candidate).cmp(&(!b.lifecycle.promotion_candidate)))
+        .then_with(|| a.metadata.tags.is_empty().cmp(&b.metadata.tags.is_empty()))
+        .then_with(|| {
+            is_priority_memory_kind(&a.metadata.kind)
+                .cmp(&is_priority_memory_kind(&b.metadata.kind))
+                .reverse()
+        })
+        .then_with(|| {
+            memory_freshness_sort_rank(&a.metadata.freshness)
+                .cmp(&memory_freshness_sort_rank(&b.metadata.freshness))
+        })
+        .then_with(|| b.metadata.updated_at.cmp(&a.metadata.updated_at))
+        .then_with(|| a.key.cmp(&b.key))
+}
+
+/// Select governed user-memory candidates suitable for prompt-level retrieval.
+///
+/// The output is intentionally biased toward durable preferences, decisions,
+/// constraints, profile, and project-state records, while still allowing tagged
+/// governed records to surface. Expired lifecycle entries are excluded.
+pub fn select_governed_memory_prompt_candidates(
+    entries: &[(String, serde_json::Value)],
+    now: DateTime<Utc>,
+    limit: usize,
+) -> Vec<GovernedMemoryPromptCandidate> {
+    select_governed_memory_prompt_candidates_for_query(entries, now, limit, None)
+}
+
+/// Select governed user-memory candidates and rerank them against the current query.
+pub fn select_governed_memory_prompt_candidates_for_query(
+    entries: &[(String, serde_json::Value)],
+    now: DateTime<Utc>,
+    limit: usize,
+    query: Option<&str>,
+) -> Vec<GovernedMemoryPromptCandidate> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    let query_profile = query.map(memory_query_profile).unwrap_or_default();
+    let mut candidates = collect_governed_memory_prompt_candidates(entries, now);
+    candidates.sort_by(|a, b| compare_governed_memory_candidates(a, b, &query_profile));
+    candidates.truncate(limit);
+    candidates
+}
+
+/// Summarize governed memory review/promotion actions for higher-level prompt orchestration.
+pub fn summarize_governed_memory_orchestration_for_query(
+    entries: &[(String, serde_json::Value)],
+    now: DateTime<Utc>,
+    limit_per_bucket: usize,
+    query: Option<&str>,
+) -> GovernedMemoryOrchestrationSnapshot {
+    if limit_per_bucket == 0 {
+        return GovernedMemoryOrchestrationSnapshot::default();
+    }
+
+    let query_profile = query.map(memory_query_profile).unwrap_or_default();
+    let candidates = collect_governed_memory_prompt_candidates(entries, now);
+
+    let mut stale_review: Vec<GovernedMemoryPromptCandidate> = candidates
+        .iter()
+        .filter(|candidate| candidate.lifecycle.state == MemoryLifecycleState::Stale)
+        .cloned()
+        .collect();
+    stale_review.sort_by(|a, b| compare_governed_memory_candidates(a, b, &query_profile));
+    stale_review.truncate(limit_per_bucket);
+
+    let mut promotion_candidates: Vec<GovernedMemoryPromptCandidate> = candidates
+        .iter()
+        .filter(|candidate| candidate.lifecycle.promotion_candidate)
+        .cloned()
+        .collect();
+    promotion_candidates.sort_by(|a, b| compare_governed_memory_candidates(a, b, &query_profile));
+    promotion_candidates.truncate(limit_per_bucket);
+
+    GovernedMemoryOrchestrationSnapshot {
+        stale_review: stale_review
+            .into_iter()
+            .map(|candidate| GovernedMemoryOrchestrationSignal {
+                key: candidate.key,
+                metadata: candidate.metadata,
+                lifecycle: candidate.lifecycle,
+            })
+            .collect(),
+        promotion_candidates: promotion_candidates
+            .into_iter()
+            .map(|candidate| GovernedMemoryOrchestrationSignal {
+                key: candidate.key,
+                metadata: candidate.metadata,
+                lifecycle: candidate.lifecycle,
+            })
+            .collect(),
     }
 }
 
@@ -364,5 +1358,538 @@ mod tests {
         let json = serde_json::to_string(&fragment).unwrap();
         let deserialized: MemoryFragment = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.content, "Test memory");
+    }
+
+    #[test]
+    fn test_canonicalize_user_memory_key_adds_default_namespace() {
+        assert_eq!(
+            canonicalize_user_memory_key("user_name").unwrap(),
+            "general.user_name"
+        );
+        assert_eq!(
+            canonicalize_user_memory_key("project.alpha.status").unwrap(),
+            "project.alpha.status"
+        );
+    }
+
+    #[test]
+    fn test_internal_memory_key_bypasses_namespace() {
+        assert_eq!(
+            canonicalize_user_memory_key("session_2026-03-13_summary").unwrap(),
+            "session_2026-03-13_summary"
+        );
+        assert!(is_internal_memory_key("__openfang_schedules"));
+        assert!(is_legacy_user_memory_key("user_name"));
+        assert!(!is_legacy_user_memory_key("general.user_name"));
+    }
+
+    #[test]
+    fn test_memory_lookup_candidates_preserve_legacy_key_and_canonical_key() {
+        assert_eq!(
+            memory_lookup_candidates("user_name").unwrap(),
+            vec!["general.user_name".to_string(), "user_name".to_string()]
+        );
+        assert_eq!(
+            memory_lookup_candidates("project.alpha.status").unwrap(),
+            vec!["project.alpha.status".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_memory_key_matches_prefix_handles_default_namespace() {
+        assert!(memory_key_matches_prefix("general.user_name", "user").unwrap());
+        assert!(memory_key_matches_prefix("project.alpha.status", "project.").unwrap());
+        assert!(!memory_key_matches_prefix("__openfang_schedules", "user").unwrap());
+    }
+
+    #[test]
+    fn test_memory_metadata_key_roundtrip() {
+        let key = memory_metadata_key("user_name").unwrap();
+        assert_eq!(key, "__openfang_memory_meta.general.user_name");
+        assert_eq!(
+            memory_key_from_metadata_key(&key).unwrap(),
+            "general.user_name"
+        );
+    }
+
+    #[test]
+    fn test_build_memory_record_metadata_normalizes_fields() {
+        let metadata = build_memory_record_metadata(
+            "user_name",
+            Some("Preference"),
+            &[
+                "Name".to_string(),
+                "Name".to_string(),
+                "Profile".to_string(),
+            ],
+            Some(MemoryFreshness::Rolling),
+            "memory_store_tool",
+        )
+        .unwrap();
+
+        assert_eq!(metadata.key, "general.user_name");
+        assert_eq!(metadata.namespace, "general");
+        assert_eq!(metadata.kind, "preference");
+        assert_eq!(
+            metadata.tags,
+            vec!["name".to_string(), "profile".to_string()]
+        );
+        assert_eq!(metadata.freshness, MemoryFreshness::Rolling);
+    }
+
+    #[test]
+    fn test_canonicalize_memory_tag_filters_flattens_csv_and_deduplicates() {
+        let filters = canonicalize_memory_tag_filters(&[
+            "Profile, project".to_string(),
+            "profile".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(filters, vec!["profile".to_string(), "project".to_string()]);
+    }
+
+    #[test]
+    fn test_memory_tags_match_requires_all_requested_tags() {
+        let entry_tags = vec![
+            "profile".to_string(),
+            "project".to_string(),
+            "alpha".to_string(),
+        ];
+
+        assert!(memory_tags_match(
+            &entry_tags,
+            &["profile".to_string(), "alpha".to_string()]
+        ));
+        assert!(!memory_tags_match(
+            &entry_tags,
+            &["profile".to_string(), "missing".to_string()]
+        ));
+    }
+
+    #[test]
+    fn test_collect_memory_metadata_ignores_non_metadata_entries() {
+        let metadata =
+            build_memory_record_metadata("user_name", Some("fact"), &[], None, "memory_store_tool")
+                .unwrap();
+        let entries = vec![
+            ("general.user_name".to_string(), serde_json::json!("Alice")),
+            (
+                "__openfang_memory_meta.general.user_name".to_string(),
+                serde_json::to_value(&metadata).unwrap(),
+            ),
+        ];
+
+        let collected = collect_memory_metadata(&entries);
+        assert_eq!(collected["general.user_name"].kind, "fact");
+    }
+
+    #[test]
+    fn test_plan_memory_cleanup_detects_legacy_orphan_and_missing_metadata() {
+        let governed_metadata = build_memory_record_metadata(
+            "general.user_name",
+            Some("fact"),
+            &[],
+            None,
+            "memory_store_tool",
+        )
+        .unwrap();
+        let entries = vec![
+            ("user_name".to_string(), serde_json::json!("Alice")),
+            (
+                "general.user_name".to_string(),
+                serde_json::json!("Alice v2"),
+            ),
+            (
+                memory_metadata_key("general.user_name").unwrap(),
+                serde_json::to_value(governed_metadata).unwrap(),
+            ),
+            (
+                "project.alpha.status".to_string(),
+                serde_json::json!("green"),
+            ),
+            (
+                "__openfang_memory_meta.pref.theme".to_string(),
+                serde_json::json!({
+                    "schema_version": MEMORY_METADATA_SCHEMA_VERSION,
+                    "key": "pref.theme",
+                    "namespace": "pref",
+                    "kind": "preference",
+                    "tags": [],
+                    "freshness": "durable",
+                    "source": "memory_store_tool",
+                    "updated_at": Utc::now().to_rfc3339(),
+                }),
+            ),
+        ];
+
+        let plan = plan_memory_cleanup(&entries);
+
+        assert!(plan.findings.iter().any(|finding| {
+            finding.action == MemoryCleanupAction::DeleteLegacyKey
+                && finding.key == "user_name"
+                && finding.canonical_key.as_deref() == Some("general.user_name")
+        }));
+        assert!(plan.findings.iter().any(|finding| {
+            finding.action == MemoryCleanupAction::BackfillMetadata
+                && finding.key == "project.alpha.status"
+                && finding.metadata_key.as_deref()
+                    == Some("__openfang_memory_meta.project.alpha.status")
+        }));
+        assert!(plan.findings.iter().any(|finding| {
+            finding.action == MemoryCleanupAction::DeleteOrphanMetadata
+                && finding.key == "pref.theme"
+                && finding.metadata_key.as_deref() == Some("__openfang_memory_meta.pref.theme")
+        }));
+    }
+
+    #[test]
+    fn test_summarize_memory_cleanup_for_orchestration_groups_findings() {
+        let entries = vec![
+            ("legacy_theme".to_string(), serde_json::json!("solarized")),
+            (
+                "project.alpha.note".to_string(),
+                serde_json::json!("Alpha note"),
+            ),
+            (
+                memory_metadata_key("pref.orphan").unwrap(),
+                serde_json::json!({
+                    "schema_version": MEMORY_METADATA_SCHEMA_VERSION,
+                    "key": "pref.orphan",
+                    "namespace": "pref",
+                    "kind": "preference",
+                    "tags": ["profile"],
+                    "freshness": "durable",
+                    "source": "memory_store_tool",
+                    "updated_at": Utc::now().to_rfc3339(),
+                }),
+            ),
+        ];
+
+        let snapshot = summarize_memory_cleanup_for_orchestration(&entries, 2);
+
+        assert_eq!(snapshot.legacy_repairs.len(), 1);
+        assert_eq!(snapshot.legacy_repairs[0].action, MemoryCleanupAction::MigrateLegacyKey);
+        assert_eq!(snapshot.legacy_repairs[0].key, "legacy_theme");
+        assert_eq!(
+            snapshot.legacy_repairs[0].canonical_key.as_deref(),
+            Some("general.legacy_theme")
+        );
+        assert_eq!(snapshot.metadata_repairs.len(), 1);
+        assert_eq!(snapshot.metadata_repairs[0].action, MemoryCleanupAction::BackfillMetadata);
+        assert_eq!(snapshot.metadata_repairs[0].key, "project.alpha.note");
+        assert_eq!(snapshot.orphan_metadata.len(), 1);
+        assert_eq!(
+            snapshot.orphan_metadata[0].action,
+            MemoryCleanupAction::DeleteOrphanMetadata
+        );
+        assert_eq!(
+            snapshot.orphan_metadata[0].metadata_key.as_deref(),
+            Some("__openfang_memory_meta.pref.orphan")
+        );
+    }
+
+    #[test]
+    fn test_memory_lifecycle_snapshot_marks_rolling_records_expired() {
+        let metadata = MemoryRecordMetadata {
+            schema_version: MEMORY_METADATA_SCHEMA_VERSION,
+            key: "general.user_name".to_string(),
+            namespace: "general".to_string(),
+            kind: "fact".to_string(),
+            tags: vec![],
+            freshness: MemoryFreshness::Rolling,
+            source: "memory_store_tool".to_string(),
+            updated_at: Utc::now() - Duration::days(45),
+        };
+
+        let snapshot = memory_lifecycle_snapshot(&metadata, Utc::now());
+        assert_eq!(snapshot.state, MemoryLifecycleState::Expired);
+        assert!(snapshot.expires_at.is_some());
+        assert!(!snapshot.promotion_candidate);
+    }
+
+    #[test]
+    fn test_memory_lifecycle_snapshot_marks_durable_records_as_promotion_candidates() {
+        let metadata = MemoryRecordMetadata {
+            schema_version: MEMORY_METADATA_SCHEMA_VERSION,
+            key: "general.user_name".to_string(),
+            namespace: "general".to_string(),
+            kind: "preference".to_string(),
+            tags: vec!["profile".to_string()],
+            freshness: MemoryFreshness::Durable,
+            source: "memory_store_tool".to_string(),
+            updated_at: Utc::now(),
+        };
+
+        let snapshot = memory_lifecycle_snapshot(&metadata, Utc::now());
+        assert_eq!(snapshot.state, MemoryLifecycleState::Active);
+        assert!(snapshot.expires_at.is_none());
+        assert!(snapshot.promotion_candidate);
+    }
+
+    #[test]
+    fn test_select_governed_memory_prompt_candidates_prioritizes_active_tagged_records() {
+        let now = Utc::now();
+        let preference_metadata = MemoryRecordMetadata {
+            schema_version: MEMORY_METADATA_SCHEMA_VERSION,
+            key: "pref.editor.theme".to_string(),
+            namespace: "pref".to_string(),
+            kind: "preference".to_string(),
+            tags: vec!["profile".to_string(), "ui".to_string()],
+            freshness: MemoryFreshness::Durable,
+            source: "memory_store_tool".to_string(),
+            updated_at: now - Duration::days(1),
+        };
+        let project_metadata = MemoryRecordMetadata {
+            schema_version: MEMORY_METADATA_SCHEMA_VERSION,
+            key: "project.alpha.status".to_string(),
+            namespace: "project".to_string(),
+            kind: "project_state".to_string(),
+            tags: vec!["project".to_string(), "alpha".to_string()],
+            freshness: MemoryFreshness::Rolling,
+            source: "memory_store_tool".to_string(),
+            updated_at: now - Duration::days(10),
+        };
+        let fact_metadata = MemoryRecordMetadata {
+            schema_version: MEMORY_METADATA_SCHEMA_VERSION,
+            key: "general.fact_note".to_string(),
+            namespace: "general".to_string(),
+            kind: "fact".to_string(),
+            tags: vec![],
+            freshness: MemoryFreshness::Durable,
+            source: "memory_store_tool".to_string(),
+            updated_at: now,
+        };
+        let expired_metadata = MemoryRecordMetadata {
+            schema_version: MEMORY_METADATA_SCHEMA_VERSION,
+            key: "project.legacy.note".to_string(),
+            namespace: "project".to_string(),
+            kind: "project_state".to_string(),
+            tags: vec!["project".to_string()],
+            freshness: MemoryFreshness::Rolling,
+            source: "memory_store_tool".to_string(),
+            updated_at: now - Duration::days(45),
+        };
+        let entries = vec![
+            (
+                "pref.editor.theme".to_string(),
+                serde_json::json!("solarized dark"),
+            ),
+            (
+                memory_metadata_key("pref.editor.theme").unwrap(),
+                serde_json::to_value(&preference_metadata).unwrap(),
+            ),
+            (
+                "project.alpha.status".to_string(),
+                serde_json::json!("green"),
+            ),
+            (
+                memory_metadata_key("project.alpha.status").unwrap(),
+                serde_json::to_value(&project_metadata).unwrap(),
+            ),
+            (
+                "general.fact_note".to_string(),
+                serde_json::json!("ungrouped fact"),
+            ),
+            (
+                memory_metadata_key("general.fact_note").unwrap(),
+                serde_json::to_value(&fact_metadata).unwrap(),
+            ),
+            (
+                "project.legacy.note".to_string(),
+                serde_json::json!("expired"),
+            ),
+            (
+                memory_metadata_key("project.legacy.note").unwrap(),
+                serde_json::to_value(&expired_metadata).unwrap(),
+            ),
+        ];
+
+        let candidates = select_governed_memory_prompt_candidates(&entries, now, 5);
+
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].key, "pref.editor.theme");
+        assert_eq!(candidates[0].lifecycle.state, MemoryLifecycleState::Active);
+        assert_eq!(candidates[1].key, "project.alpha.status");
+        assert_eq!(candidates[1].lifecycle.state, MemoryLifecycleState::Stale);
+    }
+
+    #[test]
+    fn test_select_governed_memory_prompt_candidates_for_query_prioritizes_matching_tags_and_keys() {
+        let now = Utc::now();
+        let preference_metadata = MemoryRecordMetadata {
+            schema_version: MEMORY_METADATA_SCHEMA_VERSION,
+            key: "pref.editor.theme".to_string(),
+            namespace: "pref".to_string(),
+            kind: "preference".to_string(),
+            tags: vec!["profile".to_string(), "ui".to_string()],
+            freshness: MemoryFreshness::Durable,
+            source: "memory_store_tool".to_string(),
+            updated_at: now - Duration::days(2),
+        };
+        let project_metadata = MemoryRecordMetadata {
+            schema_version: MEMORY_METADATA_SCHEMA_VERSION,
+            key: "project.alpha.status".to_string(),
+            namespace: "project".to_string(),
+            kind: "project_state".to_string(),
+            tags: vec!["project".to_string(), "alpha".to_string()],
+            freshness: MemoryFreshness::Rolling,
+            source: "memory_store_tool".to_string(),
+            updated_at: now - Duration::hours(1),
+        };
+        let entries = vec![
+            (
+                "pref.editor.theme".to_string(),
+                serde_json::json!("Use compact bullet points."),
+            ),
+            (
+                memory_metadata_key("pref.editor.theme").unwrap(),
+                serde_json::to_value(&preference_metadata).unwrap(),
+            ),
+            (
+                "project.alpha.status".to_string(),
+                serde_json::json!("Alpha project is in progress."),
+            ),
+            (
+                memory_metadata_key("project.alpha.status").unwrap(),
+                serde_json::to_value(&project_metadata).unwrap(),
+            ),
+        ];
+
+        let candidates = select_governed_memory_prompt_candidates_for_query(
+            &entries,
+            now,
+            5,
+            Some("What is the alpha project status right now?"),
+        );
+
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].key, "project.alpha.status");
+        assert_eq!(candidates[1].key, "pref.editor.theme");
+    }
+
+    #[test]
+    fn test_memory_query_terms_drop_stopwords_and_build_phrases() {
+        let profile = memory_query_profile("What is the alpha project status right now?");
+
+        assert_eq!(profile.terms, vec!["alpha", "project", "status"]);
+        assert_eq!(
+            profile.phrases,
+            vec!["alpha project status", "alpha project", "project status"]
+        );
+        assert_eq!(profile.namespace_hints, vec!["project"]);
+        assert_eq!(profile.kind_hints, vec!["project_state"]);
+    }
+
+    #[test]
+    fn test_select_governed_memory_prompt_candidates_for_query_uses_preference_hints() {
+        let now = Utc::now();
+        let preference_metadata = MemoryRecordMetadata {
+            schema_version: MEMORY_METADATA_SCHEMA_VERSION,
+            key: "pref.reply.style".to_string(),
+            namespace: "pref".to_string(),
+            kind: "preference".to_string(),
+            tags: vec!["profile".to_string()],
+            freshness: MemoryFreshness::Durable,
+            source: "memory_store_tool".to_string(),
+            updated_at: now - Duration::days(3),
+        };
+        let project_metadata = MemoryRecordMetadata {
+            schema_version: MEMORY_METADATA_SCHEMA_VERSION,
+            key: "project.alpha.status".to_string(),
+            namespace: "project".to_string(),
+            kind: "project_state".to_string(),
+            tags: vec!["project".to_string(), "alpha".to_string()],
+            freshness: MemoryFreshness::Rolling,
+            source: "memory_store_tool".to_string(),
+            updated_at: now - Duration::hours(1),
+        };
+        let entries = vec![
+            (
+                "pref.reply.style".to_string(),
+                serde_json::json!("Use compact bullet lists with a short summary first."),
+            ),
+            (
+                memory_metadata_key("pref.reply.style").unwrap(),
+                serde_json::to_value(&preference_metadata).unwrap(),
+            ),
+            (
+                "project.alpha.status".to_string(),
+                serde_json::json!("Alpha launch is blocked on QA signoff."),
+            ),
+            (
+                memory_metadata_key("project.alpha.status").unwrap(),
+                serde_json::to_value(&project_metadata).unwrap(),
+            ),
+        ];
+
+        let candidates = select_governed_memory_prompt_candidates_for_query(
+            &entries,
+            now,
+            5,
+            Some("How should you format replies to me?"),
+        );
+
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].key, "pref.reply.style");
+        assert_eq!(candidates[1].key, "project.alpha.status");
+    }
+
+    #[test]
+    fn test_summarize_governed_memory_orchestration_for_query_surfaces_stale_and_promotion() {
+        let now = Utc::now();
+        let stale_project = MemoryRecordMetadata {
+            schema_version: MEMORY_METADATA_SCHEMA_VERSION,
+            key: "project.alpha.status".to_string(),
+            namespace: "project".to_string(),
+            kind: "project_state".to_string(),
+            tags: vec!["project".to_string(), "alpha".to_string()],
+            freshness: MemoryFreshness::Rolling,
+            source: "memory_store_tool".to_string(),
+            updated_at: now - Duration::days(8),
+        };
+        let durable_pref = MemoryRecordMetadata {
+            schema_version: MEMORY_METADATA_SCHEMA_VERSION,
+            key: "pref.editor.theme".to_string(),
+            namespace: "pref".to_string(),
+            kind: "preference".to_string(),
+            tags: vec!["profile".to_string(), "ui".to_string()],
+            freshness: MemoryFreshness::Durable,
+            source: "memory_store_tool".to_string(),
+            updated_at: now - Duration::days(1),
+        };
+        let entries = vec![
+            (
+                "project.alpha.status".to_string(),
+                serde_json::json!("Alpha is blocked on QA."),
+            ),
+            (
+                memory_metadata_key("project.alpha.status").unwrap(),
+                serde_json::to_value(&stale_project).unwrap(),
+            ),
+            (
+                "pref.editor.theme".to_string(),
+                serde_json::json!("Use solarized dark."),
+            ),
+            (
+                memory_metadata_key("pref.editor.theme").unwrap(),
+                serde_json::to_value(&durable_pref).unwrap(),
+            ),
+        ];
+
+        let snapshot = summarize_governed_memory_orchestration_for_query(
+            &entries,
+            now,
+            2,
+            Some("What is the alpha project status and ui preference?"),
+        );
+
+        assert_eq!(snapshot.stale_review.len(), 1);
+        assert_eq!(snapshot.stale_review[0].key, "project.alpha.status");
+        assert_eq!(
+            snapshot.stale_review[0].lifecycle.state,
+            MemoryLifecycleState::Stale
+        );
+        assert_eq!(snapshot.promotion_candidates.len(), 1);
+        assert_eq!(snapshot.promotion_candidates[0].key, "pref.editor.theme");
     }
 }

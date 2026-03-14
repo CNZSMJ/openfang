@@ -5289,6 +5289,13 @@ impl KernelHandle for OpenFangKernel {
             .map_err(|e| format!("Memory recall failed: {e}"))
     }
 
+    fn memory_delete(&self, key: &str) -> Result<(), String> {
+        let agent_id = shared_memory_agent_id();
+        self.memory
+            .structured_delete(agent_id, key)
+            .map_err(|e| format!("Memory delete failed: {e}"))
+    }
+
     fn memory_list(
         &self,
         prefix: Option<&str>,
@@ -5451,7 +5458,7 @@ impl KernelHandle for OpenFangKernel {
         } else {
             CronDelivery::None
         };
-        let one_shot = job_json["one_shot"].as_bool().unwrap_or_else(|| {
+        let one_shot = job_json["one_shot"].as_bool().unwrap_or({
             // For At-scheduled jobs without an explicit one_shot value,
             // default to true to prevent accidental infinite loops.
             matches!(schedule, CronSchedule::At { .. })

@@ -17,9 +17,15 @@ use crate::web_search::WebToolsContext;
 use openfang_memory::session::Session;
 use openfang_memory::MemorySubstrate;
 use openfang_skills::registry::SkillRegistry;
-use openfang_types::agent::{AgentId, AgentManifest};
+use openfang_types::agent::AgentId;
+use openfang_types::agent::AgentManifest;
 use openfang_types::error::{OpenFangError, OpenFangResult};
-use openfang_types::memory::{Memory, MemoryFilter, MemorySource};
+use openfang_types::memory::{
+    Memory, MemoryFilter, MemoryFreshness, MemoryLifecycleState, MemorySource,
+    select_governed_memory_prompt_candidates_for_query,
+    summarize_memory_cleanup_for_orchestration,
+    summarize_governed_memory_orchestration_for_query,
+};
 use openfang_types::message::{
     ContentBlock, Message, MessageContent, Role, StopReason, TokenUsage,
 };
@@ -122,22 +128,28 @@ fn format_recalled_memory_fragments(
         .collect()
 }
 
+#[cfg(test)]
 fn load_recent_session_summaries(
     memory: &MemorySubstrate,
     agent_id: AgentId,
     limit: usize,
 ) -> Vec<String> {
-    let mut summaries: Vec<(String, String)> = memory
-        .list_kv(agent_id)
-        .unwrap_or_default()
-        .into_iter()
+    load_recent_session_summaries_from_entries(&memory.list_kv(agent_id).unwrap_or_default(), limit)
+}
+
+fn load_recent_session_summaries_from_entries(
+    entries: &[(String, serde_json::Value)],
+    limit: usize,
+) -> Vec<String> {
+    let mut summaries: Vec<(String, String)> = entries
+        .iter()
         .filter_map(|(key, value)| {
             if !key.starts_with("session_") {
                 return None;
             }
 
             let rendered = match value {
-                serde_json::Value::String(text) => text,
+                serde_json::Value::String(text) => text.clone(),
                 other => serde_json::to_string(&other).ok()?,
             };
 
@@ -163,6 +175,191 @@ fn load_recent_session_summaries(
         .take(limit)
         .map(|(_, summary)| summary)
         .collect()
+}
+
+fn render_memory_freshness(freshness: &MemoryFreshness) -> &'static str {
+    match freshness {
+        MemoryFreshness::Rolling => "rolling",
+        MemoryFreshness::Durable => "durable",
+        MemoryFreshness::Archival => "archival",
+    }
+}
+
+fn render_memory_lifecycle_state(state: MemoryLifecycleState) -> &'static str {
+    match state {
+        MemoryLifecycleState::Active => "active",
+        MemoryLifecycleState::Stale => "stale",
+        MemoryLifecycleState::Expired => "expired",
+    }
+}
+
+fn format_governed_memory_candidates(
+    user_message: &str,
+    entries: &[(String, serde_json::Value)],
+    limit: usize,
+) -> Vec<String> {
+    let mut seen = HashSet::new();
+
+    select_governed_memory_prompt_candidates_for_query(
+        entries,
+        chrono::Utc::now(),
+        limit,
+        Some(user_message),
+    )
+        .into_iter()
+        .filter_map(|candidate| {
+            let rendered_value = match candidate.value {
+                serde_json::Value::String(text) => text,
+                other => serde_json::to_string(&other).ok()?,
+            };
+            let rendered_value = rendered_value.trim();
+            if rendered_value.is_empty() {
+                return None;
+            }
+
+            let mut qualifiers = vec![
+                format!("kind={}", candidate.metadata.kind),
+                format!(
+                    "freshness={}",
+                    render_memory_freshness(&candidate.metadata.freshness)
+                ),
+                format!(
+                    "lifecycle={}",
+                    render_memory_lifecycle_state(candidate.lifecycle.state)
+                ),
+            ];
+            if !candidate.metadata.tags.is_empty() {
+                qualifiers.push(format!("tags={}", candidate.metadata.tags.join(",")));
+            }
+            if candidate.lifecycle.promotion_candidate {
+                qualifiers.push("promotion_candidate".to_string());
+            }
+
+            let rendered = format!(
+                "[{}] ({}) {}",
+                candidate.key,
+                qualifiers.join(", "),
+                openfang_types::truncate_str(rendered_value, 240)
+            );
+
+            if seen.insert(rendered.clone()) {
+                Some(rendered)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn format_governed_memory_orchestration_signals(
+    user_message: &str,
+    entries: &[(String, serde_json::Value)],
+    limit_per_bucket: usize,
+) -> Vec<String> {
+    let snapshot = summarize_governed_memory_orchestration_for_query(
+        entries,
+        chrono::Utc::now(),
+        limit_per_bucket,
+        Some(user_message),
+    );
+    let mut rendered = Vec::new();
+
+    for signal in snapshot.stale_review {
+        let mut qualifiers = vec![
+            format!("kind={}", signal.metadata.kind),
+            format!("review_at={}", signal.lifecycle.review_at.to_rfc3339()),
+        ];
+        if let Some(expires_at) = signal.lifecycle.expires_at {
+            qualifiers.push(format!("expires_at={}", expires_at.to_rfc3339()));
+        }
+        if !signal.metadata.tags.is_empty() {
+            qualifiers.push(format!("tags={}", signal.metadata.tags.join(",")));
+        }
+        rendered.push(format!(
+            "Review stale memory before reuse: [{}] ({})",
+            signal.key,
+            qualifiers.join(", ")
+        ));
+    }
+
+    for signal in snapshot.promotion_candidates {
+        let mut qualifiers = vec![
+            format!("kind={}", signal.metadata.kind),
+            format!(
+                "freshness={}",
+                render_memory_freshness(&signal.metadata.freshness)
+            ),
+            format!(
+                "lifecycle={}",
+                render_memory_lifecycle_state(signal.lifecycle.state)
+            ),
+        ];
+        if !signal.metadata.tags.is_empty() {
+            qualifiers.push(format!("tags={}", signal.metadata.tags.join(",")));
+        }
+        rendered.push(format!(
+            "Consider promoting to MEMORY.md: [{}] ({})",
+            signal.key,
+            qualifiers.join(", ")
+        ));
+    }
+
+    rendered
+}
+
+fn format_memory_cleanup_orchestration_signals(
+    entries: &[(String, serde_json::Value)],
+    limit_per_bucket: usize,
+) -> Vec<String> {
+    let snapshot = summarize_memory_cleanup_for_orchestration(entries, limit_per_bucket);
+    let mut rendered = Vec::new();
+
+    for signal in snapshot.legacy_repairs {
+        match signal.action {
+            openfang_types::memory::MemoryCleanupAction::MigrateLegacyKey => rendered.push(
+                format!(
+                    "Run memory_cleanup before reuse: migrate legacy key [{}] to [{}]",
+                    signal.key,
+                    signal.canonical_key.unwrap_or_else(|| "unknown".to_string())
+                ),
+            ),
+            openfang_types::memory::MemoryCleanupAction::DeleteLegacyKey => rendered.push(
+                format!(
+                    "Run memory_cleanup before reuse: delete duplicate legacy key [{}]",
+                    signal.key
+                ),
+            ),
+            _ => {}
+        }
+    }
+
+    for signal in snapshot.metadata_repairs {
+        rendered.push(format!(
+            "Run memory_cleanup to backfill governed metadata for [{}]",
+            signal.key
+        ));
+    }
+
+    for signal in snapshot.orphan_metadata {
+        rendered.push(format!(
+            "Run memory_cleanup to remove orphan metadata sidecar [{}]",
+            signal.metadata_key.unwrap_or(signal.key)
+        ));
+    }
+
+    rendered
+}
+
+fn load_governed_memory_entries(
+    memory: &MemorySubstrate,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    agent_id: AgentId,
+) -> Vec<(String, serde_json::Value)> {
+    if let Some(kh) = kernel {
+        return kh.memory_list(None, Some(500)).unwrap_or_default();
+    }
+
+    memory.list_kv(agent_id).unwrap_or_default()
 }
 
 fn trim_messages_for_prepended_context(messages: &mut Vec<Message>, reserved_slots: usize) {
@@ -343,9 +540,14 @@ pub async fn run_agent_loop_with_session_message(
             .await
             .unwrap_or_default()
     };
+    let structured_entries = memory.list_kv(session.agent_id).unwrap_or_default();
+    let governed_entries = load_governed_memory_entries(memory, kernel.as_ref(), session.agent_id);
     let memory_context_msg = crate::prompt_builder::build_memory_context_message(
         &format_recalled_memory_fragments(&_memories),
-        &load_recent_session_summaries(memory, session.agent_id, 3),
+        &format_memory_cleanup_orchestration_signals(&governed_entries, 2),
+        &format_governed_memory_orchestration_signals(user_message, &governed_entries, 2),
+        &format_governed_memory_candidates(user_message, &governed_entries, 4),
+        &load_recent_session_summaries_from_entries(&structured_entries, 3),
     );
 
     // Fire BeforePromptBuild hook
@@ -1283,9 +1485,14 @@ pub async fn run_agent_loop_streaming(
             .await
             .unwrap_or_default()
     };
+    let structured_entries = memory.list_kv(session.agent_id).unwrap_or_default();
+    let governed_entries = load_governed_memory_entries(memory, kernel.as_ref(), session.agent_id);
     let memory_context_msg = crate::prompt_builder::build_memory_context_message(
         &format_recalled_memory_fragments(&_memories),
-        &load_recent_session_summaries(memory, session.agent_id, 3),
+        &format_memory_cleanup_orchestration_signals(&governed_entries, 2),
+        &format_governed_memory_orchestration_signals(user_message, &governed_entries, 2),
+        &format_governed_memory_candidates(user_message, &governed_entries, 4),
+        &load_recent_session_summaries_from_entries(&structured_entries, 3),
     );
 
     // Fire BeforePromptBuild hook
@@ -2509,6 +2716,205 @@ mod tests {
         assert_eq!(summaries.len(), 1);
         assert!(summaries[0].contains("session_2026-03-12_beta"));
         assert!(summaries[0].contains("Newest summary"));
+    }
+
+    #[test]
+    fn test_format_governed_memory_candidates_surfaces_lifecycle_and_tags() {
+        let now = chrono::Utc::now();
+        let themed_metadata = openfang_types::memory::MemoryRecordMetadata {
+            schema_version: openfang_types::memory::MEMORY_METADATA_SCHEMA_VERSION,
+            key: "pref.editor.theme".to_string(),
+            namespace: "pref".to_string(),
+            kind: "preference".to_string(),
+            tags: vec!["profile".to_string(), "ui".to_string()],
+            freshness: MemoryFreshness::Durable,
+            source: "memory_store_tool".to_string(),
+            updated_at: now,
+        };
+        let fact_metadata = openfang_types::memory::MemoryRecordMetadata {
+            schema_version: openfang_types::memory::MEMORY_METADATA_SCHEMA_VERSION,
+            key: "general.note".to_string(),
+            namespace: "general".to_string(),
+            kind: "fact".to_string(),
+            tags: vec![],
+            freshness: MemoryFreshness::Durable,
+            source: "memory_store_tool".to_string(),
+            updated_at: now,
+        };
+        let entries = vec![
+            (
+                "pref.editor.theme".to_string(),
+                serde_json::json!("solarized dark"),
+            ),
+            (
+                openfang_types::memory::memory_metadata_key("pref.editor.theme").unwrap(),
+                serde_json::to_value(&themed_metadata).unwrap(),
+            ),
+            ("general.note".to_string(), serde_json::json!("plain fact")),
+            (
+                openfang_types::memory::memory_metadata_key("general.note").unwrap(),
+                serde_json::to_value(&fact_metadata).unwrap(),
+            ),
+        ];
+
+        let rendered = format_governed_memory_candidates(
+            "What is the editor theme and ui preference?",
+            &entries,
+            5,
+        );
+
+        assert_eq!(rendered.len(), 1);
+        assert!(rendered[0].contains("[pref.editor.theme]"));
+        assert!(rendered[0].contains("kind=preference"));
+        assert!(rendered[0].contains("freshness=durable"));
+        assert!(rendered[0].contains("lifecycle=active"));
+        assert!(rendered[0].contains("tags=profile,ui"));
+        assert!(rendered[0].contains("promotion_candidate"));
+    }
+
+    #[test]
+    fn test_format_governed_memory_candidates_query_prioritizes_matching_project_entry() {
+        let now = chrono::Utc::now();
+        let pref_metadata = openfang_types::memory::MemoryRecordMetadata {
+            schema_version: openfang_types::memory::MEMORY_METADATA_SCHEMA_VERSION,
+            key: "pref.editor.theme".to_string(),
+            namespace: "pref".to_string(),
+            kind: "preference".to_string(),
+            tags: vec!["profile".to_string(), "ui".to_string()],
+            freshness: MemoryFreshness::Durable,
+            source: "memory_store_tool".to_string(),
+            updated_at: now - chrono::Duration::days(1),
+        };
+        let project_metadata = openfang_types::memory::MemoryRecordMetadata {
+            schema_version: openfang_types::memory::MEMORY_METADATA_SCHEMA_VERSION,
+            key: "project.alpha.status".to_string(),
+            namespace: "project".to_string(),
+            kind: "project_state".to_string(),
+            tags: vec!["project".to_string(), "alpha".to_string()],
+            freshness: MemoryFreshness::Rolling,
+            source: "memory_store_tool".to_string(),
+            updated_at: now,
+        };
+        let entries = vec![
+            (
+                "pref.editor.theme".to_string(),
+                serde_json::json!("Use compact bullet points."),
+            ),
+            (
+                openfang_types::memory::memory_metadata_key("pref.editor.theme").unwrap(),
+                serde_json::to_value(&pref_metadata).unwrap(),
+            ),
+            (
+                "project.alpha.status".to_string(),
+                serde_json::json!("Alpha project is in progress."),
+            ),
+            (
+                openfang_types::memory::memory_metadata_key("project.alpha.status").unwrap(),
+                serde_json::to_value(&project_metadata).unwrap(),
+            ),
+        ];
+
+        let rendered = format_governed_memory_candidates(
+            "What is the alpha project status?",
+            &entries,
+            2,
+        );
+
+        assert_eq!(rendered.len(), 2);
+        assert!(rendered[0].contains("[project.alpha.status]"));
+        assert!(rendered[1].contains("[pref.editor.theme]"));
+    }
+
+    #[test]
+    fn test_format_governed_memory_orchestration_signals_surfaces_review_and_promotion() {
+        let now = chrono::Utc::now();
+        let stale_project = openfang_types::memory::MemoryRecordMetadata {
+            schema_version: openfang_types::memory::MEMORY_METADATA_SCHEMA_VERSION,
+            key: "project.alpha.status".to_string(),
+            namespace: "project".to_string(),
+            kind: "project_state".to_string(),
+            tags: vec!["project".to_string(), "alpha".to_string()],
+            freshness: MemoryFreshness::Rolling,
+            source: "memory_store_tool".to_string(),
+            updated_at: now - chrono::Duration::days(8),
+        };
+        let durable_pref = openfang_types::memory::MemoryRecordMetadata {
+            schema_version: openfang_types::memory::MEMORY_METADATA_SCHEMA_VERSION,
+            key: "pref.editor.theme".to_string(),
+            namespace: "pref".to_string(),
+            kind: "preference".to_string(),
+            tags: vec!["profile".to_string(), "ui".to_string()],
+            freshness: MemoryFreshness::Durable,
+            source: "memory_store_tool".to_string(),
+            updated_at: now - chrono::Duration::days(1),
+        };
+        let entries = vec![
+            (
+                "project.alpha.status".to_string(),
+                serde_json::json!("Alpha is blocked on QA."),
+            ),
+            (
+                openfang_types::memory::memory_metadata_key("project.alpha.status").unwrap(),
+                serde_json::to_value(&stale_project).unwrap(),
+            ),
+            (
+                "pref.editor.theme".to_string(),
+                serde_json::json!("Use solarized dark."),
+            ),
+            (
+                openfang_types::memory::memory_metadata_key("pref.editor.theme").unwrap(),
+                serde_json::to_value(&durable_pref).unwrap(),
+            ),
+        ];
+
+        let rendered = format_governed_memory_orchestration_signals(
+            "What is the alpha project status and ui preference?",
+            &entries,
+            2,
+        );
+
+        assert_eq!(rendered.len(), 2);
+        assert!(rendered[0].contains("Review stale memory before reuse"));
+        assert!(rendered[0].contains("[project.alpha.status]"));
+        assert!(rendered[1].contains("Consider promoting to MEMORY.md"));
+        assert!(rendered[1].contains("[pref.editor.theme]"));
+    }
+
+    #[test]
+    fn test_format_memory_cleanup_orchestration_signals_surfaces_maintenance_actions() {
+        let entries = vec![
+            (
+                "legacy_theme".to_string(),
+                serde_json::json!("solarized"),
+            ),
+            (
+                "project.alpha.note".to_string(),
+                serde_json::json!("Alpha note"),
+            ),
+            (
+                openfang_types::memory::memory_metadata_key("pref.orphan").unwrap(),
+                serde_json::json!({
+                    "schema_version": openfang_types::memory::MEMORY_METADATA_SCHEMA_VERSION,
+                    "key": "pref.orphan",
+                    "namespace": "pref",
+                    "kind": "preference",
+                    "tags": ["profile"],
+                    "freshness": "durable",
+                    "source": "memory_store_tool",
+                    "updated_at": chrono::Utc::now().to_rfc3339(),
+                }),
+            ),
+        ];
+
+        let rendered = format_memory_cleanup_orchestration_signals(&entries, 2);
+
+        assert_eq!(rendered.len(), 3);
+        assert!(rendered[0].contains("Run memory_cleanup before reuse"));
+        assert!(rendered[0].contains("[legacy_theme]"));
+        assert!(rendered[1].contains("backfill governed metadata"));
+        assert!(rendered[1].contains("[project.alpha.note]"));
+        assert!(rendered[2].contains("remove orphan metadata sidecar"));
+        assert!(rendered[2].contains("__openfang_memory_meta.pref.orphan"));
     }
 
     #[test]
