@@ -341,11 +341,13 @@ pub fn build_canonical_context_message(ctx: &PromptContext) -> Option<String> {
 /// and recent session summaries for the current turn.
 pub fn build_memory_context_message(
     recalled_memories: &[String],
+    cleanup_maintenance_signals: &[String],
     governed_memory_signals: &[String],
     governed_memory_candidates: &[String],
     recent_session_summaries: &[String],
 ) -> Option<String> {
     if recalled_memories.is_empty()
+        && cleanup_maintenance_signals.is_empty()
         && governed_memory_signals.is_empty()
         && governed_memory_candidates.is_empty()
         && recent_session_summaries.is_empty()
@@ -362,8 +364,18 @@ pub fn build_memory_context_message(
         }
     }
 
-    if !governed_memory_signals.is_empty() {
+    if !cleanup_maintenance_signals.is_empty() {
         if !recalled_memories.is_empty() {
+            out.push('\n');
+        }
+        out.push_str("Governance maintenance signals:\n");
+        for signal in cleanup_maintenance_signals.iter().take(4) {
+            out.push_str(&format!("- {}\n", cap_str(signal, 320)));
+        }
+    }
+
+    if !governed_memory_signals.is_empty() {
+        if !recalled_memories.is_empty() || !cleanup_maintenance_signals.is_empty() {
             out.push('\n');
         }
         out.push_str("Governance attention signals:\n");
@@ -373,7 +385,10 @@ pub fn build_memory_context_message(
     }
 
     if !governed_memory_candidates.is_empty() {
-        if !recalled_memories.is_empty() || !governed_memory_signals.is_empty() {
+        if !recalled_memories.is_empty()
+            || !cleanup_maintenance_signals.is_empty()
+            || !governed_memory_signals.is_empty()
+        {
             out.push('\n');
         }
         out.push_str("Governed memory candidates:\n");
@@ -384,6 +399,7 @@ pub fn build_memory_context_message(
 
     if !recent_session_summaries.is_empty() {
         if !recalled_memories.is_empty()
+            || !cleanup_maintenance_signals.is_empty()
             || !governed_memory_signals.is_empty()
             || !governed_memory_candidates.is_empty()
         {
@@ -1452,6 +1468,8 @@ mod tests {
                 "[project.alpha] Architecture decision: use Axum".to_string(),
                 "User prefers concise summaries".to_string(),
             ],
+            &["Run memory_cleanup before reuse: migrate legacy key [theme] to [general.theme]"
+                .to_string()],
             &["Review stale memory before reuse: [project.alpha.status] (kind=project_state, review_at=2026-03-10T00:00:00Z, tags=project,alpha)".to_string()],
             &["[pref.editor.theme] (kind=preference, freshness=durable, lifecycle=active, tags=profile,ui) solarized dark".to_string()],
             &["session_2026-03-11_alpha: Reviewed prompt pipeline".to_string()],
@@ -1460,10 +1478,12 @@ mod tests {
 
         assert!(message.contains("[Memory context]"));
         assert!(message.contains("Relevant recalled memories"));
+        assert!(message.contains("Governance maintenance signals"));
         assert!(message.contains("Governance attention signals"));
         assert!(message.contains("Governed memory candidates"));
         assert!(message.contains("Recent session summaries"));
         assert!(message.contains("Architecture decision"));
+        assert!(message.contains("Run memory_cleanup before reuse"));
         assert!(message.contains("Review stale memory before reuse"));
         assert!(message.contains("pref.editor.theme"));
         assert!(message.contains("Reviewed prompt pipeline"));
@@ -1471,7 +1491,7 @@ mod tests {
 
     #[test]
     fn test_memory_context_message_omitted_when_empty() {
-        assert!(build_memory_context_message(&[], &[], &[], &[]).is_none());
+        assert!(build_memory_context_message(&[], &[], &[], &[], &[]).is_none());
     }
 
     #[test]

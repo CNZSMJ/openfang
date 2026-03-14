@@ -23,6 +23,7 @@ use openfang_types::error::{OpenFangError, OpenFangResult};
 use openfang_types::memory::{
     Memory, MemoryFilter, MemoryFreshness, MemoryLifecycleState, MemorySource,
     select_governed_memory_prompt_candidates_for_query,
+    summarize_memory_cleanup_for_orchestration,
     summarize_governed_memory_orchestration_for_query,
 };
 use openfang_types::message::{
@@ -306,6 +307,49 @@ fn format_governed_memory_orchestration_signals(
     rendered
 }
 
+fn format_memory_cleanup_orchestration_signals(
+    entries: &[(String, serde_json::Value)],
+    limit_per_bucket: usize,
+) -> Vec<String> {
+    let snapshot = summarize_memory_cleanup_for_orchestration(entries, limit_per_bucket);
+    let mut rendered = Vec::new();
+
+    for signal in snapshot.legacy_repairs {
+        match signal.action {
+            openfang_types::memory::MemoryCleanupAction::MigrateLegacyKey => rendered.push(
+                format!(
+                    "Run memory_cleanup before reuse: migrate legacy key [{}] to [{}]",
+                    signal.key,
+                    signal.canonical_key.unwrap_or_else(|| "unknown".to_string())
+                ),
+            ),
+            openfang_types::memory::MemoryCleanupAction::DeleteLegacyKey => rendered.push(
+                format!(
+                    "Run memory_cleanup before reuse: delete duplicate legacy key [{}]",
+                    signal.key
+                ),
+            ),
+            _ => {}
+        }
+    }
+
+    for signal in snapshot.metadata_repairs {
+        rendered.push(format!(
+            "Run memory_cleanup to backfill governed metadata for [{}]",
+            signal.key
+        ));
+    }
+
+    for signal in snapshot.orphan_metadata {
+        rendered.push(format!(
+            "Run memory_cleanup to remove orphan metadata sidecar [{}]",
+            signal.metadata_key.unwrap_or(signal.key)
+        ));
+    }
+
+    rendered
+}
+
 fn load_governed_memory_entries(
     memory: &MemorySubstrate,
     kernel: Option<&Arc<dyn KernelHandle>>,
@@ -500,6 +544,7 @@ pub async fn run_agent_loop_with_session_message(
     let governed_entries = load_governed_memory_entries(memory, kernel.as_ref(), session.agent_id);
     let memory_context_msg = crate::prompt_builder::build_memory_context_message(
         &format_recalled_memory_fragments(&_memories),
+        &format_memory_cleanup_orchestration_signals(&governed_entries, 2),
         &format_governed_memory_orchestration_signals(user_message, &governed_entries, 2),
         &format_governed_memory_candidates(user_message, &governed_entries, 4),
         &load_recent_session_summaries_from_entries(&structured_entries, 3),
@@ -1443,6 +1488,7 @@ pub async fn run_agent_loop_streaming(
     let governed_entries = load_governed_memory_entries(memory, kernel.as_ref(), session.agent_id);
     let memory_context_msg = crate::prompt_builder::build_memory_context_message(
         &format_recalled_memory_fragments(&_memories),
+        &format_memory_cleanup_orchestration_signals(&governed_entries, 2),
         &format_governed_memory_orchestration_signals(user_message, &governed_entries, 2),
         &format_governed_memory_candidates(user_message, &governed_entries, 4),
         &load_recent_session_summaries_from_entries(&structured_entries, 3),
@@ -2825,6 +2871,43 @@ mod tests {
         assert!(rendered[0].contains("[project.alpha.status]"));
         assert!(rendered[1].contains("Consider promoting to MEMORY.md"));
         assert!(rendered[1].contains("[pref.editor.theme]"));
+    }
+
+    #[test]
+    fn test_format_memory_cleanup_orchestration_signals_surfaces_maintenance_actions() {
+        let entries = vec![
+            (
+                "legacy_theme".to_string(),
+                serde_json::json!("solarized"),
+            ),
+            (
+                "project.alpha.note".to_string(),
+                serde_json::json!("Alpha note"),
+            ),
+            (
+                openfang_types::memory::memory_metadata_key("pref.orphan").unwrap(),
+                serde_json::json!({
+                    "schema_version": openfang_types::memory::MEMORY_METADATA_SCHEMA_VERSION,
+                    "key": "pref.orphan",
+                    "namespace": "pref",
+                    "kind": "preference",
+                    "tags": ["profile"],
+                    "freshness": "durable",
+                    "source": "memory_store_tool",
+                    "updated_at": chrono::Utc::now().to_rfc3339(),
+                }),
+            ),
+        ];
+
+        let rendered = format_memory_cleanup_orchestration_signals(&entries, 2);
+
+        assert_eq!(rendered.len(), 3);
+        assert!(rendered[0].contains("Run memory_cleanup before reuse"));
+        assert!(rendered[0].contains("[legacy_theme]"));
+        assert!(rendered[1].contains("backfill governed metadata"));
+        assert!(rendered[1].contains("[project.alpha.note]"));
+        assert!(rendered[2].contains("remove orphan metadata sidecar"));
+        assert!(rendered[2].contains("__openfang_memory_meta.pref.orphan"));
     }
 
     #[test]

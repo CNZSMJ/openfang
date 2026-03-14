@@ -92,6 +92,10 @@
   - `openfang-types::memory` 新增 governed orchestration snapshot helper，会按当前 query 总结两类动作性信号：`stale_review` 与 `promotion_candidates`
   - runtime 动态 memory context 现在会先注入 `Governance attention signals`，再附加 `Governed memory candidates` 明细，不再要求模型自己从原始 candidate 行里猜哪些要复核、哪些该晋升
   - orchestration signal 当前会显式暴露 `review_at` / `expires_at` / `freshness` / `lifecycle` / `tags`，把“先复核 stale，再考虑 promotion”变成 prompt 级的直接指令输入
+- 已落地 governance maintenance orchestration 切口：
+  - `openfang-types::memory` 新增 cleanup orchestration snapshot helper，会把 cleanup findings 按 `legacy_repairs` / `metadata_repairs` / `orphan_metadata` 分桶
+  - runtime 动态 memory context 现在会额外注入 `Governance maintenance signals`，在 `Governance attention signals` 之前直接暴露“哪些 shared memory 异常应先用 `memory_cleanup` 处理”
+  - maintenance signal 当前会显式提示 legacy bare key 迁移、canonical key metadata 回填与 orphan metadata sidecar 删除，不再要求模型先自己推断 memory 池是否处于需要治理的坏状态
 - 已完成本轮验证：
   - `cargo build --workspace --lib`
   - `cargo test --workspace`
@@ -161,14 +165,25 @@
     - 第一轮真实回复同时复用了 reply-style preference 与 no-table constraint；第二轮真实回复直接返回 `Alpha launch is blocked on QA signoff.`
     - `/api/budget` 中 `daily_spend` 从 `0.12000932` 增到 `0.12500442`，`/api/budget/agents` 中新增 verifier agent 花费 `0.004995100000000001`
     - query-profile probes 与临时 verifier agent 已删除，daemon 已按流程停止
+  - live governance maintenance orchestration 验证通过：
+    - 在 daemon 停止状态下，直接向 shared `kv_store` 注入了三类异常：legacy bare key `maintenance_signal_legacy_probe`、缺失 metadata 的 canonical key `project.maintenance_signal.note`，以及 orphan sidecar `__openfang_memory_meta.pref.maintenance_signal.orphan`
+    - `POST /api/memory/agents/{id}/kv/cleanup {"apply":false,"limit":20}` 返回了这三类 probe 对应的 `migrate_legacy_key` / `backfill_metadata` / `delete_orphan_metadata`；同轮也暴露出几条原本就存在的 shared legacy bare key
+    - 临时无工具 MiniMax verifier agent 的 `llm.log` 中出现新的 `Governance maintenance signals` 区段，明确包含：
+      - 两条已有 shared legacy bare key 的 migrate 提示
+      - `Run memory_cleanup to backfill governed metadata for [project.maintenance_signal.note]`
+      - `Run memory_cleanup to remove orphan metadata sidecar [__openfang_memory_meta.pref.maintenance_signal.orphan]`
+    - 由于 legacy bucket 当前限制为 2，prompt-time signal 中优先显示的是两条既有 shared legacy bare key；本次注入的 `maintenance_signal_legacy_probe` 则通过 cleanup audit 被验证命中
+    - verifier 的真实回复明确说明 shared memory 在复用前需要治理，并点名 backfill metadata / orphan sidecar 删除；`/api/budget` 中 `daily_spend` 从 `0.12500442` 增到 `0.13069252`，`/api/budget/agents` 中新增 verifier agent 花费 `0.005688100000000001`
+    - maintenance probes 已通过 sqlite 直接删除，临时 verifier agent 已删除，daemon 已按流程停止
 
 ## 进行中
 
-- 继续推进 Phase 1 后续切口：cleanup / governance attention 是否还需要进一步进入更主动的 orchestration hook，而不只停留在当前 prompt 摘要、tool/API 与 dashboard 可见层。
+- 继续推进 Phase 1 后续切口：governance maintenance / attention signals 是否还需要进一步驱动更主动的 orchestration hook，而不只停留在当前 prompt 摘要层。
 
 ## 下一步动作
 
-- 评估 cleanup / governance attention 是否需要进入更主动的 orchestration hook，而不只停留在当前 prompt 摘要、dashboard 与 API/tool 可见层。
+- 评估 maintenance signals 在 agent 具备 `memory_cleanup` 能力时，是否应该进入更主动的 orchestration hook，而不只停留在当前 prompt 摘要。
+- 评估 cleanup / governance attention 是否需要进一步驱动自动 promotion / cleanup，而不只停留在当前 prompt 摘要、dashboard 与 API/tool 可见层。
 - 评估 governed retrieval 是否还需要更强的显式过滤或 action hook，而不只是当前 query profile + 排序增强。
 - 在切换电脑或结束一轮实质性工作前，持续更新本文件。
 

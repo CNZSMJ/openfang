@@ -406,6 +406,23 @@ pub struct MemoryCleanupPlan {
     pub findings: Vec<MemoryCleanupFinding>,
 }
 
+/// Cleanup finding surfaced as a prompt-time governance maintenance signal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryCleanupOrchestrationSignal {
+    pub action: MemoryCleanupAction,
+    pub key: String,
+    pub canonical_key: Option<String>,
+    pub metadata_key: Option<String>,
+}
+
+/// Cleanup maintenance snapshot grouped for prompt orchestration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct MemoryCleanupOrchestrationSnapshot {
+    pub legacy_repairs: Vec<MemoryCleanupOrchestrationSignal>,
+    pub metadata_repairs: Vec<MemoryCleanupOrchestrationSignal>,
+    pub orphan_metadata: Vec<MemoryCleanupOrchestrationSignal>,
+}
+
 /// Build a governance cleanup plan for legacy bare keys and sidecar inconsistencies.
 pub fn plan_memory_cleanup(entries: &[(String, serde_json::Value)]) -> MemoryCleanupPlan {
     let metadata_map = collect_memory_metadata(entries);
@@ -477,6 +494,71 @@ pub fn plan_memory_cleanup(entries: &[(String, serde_json::Value)]) -> MemoryCle
     });
 
     MemoryCleanupPlan { findings }
+}
+
+fn memory_cleanup_action_sort_rank(action: &MemoryCleanupAction) -> u8 {
+    match action {
+        MemoryCleanupAction::MigrateLegacyKey => 0,
+        MemoryCleanupAction::DeleteLegacyKey => 1,
+        MemoryCleanupAction::BackfillMetadata => 2,
+        MemoryCleanupAction::DeleteOrphanMetadata => 3,
+    }
+}
+
+/// Summarize cleanup findings into prompt-time maintenance buckets.
+pub fn summarize_memory_cleanup_for_orchestration(
+    entries: &[(String, serde_json::Value)],
+    limit_per_bucket: usize,
+) -> MemoryCleanupOrchestrationSnapshot {
+    if limit_per_bucket == 0 {
+        return MemoryCleanupOrchestrationSnapshot::default();
+    }
+
+    let mut legacy_repairs = Vec::new();
+    let mut metadata_repairs = Vec::new();
+    let mut orphan_metadata = Vec::new();
+
+    let mut findings = plan_memory_cleanup(entries).findings;
+    findings.sort_by(|a, b| {
+        memory_cleanup_action_sort_rank(&a.action)
+            .cmp(&memory_cleanup_action_sort_rank(&b.action))
+            .then_with(|| a.key.cmp(&b.key))
+            .then_with(|| a.canonical_key.cmp(&b.canonical_key))
+            .then_with(|| a.metadata_key.cmp(&b.metadata_key))
+    });
+
+    for finding in findings {
+        let signal = MemoryCleanupOrchestrationSignal {
+            action: finding.action.clone(),
+            key: finding.key.clone(),
+            canonical_key: finding.canonical_key.clone(),
+            metadata_key: finding.metadata_key.clone(),
+        };
+
+        match finding.action {
+            MemoryCleanupAction::MigrateLegacyKey | MemoryCleanupAction::DeleteLegacyKey => {
+                if legacy_repairs.len() < limit_per_bucket {
+                    legacy_repairs.push(signal);
+                }
+            }
+            MemoryCleanupAction::BackfillMetadata => {
+                if metadata_repairs.len() < limit_per_bucket {
+                    metadata_repairs.push(signal);
+                }
+            }
+            MemoryCleanupAction::DeleteOrphanMetadata => {
+                if orphan_metadata.len() < limit_per_bucket {
+                    orphan_metadata.push(signal);
+                }
+            }
+        }
+    }
+
+    MemoryCleanupOrchestrationSnapshot {
+        legacy_repairs,
+        metadata_repairs,
+        orphan_metadata,
+    }
 }
 
 /// Build the internal sidecar key that stores governance metadata.
@@ -1458,6 +1540,52 @@ mod tests {
                 && finding.key == "pref.theme"
                 && finding.metadata_key.as_deref() == Some("__openfang_memory_meta.pref.theme")
         }));
+    }
+
+    #[test]
+    fn test_summarize_memory_cleanup_for_orchestration_groups_findings() {
+        let entries = vec![
+            ("legacy_theme".to_string(), serde_json::json!("solarized")),
+            (
+                "project.alpha.note".to_string(),
+                serde_json::json!("Alpha note"),
+            ),
+            (
+                memory_metadata_key("pref.orphan").unwrap(),
+                serde_json::json!({
+                    "schema_version": MEMORY_METADATA_SCHEMA_VERSION,
+                    "key": "pref.orphan",
+                    "namespace": "pref",
+                    "kind": "preference",
+                    "tags": ["profile"],
+                    "freshness": "durable",
+                    "source": "memory_store_tool",
+                    "updated_at": Utc::now().to_rfc3339(),
+                }),
+            ),
+        ];
+
+        let snapshot = summarize_memory_cleanup_for_orchestration(&entries, 2);
+
+        assert_eq!(snapshot.legacy_repairs.len(), 1);
+        assert_eq!(snapshot.legacy_repairs[0].action, MemoryCleanupAction::MigrateLegacyKey);
+        assert_eq!(snapshot.legacy_repairs[0].key, "legacy_theme");
+        assert_eq!(
+            snapshot.legacy_repairs[0].canonical_key.as_deref(),
+            Some("general.legacy_theme")
+        );
+        assert_eq!(snapshot.metadata_repairs.len(), 1);
+        assert_eq!(snapshot.metadata_repairs[0].action, MemoryCleanupAction::BackfillMetadata);
+        assert_eq!(snapshot.metadata_repairs[0].key, "project.alpha.note");
+        assert_eq!(snapshot.orphan_metadata.len(), 1);
+        assert_eq!(
+            snapshot.orphan_metadata[0].action,
+            MemoryCleanupAction::DeleteOrphanMetadata
+        );
+        assert_eq!(
+            snapshot.orphan_metadata[0].metadata_key.as_deref(),
+            Some("__openfang_memory_meta.pref.orphan")
+        );
     }
 
     #[test]

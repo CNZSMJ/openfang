@@ -281,6 +281,37 @@
   - 第一轮真实回复同时引用了 reply-style preference 与 no-table constraint，第二轮则直接返回 `Alpha launch is blocked on QA signoff.`
 - 这一步仍然不是 embedding / hybrid retrieval，也还没有进入显式 filtering / action hook，但已经把 governed retrieval 从“轻量词命中”推进到了“带 query profile 的可解释排序”。
 
+### 3.16 Cleanup Findings 进入 Prompt Orchestration
+
+- cleanup 之前已经具备三种显式入口：
+  - API audit/apply
+  - `memory_cleanup` tool
+  - dashboard cleanup workspace
+- 但在这之前，agent 每轮请求并不会自动知道 shared memory 池里是否存在治理异常；它只有在主动调用 `memory_cleanup` 或人工 inspection 时才看得见这些问题。
+- 现在 `openfang-types::memory` 新增了一层 cleanup orchestration snapshot，把 `plan_memory_cleanup()` 的 findings 按三类动作分桶：
+  - `legacy_repairs`
+  - `metadata_repairs`
+  - `orphan_metadata`
+- runtime 在构造动态 memory context 时，会先把这些 finding 压缩成新的 `Governance maintenance signals` 小节，再继续注入既有的：
+  - `Governance attention signals`
+  - `Governed memory candidates`
+- 当前 maintenance signals 会直接提示模型：
+  - `Run memory_cleanup before reuse: migrate legacy key [...] to [...]`
+  - `Run memory_cleanup to backfill governed metadata for [...]`
+  - `Run memory_cleanup to remove orphan metadata sidecar [...]`
+- 这一步的意义在于：cleanup 首次从“工具/API 可达能力”前移成“prompt-time 可见的治理异常”，模型不需要先自己怀疑 memory 池是否脏了。
+- shared helper 仍然保持单点语义：
+  - cleanup 规则继续由 `plan_memory_cleanup()` 决定
+  - prompt orchestration 只是消费它的 snapshot，不再另写一套运行时推断逻辑
+- live verification 已确认这不是只在单测里生效：
+  - 在 daemon 停止状态下，直接向 shared `kv_store` 注入了三类异常：legacy bare key、缺失 metadata 的 canonical key、orphan metadata sidecar
+  - cleanup audit endpoint 返回了对应 findings，同时也暴露出几条原本就存在的 shared legacy bare key
+  - verifier agent 的 `llm.log` 中真实出现了 `Governance maintenance signals`
+  - log 中明确包含 `project.maintenance_signal.note` 的 metadata backfill 提示和 `__openfang_memory_meta.pref.maintenance_signal.orphan` 的 orphan sidecar 删除提示
+  - 由于 legacy bucket 当前限制为 2，prompt-time signal 优先展示的是两条既有 shared legacy bare key；本次注入的 `maintenance_signal_legacy_probe` 通过 cleanup audit 被确认命中
+  - verifier 的真实回复明确说明 shared memory 在复用前需要治理，并指出当前没有 `memory_cleanup` tool 可直接执行
+- 这一步仍然没有实现“自动 cleanup”，但它把 maintenance 从被动工具能力推进成了主动治理提示，和 lifecycle / promotion attention 一起构成了 Phase 1 的最小 orchestration 闭环。
+
 ## 4. 当前不做的事情
 
 本阶段当前实现明确不做：
@@ -319,6 +350,6 @@
 
 在当前切口稳定后，下一步按以下顺序推进：
 
-1. 评估 governed retrieval 是否还需要更强的显式过滤或 action hook，而不只是当前 query profile + 排序增强。
-2. 评估是否需要把 cleanup audit/apply 进一步暴露到 orchestration hook，而不只停留在 API + tool + dashboard。
-3. 评估 governance attention signals 是否需要进一步驱动自动 promotion / cleanup，而不只停留在当前 prompt 摘要层。
+1. 评估 maintenance signals 在 agent 具备 `memory_cleanup` 能力时，是否应该进入更主动的 orchestration hook，而不只停留在当前 prompt 摘要。
+2. 评估 governance attention signals 是否需要进一步驱动自动 promotion / cleanup，而不只停留在当前 prompt 摘要层。
+3. 评估 governed retrieval 是否还需要更强的显式过滤或 action hook，而不只是当前 query profile + 排序增强。
