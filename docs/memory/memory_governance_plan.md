@@ -126,6 +126,26 @@
   - `source=memory_cleanup_api`
 - cleanup 规划逻辑已收敛到 `openfang-types::memory::plan_memory_cleanup`，避免 API 层再次内联一套规则。
 
+### 3.10 Governance Metadata Consumption in Dynamic Retrieval
+
+- runtime 的动态 memory context 现在会额外注入一组 governed KV 候选，而不只依赖 semantic recalled fragments 与 `session_*` 摘要。
+- governed 候选优先读取 kernel 暴露的共享 memory list，因此会消费 memory tool / memory API 写入的 shared KV，而不是只停留在 agent 私有 structured store。
+- governed 候选的筛选逻辑已下沉到 `openfang-types::memory::select_governed_memory_prompt_candidates`，供后续 embedding / hybrid retrieval 继续复用。
+- 当前选择策略会：
+  - 排除 internal key、metadata sidecar 与 `expired` lifecycle 记录
+  - 优先考虑 `preference` / `decision` / `constraint` / `profile` / `project_state`
+  - 允许带 tag 的 governed 记录进入候选集
+  - 先根据当前 user query 对 `key` / `tags` / `kind` / `value` 做轻量 query-aware 打分，再按 lifecycle、promotion candidate、是否带 tags、freshness、updated_at 排序
+- prompt 注入层当前会把这些候选以独立的 `Governed memory candidates` 小节附加到动态 memory context 中，并显式暴露：
+  - `kind`
+  - `freshness`
+  - `lifecycle`
+  - `tags`
+  - `promotion_candidate`
+- live verification 已确认 shared KV probe 会真实进入 assistant workspace 的 `logs/llm.log`，证明该路径不是死代码。
+- live verification 还确认了 query-aware 排序不是空转：在 5 条 durable preference 与 1 条 rolling project probe 并存时，project probe 只会在 project-status 查询里被拉升到前 4。
+- 这一步仍然不是完整的 query-aware hybrid retrieval，但它已经让 governed prompt candidates 具备最小问题感知能力，后续不必再从零设计一次字段语义。
+
 ## 4. 当前不做的事情
 
 本阶段当前实现明确不做：
@@ -146,8 +166,12 @@
   - metadata sidecar 写入
   - `memory_list` 默认隐藏内部 key，并返回 governed + lifecycle 字段
   - `memory_list` tags 过滤
+- `crates/openfang-runtime/src/agent_loop.rs`
+  - 动态 memory context 现在会加载 governed KV 候选
+  - governed 候选与 session summary 共用同一份 structured KV snapshot，避免 runtime 再各自定义一套筛选逻辑
 - `crates/openfang-runtime/src/prompt_builder.rs`
   - prompt 协议补充 namespaced key 约束，以及 tags/lifecycle 使用提示
+  - 动态 memory context 新增 `Governed memory candidates` 区段
 - `crates/openfang-kernel/src/wizard.rs`
   - setup hint 补充 namespaced key、tags 与 lifecycle 指导
 - `crates/openfang-api/src/routes.rs`
@@ -160,7 +184,7 @@
 
 在当前切口稳定后，下一步按以下顺序推进：
 
-1. 评估是否需要把 cleanup audit/apply 进一步暴露给 tool 层或 dashboard，而不只停留在 API。
-2. 评估是否需要在 dashboard / higher-level orchestration 中直接暴露 tag + lifecycle snapshot，而不只停留在 tool/API 层。
-3. 给后续 embedding / hybrid retrieval 预留对 `kind` / `tags` / `freshness` / `lifecycle_state` 的消费接口。
+1. 决定 governed prompt candidates 的 query-aware 打分是否需要继续引入停用词、短语匹配或 namespace/kind 显式 hint。
+2. 评估是否需要把 cleanup audit/apply 进一步暴露给 tool 层或 dashboard，而不只停留在 API。
+3. 评估是否需要在 dashboard / higher-level orchestration 中直接暴露 tag + lifecycle snapshot，而不只停留在 tool/API 层。
 4. 决定 lifecycle snapshot 是否需要进入更高层 prompt orchestration，而不仅仅停留在当前提示文案与 API/tool 可见层。

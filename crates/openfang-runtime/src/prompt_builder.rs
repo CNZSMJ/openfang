@@ -341,9 +341,13 @@ pub fn build_canonical_context_message(ctx: &PromptContext) -> Option<String> {
 /// and recent session summaries for the current turn.
 pub fn build_memory_context_message(
     recalled_memories: &[String],
+    governed_memory_candidates: &[String],
     recent_session_summaries: &[String],
 ) -> Option<String> {
-    if recalled_memories.is_empty() && recent_session_summaries.is_empty() {
+    if recalled_memories.is_empty()
+        && governed_memory_candidates.is_empty()
+        && recent_session_summaries.is_empty()
+    {
         return None;
     }
 
@@ -356,8 +360,18 @@ pub fn build_memory_context_message(
         }
     }
 
-    if !recent_session_summaries.is_empty() {
+    if !governed_memory_candidates.is_empty() {
         if !recalled_memories.is_empty() {
+            out.push('\n');
+        }
+        out.push_str("Governed memory candidates:\n");
+        for memory in governed_memory_candidates.iter().take(4) {
+            out.push_str(&format!("- {}\n", cap_str(memory, 320)));
+        }
+    }
+
+    if !recent_session_summaries.is_empty() {
+        if !recalled_memories.is_empty() || !governed_memory_candidates.is_empty() {
             out.push('\n');
         }
         out.push_str("Recent session summaries:\n");
@@ -1413,20 +1427,23 @@ mod tests {
                 "[project.alpha] Architecture decision: use Axum".to_string(),
                 "User prefers concise summaries".to_string(),
             ],
+            &["[pref.editor.theme] (kind=preference, freshness=durable, lifecycle=active, tags=profile,ui) solarized dark".to_string()],
             &["session_2026-03-11_alpha: Reviewed prompt pipeline".to_string()],
         )
         .unwrap();
 
         assert!(message.contains("[Memory context]"));
         assert!(message.contains("Relevant recalled memories"));
+        assert!(message.contains("Governed memory candidates"));
         assert!(message.contains("Recent session summaries"));
         assert!(message.contains("Architecture decision"));
+        assert!(message.contains("pref.editor.theme"));
         assert!(message.contains("Reviewed prompt pipeline"));
     }
 
     #[test]
     fn test_memory_context_message_omitted_when_empty() {
-        assert!(build_memory_context_message(&[], &[]).is_none());
+        assert!(build_memory_context_message(&[], &[], &[]).is_none());
     }
 
     #[test]

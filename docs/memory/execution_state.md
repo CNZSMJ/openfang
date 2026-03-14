@@ -30,7 +30,7 @@
 
 ## 当前目标
 
-- 在 `memory-governance` 阶段继续收口 Phase 1 lifecycle 与治理消费边界，并把 legacy 清理策略明确下来。
+- 在 `memory-governance` 阶段继续收口 Phase 1 lifecycle 与治理消费边界，并把 governed retrieval / orchestration 的入口稳定下来。
 
 ## 已完成
 
@@ -68,6 +68,12 @@
   - cleanup plan 会识别 legacy bare key、orphan metadata sidecar、以及 canonical key 缺失 metadata 三类问题
   - `apply=true` 时会执行迁移 legacy bare key、删除 orphan sidecar、回填默认 governed metadata
   - cleanup 规划逻辑已下沉到 `openfang-types::memory::plan_memory_cleanup`
+- 已落地 governed retrieval consumption 切口：
+  - `openfang-types::memory` 新增 `select_governed_memory_prompt_candidates`，统一为 runtime / 后续 retrieval 选择 governed KV 候选
+  - runtime 动态 memory context 现在会额外注入 `Governed memory candidates`，不再只依赖 semantic recall 与 `session_*` 摘要
+  - governed 候选优先读取 kernel 暴露的 shared memory list，因此 memory tool / memory API 写入的 shared KV 也会进入动态 retrieval 消费路径
+  - governed 候选当前会消费 `kind` / `tags` / `freshness` / `lifecycle_state` / `promotion_candidate`，并排除 `expired` 记录
+  - governed 候选已具备最小 query-aware 排序：会用当前 user message 对 `key` / `tags` / `kind` / `value` 做轻量打分，再回落到治理优先级排序
 - 已完成本轮验证：
   - `cargo build --workspace --lib`
   - `cargo test --workspace`
@@ -88,14 +94,27 @@
     - `project.lifecycle_probe.note` 返回 `lifecycle_state=active`、`review_at=2026-03-19T18:31:27.389653+00:00`、`expires_at=2026-04-11T18:31:27.389653+00:00`、`promotion_candidate=false`
     - `include_internal=true` 仍可看到 `__openfang_schedules`
     - 真实 agent message 后 `daily_spend` 从 `0.39378700000000005` 增到 `0.4021756`
+  - live governed retrieval 验证通过：
+    - 通过 memory API 写入 `pref.retrieval_probe.theme` 与 `project.retrieval_probe.status` 两条 shared governed KV
+    - 真实 `assistant` message 后，`~/.openfang/workspaces/assistant/logs/llm.log` 中出现 `Governed memory candidates` 区段
+    - log 中明确包含：
+      - `pref.retrieval_probe.theme (kind=preference, freshness=durable, lifecycle=active, tags=profile,ui,retrieval_probe, promotion_candidate)`
+      - `project.retrieval_probe.status (kind=project_state, freshness=rolling, lifecycle=active, tags=project,retrieval_probe)`
+    - 第二轮 live verification 中 `daily_spend` 从 `0.05442078` 增到 `0.05510341`
+  - live query-aware governed retrieval 验证通过：
+    - 注入了 5 条更高治理优先级的 durable `pref.query_probe.*` 与 1 条较低治理优先级的 rolling `project.alpha.query_probe.status`
+    - 当用户消息是 `What is the alpha project status right now?` 时，`llm.log` 的 `Governed memory candidates` 前 4 中包含 `project.alpha.query_probe.status`
+    - 同一份 log 里其它非 project 查询轮次仍由 durable `pref.query_probe.*` 占满前 4，说明 project probe 是被 query-aware 排序拉升，而不是静态治理顺序自然排到前面
+    - 该轮真实 message 的回复直接使用了 probe 值 `Alpha launch blocked on QA signoff.`
+    - 本轮 live verification 中 `daily_spend` 从 `0.05580307` 增到 `0.05715266`
 
 ## 进行中
 
-- 继续推进 Phase 1 后续切口：治理元数据在后续检索路径中的消费方式，以及 cleanup 能力是否需要进入 tool/dashboard。
+- 继续推进 Phase 1 后续切口：governed prompt candidates 的 query-aware 规则是否需要更强，以及 cleanup / lifecycle snapshot 是否需要进入 tool/dashboard 或更高层 orchestration。
 
 ## 下一步动作
 
-- 明确后续 embedding / hybrid retrieval 如何消费 `kind` / `tags` / `freshness` / `lifecycle_state` 等治理字段。
+- 评估 governed prompt candidates 的 query-aware 打分是否需要继续引入停用词、短语匹配、namespace/kind hint 或显式过滤。
 - 评估 cleanup audit/apply 是否需要进入 tool 层或 dashboard，而不只停留在 API。
 - 评估 lifecycle snapshot 是否需要进入 dashboard 或 prompt orchestration 的更高层，而不只停留在 API/tool 响应中。
 - 在切换电脑或结束一轮实质性工作前，持续更新本文件。
