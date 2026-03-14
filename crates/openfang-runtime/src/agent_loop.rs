@@ -23,6 +23,7 @@ use openfang_types::error::{OpenFangError, OpenFangResult};
 use openfang_types::memory::{
     Memory, MemoryFilter, MemoryFreshness, MemoryLifecycleState, MemorySource,
     select_governed_memory_prompt_candidates_for_query,
+    summarize_governed_memory_orchestration_for_query,
 };
 use openfang_types::message::{
     ContentBlock, Message, MessageContent, Role, StopReason, TokenUsage,
@@ -249,6 +250,62 @@ fn format_governed_memory_candidates(
         .collect()
 }
 
+fn format_governed_memory_orchestration_signals(
+    user_message: &str,
+    entries: &[(String, serde_json::Value)],
+    limit_per_bucket: usize,
+) -> Vec<String> {
+    let snapshot = summarize_governed_memory_orchestration_for_query(
+        entries,
+        chrono::Utc::now(),
+        limit_per_bucket,
+        Some(user_message),
+    );
+    let mut rendered = Vec::new();
+
+    for signal in snapshot.stale_review {
+        let mut qualifiers = vec![
+            format!("kind={}", signal.metadata.kind),
+            format!("review_at={}", signal.lifecycle.review_at.to_rfc3339()),
+        ];
+        if let Some(expires_at) = signal.lifecycle.expires_at {
+            qualifiers.push(format!("expires_at={}", expires_at.to_rfc3339()));
+        }
+        if !signal.metadata.tags.is_empty() {
+            qualifiers.push(format!("tags={}", signal.metadata.tags.join(",")));
+        }
+        rendered.push(format!(
+            "Review stale memory before reuse: [{}] ({})",
+            signal.key,
+            qualifiers.join(", ")
+        ));
+    }
+
+    for signal in snapshot.promotion_candidates {
+        let mut qualifiers = vec![
+            format!("kind={}", signal.metadata.kind),
+            format!(
+                "freshness={}",
+                render_memory_freshness(&signal.metadata.freshness)
+            ),
+            format!(
+                "lifecycle={}",
+                render_memory_lifecycle_state(signal.lifecycle.state)
+            ),
+        ];
+        if !signal.metadata.tags.is_empty() {
+            qualifiers.push(format!("tags={}", signal.metadata.tags.join(",")));
+        }
+        rendered.push(format!(
+            "Consider promoting to MEMORY.md: [{}] ({})",
+            signal.key,
+            qualifiers.join(", ")
+        ));
+    }
+
+    rendered
+}
+
 fn load_governed_memory_entries(
     memory: &MemorySubstrate,
     kernel: Option<&Arc<dyn KernelHandle>>,
@@ -443,6 +500,7 @@ pub async fn run_agent_loop_with_session_message(
     let governed_entries = load_governed_memory_entries(memory, kernel.as_ref(), session.agent_id);
     let memory_context_msg = crate::prompt_builder::build_memory_context_message(
         &format_recalled_memory_fragments(&_memories),
+        &format_governed_memory_orchestration_signals(user_message, &governed_entries, 2),
         &format_governed_memory_candidates(user_message, &governed_entries, 4),
         &load_recent_session_summaries_from_entries(&structured_entries, 3),
     );
@@ -1385,6 +1443,7 @@ pub async fn run_agent_loop_streaming(
     let governed_entries = load_governed_memory_entries(memory, kernel.as_ref(), session.agent_id);
     let memory_context_msg = crate::prompt_builder::build_memory_context_message(
         &format_recalled_memory_fragments(&_memories),
+        &format_governed_memory_orchestration_signals(user_message, &governed_entries, 2),
         &format_governed_memory_candidates(user_message, &governed_entries, 4),
         &load_recent_session_summaries_from_entries(&structured_entries, 3),
     );
@@ -2710,6 +2769,61 @@ mod tests {
 
         assert_eq!(rendered.len(), 2);
         assert!(rendered[0].contains("[project.alpha.status]"));
+        assert!(rendered[1].contains("[pref.editor.theme]"));
+    }
+
+    #[test]
+    fn test_format_governed_memory_orchestration_signals_surfaces_review_and_promotion() {
+        let now = chrono::Utc::now();
+        let stale_project = openfang_types::memory::MemoryRecordMetadata {
+            schema_version: openfang_types::memory::MEMORY_METADATA_SCHEMA_VERSION,
+            key: "project.alpha.status".to_string(),
+            namespace: "project".to_string(),
+            kind: "project_state".to_string(),
+            tags: vec!["project".to_string(), "alpha".to_string()],
+            freshness: MemoryFreshness::Rolling,
+            source: "memory_store_tool".to_string(),
+            updated_at: now - chrono::Duration::days(8),
+        };
+        let durable_pref = openfang_types::memory::MemoryRecordMetadata {
+            schema_version: openfang_types::memory::MEMORY_METADATA_SCHEMA_VERSION,
+            key: "pref.editor.theme".to_string(),
+            namespace: "pref".to_string(),
+            kind: "preference".to_string(),
+            tags: vec!["profile".to_string(), "ui".to_string()],
+            freshness: MemoryFreshness::Durable,
+            source: "memory_store_tool".to_string(),
+            updated_at: now - chrono::Duration::days(1),
+        };
+        let entries = vec![
+            (
+                "project.alpha.status".to_string(),
+                serde_json::json!("Alpha is blocked on QA."),
+            ),
+            (
+                openfang_types::memory::memory_metadata_key("project.alpha.status").unwrap(),
+                serde_json::to_value(&stale_project).unwrap(),
+            ),
+            (
+                "pref.editor.theme".to_string(),
+                serde_json::json!("Use solarized dark."),
+            ),
+            (
+                openfang_types::memory::memory_metadata_key("pref.editor.theme").unwrap(),
+                serde_json::to_value(&durable_pref).unwrap(),
+            ),
+        ];
+
+        let rendered = format_governed_memory_orchestration_signals(
+            "What is the alpha project status and ui preference?",
+            &entries,
+            2,
+        );
+
+        assert_eq!(rendered.len(), 2);
+        assert!(rendered[0].contains("Review stale memory before reuse"));
+        assert!(rendered[0].contains("[project.alpha.status]"));
+        assert!(rendered[1].contains("Consider promoting to MEMORY.md"));
         assert!(rendered[1].contains("[pref.editor.theme]"));
     }
 

@@ -306,6 +306,21 @@ pub struct GovernedMemoryPromptCandidate {
     pub lifecycle: MemoryLifecycleSnapshot,
 }
 
+/// Action-oriented governance signal used for prompt orchestration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GovernedMemoryOrchestrationSignal {
+    pub key: String,
+    pub metadata: MemoryRecordMetadata,
+    pub lifecycle: MemoryLifecycleSnapshot,
+}
+
+/// Governance snapshot summarizing review and promotion actions for prompts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct GovernedMemoryOrchestrationSnapshot {
+    pub stale_review: Vec<GovernedMemoryOrchestrationSignal>,
+    pub promotion_candidates: Vec<GovernedMemoryOrchestrationSignal>,
+}
+
 fn is_valid_memory_meta_token(token: &str) -> bool {
     !token.is_empty()
         && token
@@ -652,33 +667,13 @@ fn memory_query_match_score(candidate: &GovernedMemoryPromptCandidate, query_ter
         .sum()
 }
 
-/// Select governed user-memory candidates suitable for prompt-level retrieval.
-///
-/// The output is intentionally biased toward durable preferences, decisions,
-/// constraints, profile, and project-state records, while still allowing tagged
-/// governed records to surface. Expired lifecycle entries are excluded.
-pub fn select_governed_memory_prompt_candidates(
+fn collect_governed_memory_prompt_candidates(
     entries: &[(String, serde_json::Value)],
     now: DateTime<Utc>,
-    limit: usize,
 ) -> Vec<GovernedMemoryPromptCandidate> {
-    select_governed_memory_prompt_candidates_for_query(entries, now, limit, None)
-}
-
-/// Select governed user-memory candidates and rerank them against the current query.
-pub fn select_governed_memory_prompt_candidates_for_query(
-    entries: &[(String, serde_json::Value)],
-    now: DateTime<Utc>,
-    limit: usize,
-    query: Option<&str>,
-) -> Vec<GovernedMemoryPromptCandidate> {
-    if limit == 0 {
-        return Vec::new();
-    }
-
-    let query_terms = query.map(memory_query_terms).unwrap_or_default();
     let metadata_map = collect_memory_metadata(entries);
-    let mut candidates: Vec<GovernedMemoryPromptCandidate> = entries
+
+    entries
         .iter()
         .filter_map(|(key, value)| {
             if is_internal_memory_key(key) || is_memory_metadata_key(key) {
@@ -705,33 +700,113 @@ pub fn select_governed_memory_prompt_candidates_for_query(
                 lifecycle,
             })
         })
-        .collect();
+        .collect()
+}
 
-    candidates.sort_by(|a, b| {
-        memory_query_match_score(b, &query_terms)
-            .cmp(&memory_query_match_score(a, &query_terms))
-            .then_with(|| {
-                memory_lifecycle_sort_rank(a.lifecycle.state)
-            .cmp(&memory_lifecycle_sort_rank(b.lifecycle.state))
-            })
-            .then_with(|| {
-                (!a.lifecycle.promotion_candidate).cmp(&(!b.lifecycle.promotion_candidate))
-            })
-            .then_with(|| a.metadata.tags.is_empty().cmp(&b.metadata.tags.is_empty()))
-            .then_with(|| {
-                is_priority_memory_kind(&a.metadata.kind)
-                    .cmp(&is_priority_memory_kind(&b.metadata.kind))
-                    .reverse()
-            })
-            .then_with(|| {
-                memory_freshness_sort_rank(&a.metadata.freshness)
-                    .cmp(&memory_freshness_sort_rank(&b.metadata.freshness))
-            })
-            .then_with(|| b.metadata.updated_at.cmp(&a.metadata.updated_at))
-            .then_with(|| a.key.cmp(&b.key))
-    });
+fn compare_governed_memory_candidates(
+    a: &GovernedMemoryPromptCandidate,
+    b: &GovernedMemoryPromptCandidate,
+    query_terms: &[String],
+) -> std::cmp::Ordering {
+    memory_query_match_score(b, query_terms)
+        .cmp(&memory_query_match_score(a, query_terms))
+        .then_with(|| {
+            memory_lifecycle_sort_rank(a.lifecycle.state).cmp(&memory_lifecycle_sort_rank(b.lifecycle.state))
+        })
+        .then_with(|| (!a.lifecycle.promotion_candidate).cmp(&(!b.lifecycle.promotion_candidate)))
+        .then_with(|| a.metadata.tags.is_empty().cmp(&b.metadata.tags.is_empty()))
+        .then_with(|| {
+            is_priority_memory_kind(&a.metadata.kind)
+                .cmp(&is_priority_memory_kind(&b.metadata.kind))
+                .reverse()
+        })
+        .then_with(|| {
+            memory_freshness_sort_rank(&a.metadata.freshness)
+                .cmp(&memory_freshness_sort_rank(&b.metadata.freshness))
+        })
+        .then_with(|| b.metadata.updated_at.cmp(&a.metadata.updated_at))
+        .then_with(|| a.key.cmp(&b.key))
+}
+
+/// Select governed user-memory candidates suitable for prompt-level retrieval.
+///
+/// The output is intentionally biased toward durable preferences, decisions,
+/// constraints, profile, and project-state records, while still allowing tagged
+/// governed records to surface. Expired lifecycle entries are excluded.
+pub fn select_governed_memory_prompt_candidates(
+    entries: &[(String, serde_json::Value)],
+    now: DateTime<Utc>,
+    limit: usize,
+) -> Vec<GovernedMemoryPromptCandidate> {
+    select_governed_memory_prompt_candidates_for_query(entries, now, limit, None)
+}
+
+/// Select governed user-memory candidates and rerank them against the current query.
+pub fn select_governed_memory_prompt_candidates_for_query(
+    entries: &[(String, serde_json::Value)],
+    now: DateTime<Utc>,
+    limit: usize,
+    query: Option<&str>,
+) -> Vec<GovernedMemoryPromptCandidate> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    let query_terms = query.map(memory_query_terms).unwrap_or_default();
+    let mut candidates = collect_governed_memory_prompt_candidates(entries, now);
+    candidates.sort_by(|a, b| compare_governed_memory_candidates(a, b, &query_terms));
     candidates.truncate(limit);
     candidates
+}
+
+/// Summarize governed memory review/promotion actions for higher-level prompt orchestration.
+pub fn summarize_governed_memory_orchestration_for_query(
+    entries: &[(String, serde_json::Value)],
+    now: DateTime<Utc>,
+    limit_per_bucket: usize,
+    query: Option<&str>,
+) -> GovernedMemoryOrchestrationSnapshot {
+    if limit_per_bucket == 0 {
+        return GovernedMemoryOrchestrationSnapshot::default();
+    }
+
+    let query_terms = query.map(memory_query_terms).unwrap_or_default();
+    let candidates = collect_governed_memory_prompt_candidates(entries, now);
+
+    let mut stale_review: Vec<GovernedMemoryPromptCandidate> = candidates
+        .iter()
+        .filter(|candidate| candidate.lifecycle.state == MemoryLifecycleState::Stale)
+        .cloned()
+        .collect();
+    stale_review.sort_by(|a, b| compare_governed_memory_candidates(a, b, &query_terms));
+    stale_review.truncate(limit_per_bucket);
+
+    let mut promotion_candidates: Vec<GovernedMemoryPromptCandidate> = candidates
+        .iter()
+        .filter(|candidate| candidate.lifecycle.promotion_candidate)
+        .cloned()
+        .collect();
+    promotion_candidates.sort_by(|a, b| compare_governed_memory_candidates(a, b, &query_terms));
+    promotion_candidates.truncate(limit_per_bucket);
+
+    GovernedMemoryOrchestrationSnapshot {
+        stale_review: stale_review
+            .into_iter()
+            .map(|candidate| GovernedMemoryOrchestrationSignal {
+                key: candidate.key,
+                metadata: candidate.metadata,
+                lifecycle: candidate.lifecycle,
+            })
+            .collect(),
+        promotion_candidates: promotion_candidates
+            .into_iter()
+            .map(|candidate| GovernedMemoryOrchestrationSignal {
+                key: candidate.key,
+                metadata: candidate.metadata,
+                lifecycle: candidate.lifecycle,
+            })
+            .collect(),
+    }
 }
 
 /// An entity in the knowledge graph.
@@ -1347,5 +1422,64 @@ mod tests {
         assert_eq!(candidates.len(), 2);
         assert_eq!(candidates[0].key, "project.alpha.status");
         assert_eq!(candidates[1].key, "pref.editor.theme");
+    }
+
+    #[test]
+    fn test_summarize_governed_memory_orchestration_for_query_surfaces_stale_and_promotion() {
+        let now = Utc::now();
+        let stale_project = MemoryRecordMetadata {
+            schema_version: MEMORY_METADATA_SCHEMA_VERSION,
+            key: "project.alpha.status".to_string(),
+            namespace: "project".to_string(),
+            kind: "project_state".to_string(),
+            tags: vec!["project".to_string(), "alpha".to_string()],
+            freshness: MemoryFreshness::Rolling,
+            source: "memory_store_tool".to_string(),
+            updated_at: now - Duration::days(8),
+        };
+        let durable_pref = MemoryRecordMetadata {
+            schema_version: MEMORY_METADATA_SCHEMA_VERSION,
+            key: "pref.editor.theme".to_string(),
+            namespace: "pref".to_string(),
+            kind: "preference".to_string(),
+            tags: vec!["profile".to_string(), "ui".to_string()],
+            freshness: MemoryFreshness::Durable,
+            source: "memory_store_tool".to_string(),
+            updated_at: now - Duration::days(1),
+        };
+        let entries = vec![
+            (
+                "project.alpha.status".to_string(),
+                serde_json::json!("Alpha is blocked on QA."),
+            ),
+            (
+                memory_metadata_key("project.alpha.status").unwrap(),
+                serde_json::to_value(&stale_project).unwrap(),
+            ),
+            (
+                "pref.editor.theme".to_string(),
+                serde_json::json!("Use solarized dark."),
+            ),
+            (
+                memory_metadata_key("pref.editor.theme").unwrap(),
+                serde_json::to_value(&durable_pref).unwrap(),
+            ),
+        ];
+
+        let snapshot = summarize_governed_memory_orchestration_for_query(
+            &entries,
+            now,
+            2,
+            Some("What is the alpha project status and ui preference?"),
+        );
+
+        assert_eq!(snapshot.stale_review.len(), 1);
+        assert_eq!(snapshot.stale_review[0].key, "project.alpha.status");
+        assert_eq!(
+            snapshot.stale_review[0].lifecycle.state,
+            MemoryLifecycleState::Stale
+        );
+        assert_eq!(snapshot.promotion_candidates.len(), 1);
+        assert_eq!(snapshot.promotion_candidates[0].key, "pref.editor.theme");
     }
 }

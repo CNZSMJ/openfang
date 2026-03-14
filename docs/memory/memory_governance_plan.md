@@ -229,6 +229,31 @@
   - cleanup apply 后，canonical key 与 metadata 回填可被 API 读回，而 orphan sidecar 已删除；验证过程中被一并迁移的无关 shared legacy bare key 已恢复回原状
   - 现有 `Researcher` 与 `assistant` agent 的真实 message 分别命中了既有的 MiniMax tool-result id 错误与 Gemini `thought_signature` 错误，因此最终用一个临时无工具 MiniMax verifier agent 补齐了真实 LLM + `/api/budget` 增量验证
 
+### 3.14 Lifecycle / Promotion 进入 Prompt Orchestration
+
+- governed retrieval 之前已经把 lifecycle / promotion 字段放进 `Governed memory candidates` 明细里，但那仍然要求模型自己从候选行中归纳“哪些 stale 需要复核、哪些 durable 该进 MEMORY.md”。
+- 现在 `openfang-types::memory` 新增了 governed orchestration snapshot helper，会围绕当前 query 直接总结两类动作性信号：
+  - `stale_review`
+  - `promotion_candidates`
+- runtime 在构造动态 memory context 时，会先注入新的 `Governance attention signals` 小节，再附加原有 `Governed memory candidates`：
+  - `Review stale memory before reuse: [...]`
+  - `Consider promoting to MEMORY.md: [...]`
+- 这样 lifecycle / promotion 不再只是“字段可见”，而是第一次进入了 prompt orchestration 的上层决策提示，模型不需要再自己从原始 metadata 行里二次推理。
+- 当前 signal 仍然复用既有 governed retrieval 语义：
+  - query-aware 匹配
+  - lifecycle 排序
+  - promotion candidate 规则
+  - tag / kind / freshness / updated_at
+- 但它把这些规则压缩成了更直接的动作提示，适合驱动：
+  - stale 记忆先复核再复用
+  - durable preference / decision / profile 类记忆考虑晋升到 `MEMORY.md`
+- live verification 已确认这不是只在代码里拼字符串：
+  - 通过 API 写入两条 shared governed probe，并把 sidecar `updated_at` 调到 stale 窗口
+  - verifier agent 的 `llm.log` 中真实出现了 `Governance attention signals`
+  - log 中明确包含两条 stale review 和一条 promotion 提示
+  - 同轮回复也按 stale review / promotion 结构组织，说明该摘要已经被模型实际消费
+- 这一步仍然没有实现“自动 cleanup / 自动 promotion”，但它已经把治理状态从被动可见推进到了主动提示，基本完成了 Phase 1 对 prompt orchestration 的最小闭环。
+
 ## 4. 当前不做的事情
 
 本阶段当前实现明确不做：
@@ -269,4 +294,4 @@
 
 1. 决定 governed prompt candidates 的 query-aware 打分是否需要继续引入停用词、短语匹配或 namespace/kind 显式 hint。
 2. 评估是否需要把 cleanup audit/apply 进一步暴露到 orchestration hook，而不只停留在 API + tool + dashboard。
-3. 决定 lifecycle / promotion snapshot 是否需要进入更高层 prompt orchestration，而不仅仅停留在当前提示文案、dashboard 与 API/tool 可见层。
+3. 评估 governance attention signals 是否需要进一步驱动自动 promotion / cleanup，而不只停留在当前 prompt 摘要层。

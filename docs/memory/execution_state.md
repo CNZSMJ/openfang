@@ -88,6 +88,10 @@
   - governed 候选优先读取 kernel 暴露的 shared memory list，因此 memory tool / memory API 写入的 shared KV 也会进入动态 retrieval 消费路径
   - governed 候选当前会消费 `kind` / `tags` / `freshness` / `lifecycle_state` / `promotion_candidate`，并排除 `expired` 记录
   - governed 候选已具备最小 query-aware 排序：会用当前 user message 对 `key` / `tags` / `kind` / `value` 做轻量打分，再回落到治理优先级排序
+- 已落地 governance attention orchestration 切口：
+  - `openfang-types::memory` 新增 governed orchestration snapshot helper，会按当前 query 总结两类动作性信号：`stale_review` 与 `promotion_candidates`
+  - runtime 动态 memory context 现在会先注入 `Governance attention signals`，再附加 `Governed memory candidates` 明细，不再要求模型自己从原始 candidate 行里猜哪些要复核、哪些该晋升
+  - orchestration signal 当前会显式暴露 `review_at` / `expires_at` / `freshness` / `lifecycle` / `tags`，把“先复核 stale，再考虑 promotion”变成 prompt 级的直接指令输入
 - 已完成本轮验证：
   - `cargo build --workspace --lib`
   - `cargo test --workspace`
@@ -140,15 +144,25 @@
     - cleanup 后单条读取确认 `general.dashboard_cleanup_probe` 与 `project.dashboard_cleanup.note` 都具备 governed metadata，而 `pref.dashboard_cleanup.orphan` sidecar 已不存在
     - 真实 LLM 验证阶段，现有 `Researcher` 与 `assistant` agent 分别命中了既有的 MiniMax tool-result id 兼容问题与 Gemini `thought_signature` 问题，因此改为临时创建一个无工具的 MiniMax verifier agent 完成纯文本消息调用
     - verifier 返回 `Hey there! Great to meet you! 👋`，`daily_spend` 从 `0.10918752` 增到 `0.11277132000000001`；dashboard cleanup probes 与临时 verifier agent 已删除，daemon 已按流程停止
+  - live governance attention orchestration 验证通过：
+    - 通过 memory API 写入 `pref.orchestration_signal.theme` 与 `project.alpha.orchestration_signal.status` 两条 shared governed KV，并把 sidecar `updated_at` 调整到 stale 窗口
+    - 单条读取确认两条 probe 均已变为 `lifecycle_state=stale`，其中 `pref.orchestration_signal.theme` 仍为 `promotion_candidate=true`
+    - 临时无工具 MiniMax verifier agent 的 `llm.log` 中出现新的 `Governance attention signals` 区段，明确包含：
+      - `Review stale memory before reuse: [pref.orchestration_signal.theme]`
+      - `Review stale memory before reuse: [project.alpha.orchestration_signal.status]`
+      - `Consider promoting to MEMORY.md: [pref.orchestration_signal.theme]`
+    - 同一份 log 中仍保留 `Governed memory candidates` 明细，说明新摘要是叠加在原 governed retrieval 之上，而不是替换掉它
+    - verifier 的真实回复已按 stale review / promotion 组织答案，`daily_spend` 从 `0.11277132000000001` 增到 `0.12000932`，`/api/budget/agents` 中新增 verifier 花费 `0.007238000000000001`
+    - orchestration probes 与临时 verifier agent 已删除，daemon 已按流程停止
 
 ## 进行中
 
-- 继续推进 Phase 1 后续切口：governed prompt candidates 的 query-aware 规则是否需要更强，以及 lifecycle / promotion snapshot 是否需要进入更高层 prompt orchestration。
+- 继续推进 Phase 1 后续切口：governed prompt candidates 的 query-aware 规则是否需要更强，以及 cleanup / governance attention 是否还需要进一步进入自动 orchestration hook。
 
 ## 下一步动作
 
 - 评估 governed prompt candidates 的 query-aware 打分是否需要继续引入停用词、短语匹配、namespace/kind hint 或显式过滤。
-- 评估 lifecycle / promotion snapshot 是否需要进入 prompt orchestration 的更高层，而不只停留在 dashboard + API/tool 可见层。
+- 评估 cleanup / governance attention 是否需要进入更主动的 orchestration hook，而不只停留在当前 prompt 摘要、dashboard 与 API/tool 可见层。
 - 在切换电脑或结束一轮实质性工作前，持续更新本文件。
 
 ## 风险与阻塞
