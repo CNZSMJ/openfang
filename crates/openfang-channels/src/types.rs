@@ -280,7 +280,7 @@ pub trait ChannelAdapter: Send + Sync {
 ///
 /// Shared utility used by Telegram, Discord, and Slack adapters.
 pub fn split_message(text: &str, max_len: usize) -> Vec<&str> {
-    if text.len() <= max_len {
+    if max_len == 0 || text.len() <= max_len {
         return vec![text];
     }
     let mut chunks = Vec::new();
@@ -292,7 +292,14 @@ pub fn split_message(text: &str, max_len: usize) -> Vec<&str> {
         }
         // Try to split at a newline near the boundary (UTF-8 safe)
         let safe_end = openfang_types::truncate_str(remaining, max_len).len();
-        let split_at = remaining[..safe_end].rfind('\n').unwrap_or(safe_end);
+        if safe_end == 0 {
+            chunks.push(remaining);
+            break;
+        }
+        let split_at = remaining[..safe_end]
+            .rfind('\n')
+            .filter(|idx| *idx > 0)
+            .unwrap_or(safe_end);
         let (chunk, rest) = remaining.split_at(split_at);
         chunks.push(chunk);
         // Skip the newline (and optional \r) we split on
@@ -342,6 +349,20 @@ mod tests {
         let text = "line1\nline2\nline3";
         let chunks = split_message(text, 10);
         assert_eq!(chunks, vec!["line1", "line2", "line3"]);
+    }
+
+    #[test]
+    fn test_split_message_zero_limit_returns_unsplit() {
+        let text = "hello";
+        let chunks = split_message(text, 0);
+        assert_eq!(chunks, vec!["hello"]);
+    }
+
+    #[test]
+    fn test_split_message_no_empty_chunks_when_newline_at_start() {
+        let text = "\nline1\nline2";
+        let chunks = split_message(text, 6);
+        assert!(chunks.iter().all(|chunk| !chunk.is_empty()));
     }
 
     #[test]

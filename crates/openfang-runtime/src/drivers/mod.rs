@@ -263,7 +263,7 @@ pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmErr
         return Ok(Arc::new(anthropic::AnthropicDriver::new(api_key, base_url)));
     }
 
-    // MiniMax uses Anthropic API format
+    // MiniMax uses OpenAI-compatible chat completions endpoints.
     if provider == "minimax" {
         let api_key = config
             .api_key
@@ -276,7 +276,7 @@ pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmErr
             .base_url
             .clone()
             .unwrap_or_else(|| MINIMAX_BASE_URL.to_string());
-        return Ok(Arc::new(anthropic::AnthropicDriver::new(api_key, base_url)));
+        return Ok(Arc::new(openai::OpenAIDriver::new(api_key, base_url)));
     }
 
     // Gemini uses a different API format — special case
@@ -519,6 +519,9 @@ pub fn known_providers() -> &'static [&'static str] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm_driver::CompletionRequest;
+    use openfang_types::message::{Message, MessageContent, Role};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn test_provider_defaults_groq() {
@@ -710,6 +713,67 @@ mod tests {
         assert_eq!(d.base_url, "https://api.kimi.com/coding");
         assert_eq!(d.api_key_env, "KIMI_API_KEY");
         assert!(d.key_required);
+    }
+
+    #[tokio::test]
+    async fn test_minimax_uses_openai_chat_completions_endpoint() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("listener local addr");
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept connection");
+            let mut buf = [0u8; 8192];
+            let n = socket.read(&mut buf).await.expect("read request");
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            let first_line = request.lines().next().unwrap_or_default().to_string();
+
+            let body = r#"{"id":"chatcmpl-test","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+
+            first_line
+        });
+
+        let driver = create_driver(&DriverConfig {
+            provider: "minimax".to_string(),
+            api_key: Some("test-key".to_string()),
+            base_url: Some(format!("http://{addr}")),
+            skip_permissions: true,
+        })
+        .expect("create minimax driver");
+
+        let response = driver
+            .complete(CompletionRequest {
+                model: "MiniMax-M2.5".to_string(),
+                messages: vec![Message {
+                    role: Role::User,
+                    content: MessageContent::text("Say OK"),
+                }],
+                tools: vec![],
+                max_tokens: 32,
+                temperature: 0.0,
+                system: None,
+                thinking: None,
+            })
+            .await
+            .expect("minimax completion");
+
+        assert_eq!(response.text(), "OK");
+
+        let request_line = server.await.expect("server join");
+        assert!(
+            request_line.starts_with("POST /chat/completions "),
+            "unexpected request line: {request_line}"
+        );
     }
 
     #[test]

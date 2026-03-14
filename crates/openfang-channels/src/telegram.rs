@@ -1143,6 +1143,9 @@ fn split_telegram_html_chunks(text: &str, max_len: usize) -> Vec<String> {
     if sanitized.is_empty() {
         return vec![String::new()];
     }
+    if max_len == 0 {
+        return vec![sanitized];
+    }
     if sanitized.len() <= max_len {
         return vec![sanitized];
     }
@@ -1576,6 +1579,42 @@ mod tests {
     fn test_split_telegram_html_chunks_escapes_unknown_tags() {
         let chunks = split_telegram_html_chunks("hello <thinking>world</thinking>", 4096);
         assert_eq!(chunks, vec!["hello &lt;thinking&gt;world&lt;/thinking&gt;".to_string()]);
+    }
+
+    #[test]
+    fn test_split_telegram_html_chunks_preserves_code_block_wrappers() {
+        let input = "<pre><code>line1\nline2\nline3</code></pre>";
+        let chunks = split_telegram_html_chunks(input, 30);
+        assert_eq!(
+            chunks,
+            vec![
+                "<pre><code>line1</code></pre>".to_string(),
+                "<pre><code>line2</code></pre>".to_string(),
+                "<pre><code>line3</code></pre>".to_string(),
+            ]
+        );
+        assert!(chunks.iter().all(|chunk| chunk.len() <= 30));
+    }
+
+    #[test]
+    fn test_split_telegram_html_chunks_preserves_table_as_preformatted_lines() {
+        let input = "<pre><code>| A | B |\n| 1 | 2 |\n| 3 | 4 |</code></pre>";
+        let chunks = split_telegram_html_chunks(input, 34);
+        assert_eq!(
+            chunks,
+            vec![
+                "<pre><code>| A | B |</code></pre>".to_string(),
+                "<pre><code>| 1 | 2 |</code></pre>".to_string(),
+                "<pre><code>| 3 | 4 |</code></pre>".to_string(),
+            ]
+        );
+        assert!(chunks.iter().all(|chunk| chunk.len() <= 34));
+    }
+
+    #[test]
+    fn test_split_telegram_html_chunks_zero_limit_returns_unsplit() {
+        let chunks = split_telegram_html_chunks("hello", 0);
+        assert_eq!(chunks, vec!["hello".to_string()]);
     }
 
 }
