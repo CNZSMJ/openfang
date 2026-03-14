@@ -9,7 +9,7 @@
 
 ## 当前阶段
 
-- `phase-1-memory-governance`
+- `phase-2-embedding-hybrid-retrieval`
 
 ## 基线分支
 
@@ -30,13 +30,17 @@
 
 ## 当前目标
 
-- 在 `memory-governance` 阶段继续收口 Phase 1 lifecycle 与治理消费边界，并把 governed retrieval / orchestration 的入口稳定下来。
+- 在 `memory-governance` 分支上开始 Phase 2，围绕 governed shared memory 设计并落地 embedding / hybrid retrieval 的接线顺序与验证路径。
 
 ## 已完成
 
 - 已重写记忆增强设计文档，使其与当前分支中的实际实现架构一致。
 - 已明确 `MEMORY.md` 指的是 agent workspace identity file，而不是仓库中的任意 `MEMORY.md`。
 - 已确认后续阶段交付顺序：memory governance、embedding/hybrid retrieval、prompt architecture、assistant memory autoconverge。
+- 已完成 Phase 1 `memory-governance` 收口：
+  - shared KV 已具备 namespacing、metadata sidecar、tags / freshness / lifecycle / promotion、legacy cleanup、tool/API/dashboard 暴露
+  - governed retrieval 已具备 query profile 排序、attention signals、maintenance signals，并真实进入 prompt-time orchestration
+  - Phase 1 剩余条目已从“实现缺口”收敛为“后续阶段可选增强”，不再阻塞进入 embedding / hybrid retrieval
 - 已确认后续记忆计划管理文档统一放在 `docs/memory/` 下。
 - 已将 `feature/enhance-memory-recall-and-store` 合并回 `custom/0.1.0`，形成 Phase 0 基线。
 - 已完成一次合并后验证：`cargo build --workspace --lib`、`cargo test --workspace`、最小 live integration 成功。
@@ -178,13 +182,13 @@
 
 ## 进行中
 
-- 继续推进 Phase 1 后续切口：governance maintenance / attention signals 是否还需要进一步驱动更主动的 orchestration hook，而不只停留在当前 prompt 摘要层。
+- 准备进入 Phase 2：embedding / hybrid retrieval 的接线边界、provider 选择、以及如何消费现有 governed metadata。
 
 ## 下一步动作
 
-- 评估 maintenance signals 在 agent 具备 `memory_cleanup` 能力时，是否应该进入更主动的 orchestration hook，而不只停留在当前 prompt 摘要。
-- 评估 cleanup / governance attention 是否需要进一步驱动自动 promotion / cleanup，而不只停留在当前 prompt 摘要、dashboard 与 API/tool 可见层。
-- 评估 governed retrieval 是否还需要更强的显式过滤或 action hook，而不只是当前 query profile + 排序增强。
+- 读取并对齐 Phase 2 设计目标：embedding provider、fallback、以及 governed metadata 在 hybrid retrieval 中的消费顺序。
+- 决定 Phase 2 的最小落地点：先接 embedding recall、还是直接做 hybrid retrieval 排序与回退。
+- 把当前 embedding 运行前提补齐后再开始 live verification；本机 `http://localhost:11434/v1/embeddings` 当前离线，会影响 Phase 2 验证路径。
 - 在切换电脑或结束一轮实质性工作前，持续更新本文件。
 
 ## 风险与阻塞
