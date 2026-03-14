@@ -612,16 +612,115 @@ fn memory_freshness_sort_rank(freshness: &MemoryFreshness) -> u8 {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct MemoryQueryProfile {
+    terms: Vec<String>,
+    phrases: Vec<String>,
+    namespace_hints: Vec<String>,
+    kind_hints: Vec<String>,
+}
+
+impl MemoryQueryProfile {
+    fn is_empty(&self) -> bool {
+        self.terms.is_empty()
+            && self.phrases.is_empty()
+            && self.namespace_hints.is_empty()
+            && self.kind_hints.is_empty()
+    }
+}
+
+fn is_memory_query_stopword(term: &str) -> bool {
+    matches!(
+        term,
+        "a"
+            | "an"
+            | "and"
+            | "are"
+            | "at"
+            | "be"
+            | "before"
+            | "but"
+            | "by"
+            | "can"
+            | "did"
+            | "do"
+            | "does"
+            | "for"
+            | "from"
+            | "how"
+            | "i"
+            | "if"
+            | "in"
+            | "into"
+            | "is"
+            | "it"
+            | "me"
+            | "my"
+            | "now"
+            | "of"
+            | "on"
+            | "or"
+            | "our"
+            | "right"
+            | "should"
+            | "that"
+            | "the"
+            | "their"
+            | "them"
+            | "there"
+            | "these"
+            | "they"
+            | "this"
+            | "to"
+            | "up"
+            | "use"
+            | "we"
+            | "what"
+            | "when"
+            | "where"
+            | "which"
+            | "who"
+            | "why"
+            | "you"
+            | "your"
+    )
+}
+
+fn normalize_memory_query_text(input: &str) -> String {
+    let mut normalized = String::with_capacity(input.len());
+    let mut previous_was_space = false;
+
+    for ch in input.chars() {
+        let normalized_char = if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-') {
+            ch.to_ascii_lowercase()
+        } else {
+            ' '
+        };
+
+        if normalized_char == ' ' {
+            if !previous_was_space && !normalized.is_empty() {
+                normalized.push(' ');
+            }
+            previous_was_space = true;
+        } else {
+            normalized.push(normalized_char);
+            previous_was_space = false;
+        }
+    }
+
+    normalized.trim().to_string()
+}
+
 fn memory_query_terms(query: &str) -> Vec<String> {
     let mut terms = Vec::new();
     let mut seen = HashSet::new();
 
-    for term in query
-        .split(|ch: char| !ch.is_ascii_alphanumeric() && !matches!(ch, '_' | '-'))
-        .map(str::trim)
+    for term in normalize_memory_query_text(query)
+        .split_whitespace()
         .filter(|term| term.len() >= 2)
-        .map(|term| term.to_lowercase())
+        .filter(|term| !is_memory_query_stopword(term))
     {
+        let term = term.to_string();
         if seen.insert(term.clone()) {
             terms.push(term);
         }
@@ -630,41 +729,157 @@ fn memory_query_terms(query: &str) -> Vec<String> {
     terms
 }
 
-fn memory_query_match_score(candidate: &GovernedMemoryPromptCandidate, query_terms: &[String]) -> usize {
-    if query_terms.is_empty() {
+fn memory_query_phrases(terms: &[String]) -> Vec<String> {
+    let mut phrases = Vec::new();
+    let mut seen = HashSet::new();
+
+    for width in [3, 2] {
+        for window in terms.windows(width) {
+            let phrase = window.join(" ");
+            if seen.insert(phrase.clone()) {
+                phrases.push(phrase);
+            }
+        }
+    }
+
+    phrases
+}
+
+fn push_unique_hint(hints: &mut Vec<String>, hint: &str) {
+    if !hints.iter().any(|existing| existing == hint) {
+        hints.push(hint.to_string());
+    }
+}
+
+fn memory_query_profile(query: &str) -> MemoryQueryProfile {
+    let terms = memory_query_terms(query);
+    let phrases = memory_query_phrases(&terms);
+    let mut namespace_hints = Vec::new();
+    let mut kind_hints = Vec::new();
+
+    for term in &terms {
+        match term.as_str() {
+            "blocked" | "blocker" | "launch" | "milestone" | "project" | "qa" | "release"
+            | "roadmap" | "ship" | "shipping" | "status" => {
+                push_unique_hint(&mut namespace_hints, "project");
+                push_unique_hint(&mut kind_hints, "project_state");
+            }
+            "constraint" | "constraints" | "must" | "policy" | "requirement" | "required" => {
+                push_unique_hint(&mut kind_hints, "constraint");
+            }
+            "decide" | "decided" | "decision" | "choice" | "chosen" => {
+                push_unique_hint(&mut kind_hints, "decision");
+            }
+            "prefer" | "preference" | "preferences" | "preferred" | "style" | "theme"
+            | "tone" | "format" | "formatting" | "ux" | "ui" => {
+                push_unique_hint(&mut namespace_hints, "pref");
+                push_unique_hint(&mut kind_hints, "preference");
+            }
+            "profile" | "background" | "bio" => {
+                push_unique_hint(&mut kind_hints, "profile");
+            }
+            _ => {}
+        }
+    }
+
+    MemoryQueryProfile {
+        terms,
+        phrases,
+        namespace_hints,
+        kind_hints,
+    }
+}
+
+fn memory_query_match_score(
+    candidate: &GovernedMemoryPromptCandidate,
+    query_profile: &MemoryQueryProfile,
+) -> usize {
+    if query_profile.is_empty() {
         return 0;
     }
 
     let key_tokens = memory_query_terms(&candidate.key);
+    let normalized_key = normalize_memory_query_text(&candidate.key);
+    let namespace = candidate.metadata.namespace.to_lowercase();
     let kind = candidate.metadata.kind.to_lowercase();
-    let rendered_value = match &candidate.value {
-        serde_json::Value::String(text) => text.to_lowercase(),
-        other => serde_json::to_string(other).unwrap_or_default().to_lowercase(),
+    let lowered_tags: Vec<String> = candidate
+        .metadata
+        .tags
+        .iter()
+        .map(|tag| tag.to_lowercase())
+        .collect();
+    let normalized_value = match &candidate.value {
+        serde_json::Value::String(text) => normalize_memory_query_text(text),
+        other => normalize_memory_query_text(&serde_json::to_string(other).unwrap_or_default()),
     };
 
-    query_terms
+    let term_score: usize = query_profile
+        .terms
         .iter()
         .map(|term| {
             let mut score = 0;
 
-            if candidate.metadata.tags.iter().any(|tag| tag == term) {
-                score += 6;
+            if lowered_tags.iter().any(|tag| tag == term) {
+                score += 8;
             }
             if key_tokens.iter().any(|token| token == term) {
-                score += 5;
-            } else if candidate.key.to_lowercase().contains(term) {
+                score += 7;
+            } else if namespace == *term {
+                score += 6;
+            } else if normalized_key.contains(term) {
                 score += 3;
             }
             if kind == *term {
-                score += 4;
+                score += 6;
             }
-            if rendered_value.contains(term) {
+            if normalized_value.contains(term) {
                 score += 2;
             }
 
             score
         })
-        .sum()
+        .sum();
+
+    let phrase_score: usize = query_profile
+        .phrases
+        .iter()
+        .map(|phrase| {
+            let mut score = 0;
+
+            if normalized_key.contains(phrase) {
+                score += 10;
+            }
+            if normalized_value.contains(phrase) {
+                score += 5;
+            }
+            if lowered_tags
+                .iter()
+                .map(|tag| normalize_memory_query_text(tag))
+                .any(|tag| tag == *phrase)
+            {
+                score += 6;
+            }
+
+            score
+        })
+        .sum();
+
+    let namespace_hint_score = if query_profile
+        .namespace_hints
+        .iter()
+        .any(|hint| hint == &namespace)
+    {
+        8
+    } else {
+        0
+    };
+    let kind_hint_score = if query_profile.kind_hints.iter().any(|hint| hint == &kind) {
+        7
+    } else {
+        0
+    };
+
+    term_score + phrase_score + namespace_hint_score + kind_hint_score
 }
 
 fn collect_governed_memory_prompt_candidates(
@@ -706,10 +921,10 @@ fn collect_governed_memory_prompt_candidates(
 fn compare_governed_memory_candidates(
     a: &GovernedMemoryPromptCandidate,
     b: &GovernedMemoryPromptCandidate,
-    query_terms: &[String],
+    query_profile: &MemoryQueryProfile,
 ) -> std::cmp::Ordering {
-    memory_query_match_score(b, query_terms)
-        .cmp(&memory_query_match_score(a, query_terms))
+    memory_query_match_score(b, query_profile)
+        .cmp(&memory_query_match_score(a, query_profile))
         .then_with(|| {
             memory_lifecycle_sort_rank(a.lifecycle.state).cmp(&memory_lifecycle_sort_rank(b.lifecycle.state))
         })
@@ -752,9 +967,9 @@ pub fn select_governed_memory_prompt_candidates_for_query(
         return Vec::new();
     }
 
-    let query_terms = query.map(memory_query_terms).unwrap_or_default();
+    let query_profile = query.map(memory_query_profile).unwrap_or_default();
     let mut candidates = collect_governed_memory_prompt_candidates(entries, now);
-    candidates.sort_by(|a, b| compare_governed_memory_candidates(a, b, &query_terms));
+    candidates.sort_by(|a, b| compare_governed_memory_candidates(a, b, &query_profile));
     candidates.truncate(limit);
     candidates
 }
@@ -770,7 +985,7 @@ pub fn summarize_governed_memory_orchestration_for_query(
         return GovernedMemoryOrchestrationSnapshot::default();
     }
 
-    let query_terms = query.map(memory_query_terms).unwrap_or_default();
+    let query_profile = query.map(memory_query_profile).unwrap_or_default();
     let candidates = collect_governed_memory_prompt_candidates(entries, now);
 
     let mut stale_review: Vec<GovernedMemoryPromptCandidate> = candidates
@@ -778,7 +993,7 @@ pub fn summarize_governed_memory_orchestration_for_query(
         .filter(|candidate| candidate.lifecycle.state == MemoryLifecycleState::Stale)
         .cloned()
         .collect();
-    stale_review.sort_by(|a, b| compare_governed_memory_candidates(a, b, &query_terms));
+    stale_review.sort_by(|a, b| compare_governed_memory_candidates(a, b, &query_profile));
     stale_review.truncate(limit_per_bucket);
 
     let mut promotion_candidates: Vec<GovernedMemoryPromptCandidate> = candidates
@@ -786,7 +1001,7 @@ pub fn summarize_governed_memory_orchestration_for_query(
         .filter(|candidate| candidate.lifecycle.promotion_candidate)
         .cloned()
         .collect();
-    promotion_candidates.sort_by(|a, b| compare_governed_memory_candidates(a, b, &query_terms));
+    promotion_candidates.sort_by(|a, b| compare_governed_memory_candidates(a, b, &query_profile));
     promotion_candidates.truncate(limit_per_bucket);
 
     GovernedMemoryOrchestrationSnapshot {
@@ -1422,6 +1637,73 @@ mod tests {
         assert_eq!(candidates.len(), 2);
         assert_eq!(candidates[0].key, "project.alpha.status");
         assert_eq!(candidates[1].key, "pref.editor.theme");
+    }
+
+    #[test]
+    fn test_memory_query_terms_drop_stopwords_and_build_phrases() {
+        let profile = memory_query_profile("What is the alpha project status right now?");
+
+        assert_eq!(profile.terms, vec!["alpha", "project", "status"]);
+        assert_eq!(
+            profile.phrases,
+            vec!["alpha project status", "alpha project", "project status"]
+        );
+        assert_eq!(profile.namespace_hints, vec!["project"]);
+        assert_eq!(profile.kind_hints, vec!["project_state"]);
+    }
+
+    #[test]
+    fn test_select_governed_memory_prompt_candidates_for_query_uses_preference_hints() {
+        let now = Utc::now();
+        let preference_metadata = MemoryRecordMetadata {
+            schema_version: MEMORY_METADATA_SCHEMA_VERSION,
+            key: "pref.reply.style".to_string(),
+            namespace: "pref".to_string(),
+            kind: "preference".to_string(),
+            tags: vec!["profile".to_string()],
+            freshness: MemoryFreshness::Durable,
+            source: "memory_store_tool".to_string(),
+            updated_at: now - Duration::days(3),
+        };
+        let project_metadata = MemoryRecordMetadata {
+            schema_version: MEMORY_METADATA_SCHEMA_VERSION,
+            key: "project.alpha.status".to_string(),
+            namespace: "project".to_string(),
+            kind: "project_state".to_string(),
+            tags: vec!["project".to_string(), "alpha".to_string()],
+            freshness: MemoryFreshness::Rolling,
+            source: "memory_store_tool".to_string(),
+            updated_at: now - Duration::hours(1),
+        };
+        let entries = vec![
+            (
+                "pref.reply.style".to_string(),
+                serde_json::json!("Use compact bullet lists with a short summary first."),
+            ),
+            (
+                memory_metadata_key("pref.reply.style").unwrap(),
+                serde_json::to_value(&preference_metadata).unwrap(),
+            ),
+            (
+                "project.alpha.status".to_string(),
+                serde_json::json!("Alpha launch is blocked on QA signoff."),
+            ),
+            (
+                memory_metadata_key("project.alpha.status").unwrap(),
+                serde_json::to_value(&project_metadata).unwrap(),
+            ),
+        ];
+
+        let candidates = select_governed_memory_prompt_candidates_for_query(
+            &entries,
+            now,
+            5,
+            Some("How should you format replies to me?"),
+        );
+
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].key, "pref.reply.style");
+        assert_eq!(candidates[1].key, "project.alpha.status");
     }
 
     #[test]

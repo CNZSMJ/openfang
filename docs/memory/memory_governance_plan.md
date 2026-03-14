@@ -135,7 +135,8 @@
   - 排除 internal key、metadata sidecar 与 `expired` lifecycle 记录
   - 优先考虑 `preference` / `decision` / `constraint` / `profile` / `project_state`
   - 允许带 tag 的 governed 记录进入候选集
-  - 先根据当前 user query 对 `key` / `tags` / `kind` / `value` 做轻量 query-aware 打分，再按 lifecycle、promotion candidate、是否带 tags、freshness、updated_at 排序
+  - 先构建共享 query profile：stopword 清理、2/3-gram phrase 提取，以及 namespace / kind hint
+  - 再根据该 profile 对 `key` / `tags` / `kind` / `value` 做加权 query-aware 打分，然后按 lifecycle、promotion candidate、是否带 tags、freshness、updated_at 排序
 - prompt 注入层当前会把这些候选以独立的 `Governed memory candidates` 小节附加到动态 memory context 中，并显式暴露：
   - `kind`
   - `freshness`
@@ -254,6 +255,32 @@
   - 同轮回复也按 stale review / promotion 结构组织，说明该摘要已经被模型实际消费
 - 这一步仍然没有实现“自动 cleanup / 自动 promotion”，但它已经把治理状态从被动可见推进到了主动提示，基本完成了 Phase 1 对 prompt orchestration 的最小闭环。
 
+### 3.15 Strengthened Query Profile for Governed Retrieval
+
+- 在最小 query-aware 排序之上，`openfang-types::memory` 现在新增了一层共享 query profile，专门为 governed retrieval / orchestration 做更可解释的 query 归一化。
+- 当前 profile 会做三件事：
+  - 过滤常见 stopwords，避免 `what / is / the / right / now` 之类无信息词稀释打分
+  - 从剩余有效词里提取 2-gram / 3-gram phrases，给 `project alpha status` / `qa signoff` 这类短语更高权重
+  - 从 query terms 归纳 namespace / kind hints，例如：
+    - `format` / `style` / `theme` / `prefer` → `pref` / `preference`
+    - `requirements` / `policy` / `must` → `constraint`
+    - `project` / `status` / `launch` / `blocked` / `qa` → `project` / `project_state`
+- 打分时会综合消费：
+  - exact tag hit
+  - key token / namespace / kind hit
+  - normalized key/value phrase hit
+  - namespace / kind hint hit
+- 这样 governed retrieval 不再只依赖字面 token 命中，而是具备了最低限度的 query intent 归纳能力。
+- 这层能力同时被 `select_governed_memory_prompt_candidates_for_query` 和 `summarize_governed_memory_orchestration_for_query` 复用，因此 prompt candidates 和 governance attention signals 共享一套排序语义，而不是各自漂移。
+- 新增单测已覆盖：
+  - stopword 去除与 phrase 构造
+  - preference hint 把 reply-style preference 拉到 project-state 之前
+- live verification 也确认该增强真实进入了运行链路：
+  - 当用户问 `How should you format replies for me?` 时，`llm.log` 中 `Governed memory candidates` 前三为 `pref.query_profile.reply_style`、`general.query_profile.response_rule`、`project.alpha.query_profile.status`
+  - 当用户问 `What is blocking the alpha launch?` 时，同一份 log 中排序切换为 `project.alpha.query_profile.status`、`general.query_profile.response_rule`、`pref.query_profile.reply_style`
+  - 第一轮真实回复同时引用了 reply-style preference 与 no-table constraint，第二轮则直接返回 `Alpha launch is blocked on QA signoff.`
+- 这一步仍然不是 embedding / hybrid retrieval，也还没有进入显式 filtering / action hook，但已经把 governed retrieval 从“轻量词命中”推进到了“带 query profile 的可解释排序”。
+
 ## 4. 当前不做的事情
 
 本阶段当前实现明确不做：
@@ -292,6 +319,6 @@
 
 在当前切口稳定后，下一步按以下顺序推进：
 
-1. 决定 governed prompt candidates 的 query-aware 打分是否需要继续引入停用词、短语匹配或 namespace/kind 显式 hint。
+1. 评估 governed retrieval 是否还需要更强的显式过滤或 action hook，而不只是当前 query profile + 排序增强。
 2. 评估是否需要把 cleanup audit/apply 进一步暴露到 orchestration hook，而不只停留在 API + tool + dashboard。
 3. 评估 governance attention signals 是否需要进一步驱动自动 promotion / cleanup，而不只停留在当前 prompt 摘要层。

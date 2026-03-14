@@ -87,7 +87,7 @@
   - runtime 动态 memory context 现在会额外注入 `Governed memory candidates`，不再只依赖 semantic recall 与 `session_*` 摘要
   - governed 候选优先读取 kernel 暴露的 shared memory list，因此 memory tool / memory API 写入的 shared KV 也会进入动态 retrieval 消费路径
   - governed 候选当前会消费 `kind` / `tags` / `freshness` / `lifecycle_state` / `promotion_candidate`，并排除 `expired` 记录
-  - governed 候选已具备最小 query-aware 排序：会用当前 user message 对 `key` / `tags` / `kind` / `value` 做轻量打分，再回落到治理优先级排序
+  - governed 候选的 query-aware 规则已升级为共享 query profile：会先对当前 user message 做 stopword 清理、2/3-gram phrase 提取和 namespace/kind hint 归纳，再对 `key` / `tags` / `kind` / `value` 做加权打分后回落到治理优先级排序
 - 已落地 governance attention orchestration 切口：
   - `openfang-types::memory` 新增 governed orchestration snapshot helper，会按当前 query 总结两类动作性信号：`stale_review` 与 `promotion_candidates`
   - runtime 动态 memory context 现在会先注入 `Governance attention signals`，再附加 `Governed memory candidates` 明细，不再要求模型自己从原始 candidate 行里猜哪些要复核、哪些该晋升
@@ -154,15 +154,22 @@
     - 同一份 log 中仍保留 `Governed memory candidates` 明细，说明新摘要是叠加在原 governed retrieval 之上，而不是替换掉它
     - verifier 的真实回复已按 stale review / promotion 组织答案，`daily_spend` 从 `0.11277132000000001` 增到 `0.12000932`，`/api/budget/agents` 中新增 verifier 花费 `0.007238000000000001`
     - orchestration probes 与临时 verifier agent 已删除，daemon 已按流程停止
+  - live strengthened query-profile retrieval 验证通过：
+    - 通过 memory API 写入 `pref.query_profile.reply_style`、`general.query_profile.response_rule` 与 `project.alpha.query_profile.status` 三条 shared governed KV
+    - 临时无工具 MiniMax verifier agent 的第一轮消息 `How should you format replies for me?` 中，`llm.log` 的 `Governed memory candidates` 排序为 `pref.query_profile.reply_style`、`general.query_profile.response_rule`、`project.alpha.query_profile.status`
+    - 第二轮消息 `What is blocking the alpha launch?` 中，同一份 `llm.log` 的 `Governed memory candidates` 排序改为 `project.alpha.query_profile.status`、`general.query_profile.response_rule`、`pref.query_profile.reply_style`
+    - 第一轮真实回复同时复用了 reply-style preference 与 no-table constraint；第二轮真实回复直接返回 `Alpha launch is blocked on QA signoff.`
+    - `/api/budget` 中 `daily_spend` 从 `0.12000932` 增到 `0.12500442`，`/api/budget/agents` 中新增 verifier agent 花费 `0.004995100000000001`
+    - query-profile probes 与临时 verifier agent 已删除，daemon 已按流程停止
 
 ## 进行中
 
-- 继续推进 Phase 1 后续切口：governed prompt candidates 的 query-aware 规则是否需要更强，以及 cleanup / governance attention 是否还需要进一步进入自动 orchestration hook。
+- 继续推进 Phase 1 后续切口：cleanup / governance attention 是否还需要进一步进入更主动的 orchestration hook，而不只停留在当前 prompt 摘要、tool/API 与 dashboard 可见层。
 
 ## 下一步动作
 
-- 评估 governed prompt candidates 的 query-aware 打分是否需要继续引入停用词、短语匹配、namespace/kind hint 或显式过滤。
 - 评估 cleanup / governance attention 是否需要进入更主动的 orchestration hook，而不只停留在当前 prompt 摘要、dashboard 与 API/tool 可见层。
+- 评估 governed retrieval 是否还需要更强的显式过滤或 action hook，而不只是当前 query profile + 排序增强。
 - 在切换电脑或结束一轮实质性工作前，持续更新本文件。
 
 ## 风险与阻塞
