@@ -395,6 +395,7 @@ pub fn build_memory_section(memories: &[(String, String)]) -> String {
          - When storing memory, include governance metadata when useful: `kind`, `tags`, `freshness`, and `conflict_policy`.\n\
          - Bare memory keys are normalized into the `general.` namespace; reserve internal keys such as `session_*` for system-managed state.\n\
          - Use memory_list lifecycle fields (`lifecycle_state`, `review_at`, `expires_at`, `promotion_candidate`) when deciding whether a memory is stale or should graduate into `MEMORY.md`.\n\
+         - If memory_list reveals legacy bare keys, orphan metadata, or missing governed metadata, use memory_cleanup to audit first and apply repairs deliberately.\n\
          - Treat injected memory context as historical guidance, not as a replacement for checking current state.",
     );
     if !memories.is_empty() {
@@ -807,7 +808,9 @@ pub fn tool_category(name: &str) -> &'static str {
 
         "shell_exec" | "shell_background" => "Shell",
 
-        "memory_store" | "memory_recall" | "memory_delete" | "memory_list" => "Memory",
+        "memory_store" | "memory_recall" | "memory_delete" | "memory_list" | "memory_cleanup" => {
+            "Memory"
+        }
 
         "agent_send" | "agent_spawn" | "agent_list" | "agent_kill" => "Agents",
 
@@ -873,6 +876,7 @@ pub fn tool_hint(name: &str) -> &'static str {
         "memory_recall" => "search memory for relevant context",
         "memory_delete" => "delete a memory entry",
         "memory_list" => "list stored memory keys",
+        "memory_cleanup" => "audit or repair governed memory metadata",
 
         // Agents
         "agent_send" => "send a message to another agent",
@@ -1118,6 +1122,7 @@ mod tests {
         assert_eq!(tool_category("browser_navigate"), "Browser");
         assert_eq!(tool_category("shell_exec"), "Shell");
         assert_eq!(tool_category("memory_store"), "Memory");
+        assert_eq!(tool_category("memory_cleanup"), "Memory");
         assert_eq!(tool_category("agent_send"), "Agents");
         assert_eq!(tool_category("mcp_minimax_web_search"), "Web");
         assert_eq!(tool_category("mcp_minimax_understand_image"), "Media");
@@ -1133,6 +1138,10 @@ mod tests {
         assert!(!tool_hint("file_read").is_empty());
         assert!(!tool_hint("browser_navigate").is_empty());
         assert_eq!(tool_hint("cron_cancel"), "cancel a scheduled task");
+        assert_eq!(
+            tool_hint("memory_cleanup"),
+            "audit or repair governed memory metadata"
+        );
         assert!(tool_hint("some_unknown_tool").is_empty());
     }
 
@@ -1142,6 +1151,7 @@ mod tests {
         assert!(section.contains("## Memory Recall"));
         assert!(section.contains("memory_recall"));
         assert!(section.contains("memory_list"));
+        assert!(section.contains("memory_cleanup"));
         assert!(!section.contains("Recalled memories"));
     }
 
@@ -1175,7 +1185,7 @@ mod tests {
         let section = build_memory_section(&memories);
         // Should be capped at 500 + "..."
         assert!(section.contains("..."));
-        assert!(section.len() < 1600);
+        assert!(section.len() < 1800);
     }
 
     #[test]

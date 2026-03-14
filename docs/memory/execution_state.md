@@ -68,6 +68,10 @@
   - cleanup plan 会识别 legacy bare key、orphan metadata sidecar、以及 canonical key 缺失 metadata 三类问题
   - `apply=true` 时会执行迁移 legacy bare key、删除 orphan sidecar、回填默认 governed metadata
   - cleanup 规划逻辑已下沉到 `openfang-types::memory::plan_memory_cleanup`
+- 已落地 cleanup tool exposure 切口：
+  - runtime builtin tool 新增 `memory_cleanup`，支持 `apply` / `limit` 参数，并直接消费共享 cleanup plan
+  - `KernelHandle` 新增 shared memory delete bridge，供 tool 层执行 legacy key 删除、orphan sidecar 删除与 metadata 回填
+  - prompt builder / setup wizard 已把 `memory_cleanup` 纳入 memory capability 指导，提示 agent 先 audit 再 apply
 - 已落地 governed retrieval consumption 切口：
   - `openfang-types::memory` 新增 `select_governed_memory_prompt_candidates`，统一为 runtime / 后续 retrieval 选择 governed KV 候选
   - runtime 动态 memory context 现在会额外注入 `Governed memory candidates`，不再只依赖 semantic recall 与 `session_*` 摘要
@@ -107,15 +111,20 @@
     - 同一份 log 里其它非 project 查询轮次仍由 durable `pref.query_probe.*` 占满前 4，说明 project probe 是被 query-aware 排序拉升，而不是静态治理顺序自然排到前面
     - 该轮真实 message 的回复直接使用了 probe 值 `Alpha launch blocked on QA signoff.`
     - 本轮 live verification 中 `daily_spend` 从 `0.05580307` 增到 `0.05715266`
+  - live `memory_cleanup` tool 验证通过：
+    - 临时创建了仅授予 `memory_cleanup` 的 MiniMax verifier agent，真实 `/api/agents/{id}/message` 返回成功
+    - verifier 的 `llm.log` 中出现两次真实 tool 调用：先 `memory_cleanup {"apply":false}`，再在命中 `tool_cleanup_legacy_probe` / `project.tool_cleanup.status` / `pref.tool_cleanup_orphan` 后执行 `memory_cleanup {"apply":true}`
+    - 该轮真实 message 的回复明确返回 `general.tool_cleanup_legacy_probe` 与 `project.tool_cleanup.status`，并确认 orphan metadata 已删除
+    - `/api/budget` 中 `daily_spend` 从 `0.05844012` 增到 `0.06483442`，`/api/budget/agents` 中新增 verifier agent 花费 `0.0063943`
+    - live 验证后已删除 probe，并把与本次 probe 无关的 shared legacy key 迁移恢复回原状
 
 ## 进行中
 
-- 继续推进 Phase 1 后续切口：governed prompt candidates 的 query-aware 规则是否需要更强，以及 cleanup / lifecycle snapshot 是否需要进入 tool/dashboard 或更高层 orchestration。
+- 继续推进 Phase 1 后续切口：governed prompt candidates 的 query-aware 规则是否需要更强，以及 lifecycle snapshot 是否需要进入 dashboard 或更高层 orchestration。
 
 ## 下一步动作
 
 - 评估 governed prompt candidates 的 query-aware 打分是否需要继续引入停用词、短语匹配、namespace/kind hint 或显式过滤。
-- 评估 cleanup audit/apply 是否需要进入 tool 层或 dashboard，而不只停留在 API。
 - 评估 lifecycle snapshot 是否需要进入 dashboard 或 prompt orchestration 的更高层，而不只停留在 API/tool 响应中。
 - 在切换电脑或结束一轮实质性工作前，持续更新本文件。
 
@@ -123,6 +132,7 @@
 
 - `cargo clippy --workspace --all-targets -- -D warnings` 当前仍被 `openfang-cli/src/main.rs` 中既有问题阻塞；按仓库约束，本轮未修改 `openfang-cli`。
 - 当前 embedding provider 本地端点 `http://localhost:11434/v1/embeddings` 离线，live LLM 调用期间会回退到 text search；这不阻塞本轮 KV governance 验证，但会影响 embedding recall 路径验证。
+- 当前 `assistant` agent 的 gemini tool-call 路径仍存在既有 `thought_signature` 兼容问题；本轮 `memory_cleanup` tool live verification 因此改用临时 MiniMax verifier agent 完成。
 - 如果后续启动工作时不先读取本文件，分支纪律和连续性可能重新漂移。
 
 ## 验证清单

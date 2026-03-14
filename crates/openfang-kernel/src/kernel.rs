@@ -5289,6 +5289,13 @@ impl KernelHandle for OpenFangKernel {
             .map_err(|e| format!("Memory recall failed: {e}"))
     }
 
+    fn memory_delete(&self, key: &str) -> Result<(), String> {
+        let agent_id = shared_memory_agent_id();
+        self.memory
+            .structured_delete(agent_id, key)
+            .map_err(|e| format!("Memory delete failed: {e}"))
+    }
+
     fn memory_list(
         &self,
         prefix: Option<&str>,

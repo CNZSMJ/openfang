@@ -12,7 +12,8 @@ use openfang_types::memory::{
     canonicalize_user_memory_key, collect_memory_metadata, is_internal_memory_key,
     is_memory_metadata_key, memory_key_matches_prefix, memory_key_namespace,
     memory_lifecycle_snapshot, memory_lookup_candidates, memory_metadata_key, memory_tags_match,
-    MemoryConflictPolicy, MemoryFreshness, MemoryLifecycleState,
+    plan_memory_cleanup, MemoryCleanupAction, MemoryConflictPolicy, MemoryFreshness,
+    MemoryLifecycleState, MEMORY_CLEANUP_SOURCE,
 };
 use openfang_types::taint::{TaintLabel, TaintSink, TaintedValue};
 use openfang_types::tool::{ToolDefinition, ToolResult};
@@ -654,6 +655,7 @@ pub async fn execute_tool(
         "memory_store" => tool_memory_store(input, kernel),
         "memory_recall" => tool_memory_recall(input, kernel),
         "memory_list" => tool_memory_list(input, kernel),
+        "memory_cleanup" => tool_memory_cleanup(input, kernel),
 
         // Collaboration tools
         "agent_find" => tool_agent_find(input, kernel),
@@ -1153,6 +1155,17 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     "limit": { "type": "integer", "description": "Maximum number of entries to return (default 20, max 100)" },
                     "include_values": { "type": "boolean", "description": "Whether to include stored values in the result (default true)" },
                     "include_internal": { "type": "boolean", "description": "Whether to include internal OpenFang keys such as session summaries and scheduler state (default false)." }
+                }
+            }),
+        },
+        tool_definition! {
+            name: "memory_cleanup".to_string(),
+            description: "Audit or apply governance cleanup for shared memory. Use to find legacy bare keys, orphan metadata sidecars, or canonical entries missing governed metadata.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "apply": { "type": "boolean", "description": "Whether to apply the cleanup plan. Default false returns audit findings only." },
+                    "limit": { "type": "integer", "description": "Maximum number of findings to inspect or apply (default 200, max 200)." }
                 }
             }),
         },
@@ -2473,6 +2486,110 @@ fn tool_memory_list(
         .collect();
 
     serde_json::to_string_pretty(&rows).map_err(|e| format!("Failed to serialize memory list: {e}"))
+}
+
+fn tool_memory_cleanup(
+    input: &serde_json::Value,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+) -> Result<String, String> {
+    let kh = require_kernel(kernel)?;
+    let apply = input.get("apply").and_then(|v| v.as_bool()).unwrap_or(false);
+    let limit = input
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|v| v.min(200) as usize)
+        .unwrap_or(200);
+
+    let mut plan = plan_memory_cleanup(&kh.memory_list(None, Some(500))?);
+    if plan.findings.len() > limit {
+        plan.findings.truncate(limit);
+    }
+
+    let mut migrated_legacy_keys = 0usize;
+    let mut deleted_legacy_keys = 0usize;
+    let mut deleted_orphan_metadata = 0usize;
+    let mut backfilled_metadata = 0usize;
+
+    if apply {
+        for finding in &plan.findings {
+            match finding.action {
+                MemoryCleanupAction::MigrateLegacyKey => {
+                    let Some(canonical_key) = finding.canonical_key.as_deref() else {
+                        continue;
+                    };
+                    let Some(legacy_value) = kh.memory_recall(&finding.key)? else {
+                        continue;
+                    };
+                    kh.memory_store(canonical_key, legacy_value)?;
+                    let metadata = build_memory_record_metadata(
+                        canonical_key,
+                        None,
+                        &[],
+                        None,
+                        MEMORY_CLEANUP_SOURCE,
+                    )?;
+                    let metadata_key = memory_metadata_key(canonical_key)?;
+                    kh.memory_store(
+                        &metadata_key,
+                        serde_json::to_value(&metadata).map_err(|e| e.to_string())?,
+                    )?;
+                    kh.memory_delete(&finding.key)?;
+                    migrated_legacy_keys += 1;
+                }
+                MemoryCleanupAction::DeleteLegacyKey => {
+                    kh.memory_delete(&finding.key)?;
+                    deleted_legacy_keys += 1;
+                }
+                MemoryCleanupAction::DeleteOrphanMetadata => {
+                    let Some(metadata_key) = finding.metadata_key.as_deref() else {
+                        continue;
+                    };
+                    kh.memory_delete(metadata_key)?;
+                    deleted_orphan_metadata += 1;
+                }
+                MemoryCleanupAction::BackfillMetadata => {
+                    let Some(canonical_key) = finding.canonical_key.as_deref() else {
+                        continue;
+                    };
+                    let Some(metadata_key) = finding.metadata_key.as_deref() else {
+                        continue;
+                    };
+                    let metadata = build_memory_record_metadata(
+                        canonical_key,
+                        None,
+                        &[],
+                        None,
+                        MEMORY_CLEANUP_SOURCE,
+                    )?;
+                    kh.memory_store(
+                        metadata_key,
+                        serde_json::to_value(&metadata).map_err(|e| e.to_string())?,
+                    )?;
+                    backfilled_metadata += 1;
+                }
+            }
+        }
+    }
+
+    let result = serde_json::json!({
+        "apply": apply,
+        "planned": plan.findings.len(),
+        "counts": {
+            "migrate_legacy_key": plan.findings.iter().filter(|finding| finding.action == MemoryCleanupAction::MigrateLegacyKey).count(),
+            "delete_legacy_key": plan.findings.iter().filter(|finding| finding.action == MemoryCleanupAction::DeleteLegacyKey).count(),
+            "delete_orphan_metadata": plan.findings.iter().filter(|finding| finding.action == MemoryCleanupAction::DeleteOrphanMetadata).count(),
+            "backfill_metadata": plan.findings.iter().filter(|finding| finding.action == MemoryCleanupAction::BackfillMetadata).count(),
+        },
+        "applied_counts": {
+            "migrated_legacy_keys": migrated_legacy_keys,
+            "deleted_legacy_keys": deleted_legacy_keys,
+            "deleted_orphan_metadata": deleted_orphan_metadata,
+            "backfilled_metadata": backfilled_metadata,
+        },
+        "findings": plan.findings,
+    });
+
+    serde_json::to_string_pretty(&result).map_err(|e| format!("Failed to serialize cleanup result: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -4060,6 +4177,11 @@ input_schema = { type = "object", properties = { issue = { type = "string" } } }
             Ok(self.memory.lock().unwrap().get(key).cloned())
         }
 
+        fn memory_delete(&self, key: &str) -> Result<(), String> {
+            self.memory.lock().unwrap().remove(key);
+            Ok(())
+        }
+
         fn memory_list(
             &self,
             prefix: Option<&str>,
@@ -4155,6 +4277,7 @@ input_schema = { type = "object", properties = { issue = { type = "string" } } }
         assert!(names.contains(&"memory_store"));
         assert!(names.contains(&"memory_recall"));
         assert!(names.contains(&"memory_list"));
+        assert!(names.contains(&"memory_cleanup"));
         // 6 collaboration tools
         assert!(names.contains(&"agent_find"));
         assert!(names.contains(&"task_post"));
@@ -4209,6 +4332,11 @@ input_schema = { type = "object", properties = { issue = { type = "string" } } }
             .find(|tool| tool.name == "memory_list")
             .expect("memory_list tool should exist");
         assert!(memory_list.input_schema["properties"]["tags"].is_object());
+        let memory_cleanup = tools
+            .iter()
+            .find(|tool| tool.name == "memory_cleanup")
+            .expect("memory_cleanup tool should exist");
+        assert!(memory_cleanup.input_schema["properties"]["apply"].is_object());
         assert!(
             tools.iter().all(|tool| !tool.defer_loading),
             "builtin tools should remain visible by default; defer_loading is reserved for skill/MCP rollout"
@@ -4276,6 +4404,126 @@ input_schema = { type = "object", properties = { issue = { type = "string" } } }
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["key"], "pref.editor.theme");
         assert_eq!(rows[0]["tags"], serde_json::json!(["ui", "profile"]));
+    }
+
+    #[tokio::test]
+    async fn test_memory_cleanup_audit_reports_findings() {
+        let kernel = Arc::new(TestKernel::with_memory(vec![
+            ("legacy_pref".to_string(), serde_json::json!("dark")),
+            (
+                "project.alpha.status".to_string(),
+                serde_json::json!("green"),
+            ),
+            (
+                "__openfang_memory_meta.pref.orphan".to_string(),
+                serde_json::json!({
+                    "schema_version": 1,
+                    "key": "pref.orphan",
+                    "namespace": "pref",
+                    "kind": "preference",
+                    "tags": [],
+                    "freshness": "durable",
+                    "source": "memory_store_tool",
+                    "updated_at": chrono::Utc::now().to_rfc3339(),
+                }),
+            ),
+        ]));
+        let kernel_handle: Arc<dyn KernelHandle> = kernel.clone();
+
+        let result = execute_tool(
+            "test-id",
+            "memory_cleanup",
+            &serde_json::json!({"apply": false}),
+            Some(&kernel_handle),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(!result.is_error, "{}", result.content);
+        let payload: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+        assert_eq!(payload["apply"], false);
+        assert_eq!(payload["counts"]["migrate_legacy_key"], 1);
+        assert_eq!(payload["counts"]["backfill_metadata"], 1);
+        assert_eq!(payload["counts"]["delete_orphan_metadata"], 1);
+        assert!(kernel
+            .memory
+            .lock()
+            .unwrap()
+            .contains_key("legacy_pref"));
+    }
+
+    #[tokio::test]
+    async fn test_memory_cleanup_apply_repairs_governance_issues() {
+        let kernel = Arc::new(TestKernel::with_memory(vec![
+            ("legacy_pref".to_string(), serde_json::json!("dark")),
+            (
+                "project.alpha.status".to_string(),
+                serde_json::json!("green"),
+            ),
+            (
+                "__openfang_memory_meta.pref.orphan".to_string(),
+                serde_json::json!({
+                    "schema_version": 1,
+                    "key": "pref.orphan",
+                    "namespace": "pref",
+                    "kind": "preference",
+                    "tags": [],
+                    "freshness": "durable",
+                    "source": "memory_store_tool",
+                    "updated_at": chrono::Utc::now().to_rfc3339(),
+                }),
+            ),
+        ]));
+        let kernel_handle: Arc<dyn KernelHandle> = kernel.clone();
+
+        let result = execute_tool(
+            "test-id",
+            "memory_cleanup",
+            &serde_json::json!({"apply": true}),
+            Some(&kernel_handle),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(!result.is_error, "{}", result.content);
+        let payload: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+        assert_eq!(payload["applied_counts"]["migrated_legacy_keys"], 1);
+        assert_eq!(payload["applied_counts"]["deleted_orphan_metadata"], 1);
+        assert_eq!(payload["applied_counts"]["backfilled_metadata"], 1);
+
+        let memory = kernel.memory.lock().unwrap();
+        assert!(!memory.contains_key("legacy_pref"));
+        assert_eq!(
+            memory.get("general.legacy_pref"),
+            Some(&serde_json::json!("dark"))
+        );
+        assert!(memory.contains_key("__openfang_memory_meta.general.legacy_pref"));
+        assert!(memory.contains_key("__openfang_memory_meta.project.alpha.status"));
+        assert!(!memory.contains_key("__openfang_memory_meta.pref.orphan"));
     }
 
     #[test]

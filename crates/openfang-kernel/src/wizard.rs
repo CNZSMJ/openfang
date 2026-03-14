@@ -80,7 +80,12 @@ impl SetupWizard {
                 "memory" => {
                     caps.memory_read.push("*".to_string());
                     caps.memory_write.push("*".to_string());
-                    for t in &["memory_store", "memory_recall", "memory_list"] {
+                    for t in &[
+                        "memory_store",
+                        "memory_recall",
+                        "memory_list",
+                        "memory_cleanup",
+                    ] {
                         let s = t.to_string();
                         if !caps.tools.contains(&s) {
                             caps.tools.push(s);
@@ -246,6 +251,11 @@ impl SetupWizard {
             hints.push(
                 "- Inspect lifecycle hints from memory_list (`lifecycle_state`, `review_at`, `expires_at`, `promotion_candidate`) before reusing or promoting old memory into MEMORY.md.",
             );
+            if has("memory_cleanup") {
+                hints.push(
+                    "- If shared memory contains legacy bare keys or broken governance metadata, use memory_cleanup with `apply=false` to audit before applying repairs.",
+                );
+            }
         }
 
         if hints.is_empty() {
@@ -399,6 +409,11 @@ mod tests {
             .capabilities
             .tools
             .contains(&"memory_recall".to_string()));
+        assert!(plan
+            .manifest
+            .capabilities
+            .tools
+            .contains(&"memory_cleanup".to_string()));
     }
 
     #[test]
@@ -437,5 +452,26 @@ mod tests {
         let plan = SetupWizard::build_plan(intent);
         assert!(plan.manifest.model.system_prompt.contains("YOUR TASK:"));
         assert!(plan.manifest.model.system_prompt.contains("Search the web"));
+    }
+
+    #[test]
+    fn test_wizard_memory_prompt_mentions_cleanup_when_memory_tools_present() {
+        let intent = AgentIntent {
+            name: "memory-test".to_string(),
+            description: "test".to_string(),
+            task: "Manage shared memory carefully".to_string(),
+            skills: vec![],
+            model_tier: "simple".to_string(),
+            scheduled: false,
+            schedule: None,
+            capabilities: vec!["memory".to_string()],
+        };
+        let plan = SetupWizard::build_plan(intent);
+        assert!(plan.manifest.model.system_prompt.contains("memory_cleanup"));
+        assert!(plan
+            .manifest
+            .model
+            .system_prompt
+            .contains("audit before applying repairs"));
     }
 }

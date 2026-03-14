@@ -48,6 +48,9 @@ pub trait KernelHandle: Send + Sync {
     /// Recall a value from shared memory.
     fn memory_recall(&self, key: &str) -> Result<Option<serde_json::Value>, String>;
 
+    /// Delete a value from shared memory.
+    fn memory_delete(&self, key: &str) -> Result<(), String>;
+
     /// List shared memory entries, optionally filtered by a prefix.
     fn memory_list(
         &self,

@@ -146,6 +146,31 @@
 - live verification 还确认了 query-aware 排序不是空转：在 5 条 durable preference 与 1 条 rolling project probe 并存时，project probe 只会在 project-status 查询里被拉升到前 4。
 - 这一步仍然不是完整的 query-aware hybrid retrieval，但它已经让 governed prompt candidates 具备最小问题感知能力，后续不必再从零设计一次字段语义。
 
+### 3.11 Cleanup 能力进入 Tool Layer
+
+- runtime builtin tools 现在新增 `memory_cleanup`，作为 shared governance cleanup 的 tool 层入口。
+- `memory_cleanup` 当前输入支持：
+  - `apply`
+  - `limit`
+- tool 返回 audit/apply 合并结果，包括：
+  - `planned`
+  - `counts`
+  - `applied_counts`
+  - `findings`
+- 为了让 tool 层真正执行 cleanup，而不只是复用 API 返回，`KernelHandle` 新增了 shared memory delete bridge。
+- 这样 cleanup 规则不再只停留在 `/api/memory/agents/:id/kv/cleanup`，agent 自己也可以：
+  - 先 audit
+  - 判断是否命中 legacy bare key / orphan sidecar / missing metadata
+  - 再决定是否 apply
+- prompt builder 的 memory guidance 与 wizard 的 memory capability 提示也已同步加入：
+  - 当 `memory_list` 暴露出治理异常时，先用 `memory_cleanup` audit
+  - 再在确有必要时 apply
+- live verification 已确认这不是“定义了 tool 但 agent 不会用”的死代码：
+  - 临时 MiniMax verifier agent 在真实 `/api/agents/{id}/message` 中先调用 `memory_cleanup {"apply":false}`
+  - 命中 `tool_cleanup_legacy_probe` / `project.tool_cleanup.status` / `pref.tool_cleanup_orphan` 后，再调用 `memory_cleanup {"apply":true}`
+  - `llm.log` 中有完整 tool_use / tool_result 记录，且 `/api/budget` 的真实 spend 增量可见
+- 这一步把 cleanup 从“运维/API 管理动作”推进成了“agent 可自助执行的治理动作”，后续若要做 dashboard 按钮或 orchestration hook，就不必再重新设计一套 cleanup 语义。
+
 ## 4. 当前不做的事情
 
 本阶段当前实现明确不做：
@@ -185,6 +210,6 @@
 在当前切口稳定后，下一步按以下顺序推进：
 
 1. 决定 governed prompt candidates 的 query-aware 打分是否需要继续引入停用词、短语匹配或 namespace/kind 显式 hint。
-2. 评估是否需要把 cleanup audit/apply 进一步暴露给 tool 层或 dashboard，而不只停留在 API。
+2. 评估是否需要把 cleanup audit/apply 进一步暴露到 dashboard 或 orchestration hook，而不只停留在 API + tool。
 3. 评估是否需要在 dashboard / higher-level orchestration 中直接暴露 tag + lifecycle snapshot，而不只停留在 tool/API 层。
 4. 决定 lifecycle snapshot 是否需要进入更高层 prompt orchestration，而不仅仅停留在当前提示文案与 API/tool 可见层。
