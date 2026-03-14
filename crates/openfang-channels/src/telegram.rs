@@ -3,6 +3,7 @@
 //! Uses long-polling via `getUpdates` with exponential backoff on failures.
 //! No external Telegram crate — just `reqwest` for full control over error handling.
 
+use crate::log_sanitize::sanitize_channel_error_for_log;
 use crate::types::{ChannelAdapter, ChannelContent, ChannelMessage, ChannelType, ChannelUser};
 use async_trait::async_trait;
 use futures::Stream;
@@ -310,7 +311,7 @@ impl TelegramAdapter {
         if let Some(tid) = thread_id {
             body["message_thread_id"] = serde_json::json!(tid);
         }
-        let _ = self.client.post(&url).json(&body).send().await?;
+        self.client.post(&url).json(&body).send().await?;
         Ok(())
     }
 
@@ -399,7 +400,10 @@ impl ChannelAdapter for TelegramAdapter {
                 .await
             {
                 Ok(_) => info!("Telegram: cleared webhook, polling mode active"),
-                Err(e) => tracing::warn!("Telegram: deleteWebhook failed (non-fatal): {e}"),
+                Err(e) => {
+                    let safe = sanitize_channel_error_for_log(&e.to_string(), &[self.token.as_str()]);
+                    tracing::warn!("Telegram: deleteWebhook failed (non-fatal): {safe}");
+                }
             }
         }
 
@@ -455,7 +459,8 @@ impl ChannelAdapter for TelegramAdapter {
                 let resp = match result {
                     Ok(resp) => resp,
                     Err(e) => {
-                        warn!("Telegram getUpdates network error: {e}, retrying in {backoff:?}");
+                        let safe = sanitize_channel_error_for_log(&e.to_string(), &[token.as_str()]);
+                        warn!("Telegram getUpdates network error: {safe}, retrying in {backoff:?}");
                         tokio::time::sleep(backoff).await;
                         backoff = (backoff * 2).min(MAX_BACKOFF);
                         continue;
@@ -495,7 +500,8 @@ impl ChannelAdapter for TelegramAdapter {
                 let body: serde_json::Value = match resp.json().await {
                     Ok(v) => v,
                     Err(e) => {
-                        warn!("Telegram getUpdates parse error: {e}");
+                        let safe = sanitize_channel_error_for_log(&e.to_string(), &[token.as_str()]);
+                        warn!("Telegram getUpdates parse error: {safe}");
                         tokio::time::sleep(backoff).await;
                         backoff = (backoff * 2).min(MAX_BACKOFF);
                         continue;
@@ -643,7 +649,8 @@ async fn parse_telegram_update(
             {
                 Ok(attachment) => attachments.push(attachment),
                 Err(err) => {
-                    warn!("Telegram photo download failed: {err}");
+                    let safe = sanitize_channel_error_for_log(&err.to_string(), &[token]);
+                    warn!("Telegram photo download failed: {safe}");
                     return None;
                 }
             }
@@ -671,7 +678,8 @@ async fn parse_telegram_update(
                 {
                     Ok(attachment) => attachments.push(attachment),
                     Err(err) => {
-                        warn!("Telegram document download failed: {err}");
+                        let safe = sanitize_channel_error_for_log(&err.to_string(), &[token]);
+                        warn!("Telegram document download failed: {safe}");
                         return None;
                     }
                 }
@@ -1115,6 +1123,7 @@ fn sanitize_telegram_html(text: &str) -> String {
 
 #[derive(Clone)]
 struct TelegramOpenTag {
+    name: String,
     raw: String,
     close: String,
 }
@@ -1185,7 +1194,7 @@ fn split_telegram_html_chunks(text: &str, max_len: usize) -> Vec<String> {
                 if is_closing && current.is_empty() && !pending_reopen.is_empty() {
                     if let Some(pos) = open_tags
                         .iter()
-                        .rposition(|tag| tag.close == format!("</{name}>"))
+                        .rposition(|tag| tag.name.eq_ignore_ascii_case(name))
                     {
                         open_tags.truncate(pos);
                         pending_reopen = open_tags.iter().map(|tag| tag.raw.as_str()).collect();
@@ -1216,11 +1225,15 @@ fn split_telegram_html_chunks(text: &str, max_len: usize) -> Vec<String> {
                     continue;
                 }
                 if is_closing {
-                    if let Some(pos) = open_tags.iter().rposition(|tag| tag.close == format!("</{name}>")) {
+                    if let Some(pos) = open_tags
+                        .iter()
+                        .rposition(|tag| tag.name.eq_ignore_ascii_case(name))
+                    {
                         open_tags.truncate(pos);
                     }
                 } else {
                     open_tags.push(TelegramOpenTag {
+                        name: name.to_ascii_lowercase(),
                         raw: raw.to_string(),
                         close: format!("</{name}>"),
                     });
@@ -1564,4 +1577,5 @@ mod tests {
         let chunks = split_telegram_html_chunks("hello <thinking>world</thinking>", 4096);
         assert_eq!(chunks, vec!["hello &lt;thinking&gt;world&lt;/thinking&gt;".to_string()]);
     }
+
 }

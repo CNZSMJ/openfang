@@ -231,27 +231,36 @@ fn extract_session_cookie(request: &Request<Body>) -> Option<String> {
 pub async fn security_headers(request: Request<Body>, next: Next) -> Response<Body> {
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
-    headers.insert("x-content-type-options", "nosniff".parse().unwrap());
-    headers.insert("x-frame-options", "DENY".parse().unwrap());
-    headers.insert("x-xss-protection", "1; mode=block".parse().unwrap());
+    headers.insert(
+        "x-content-type-options",
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        "x-frame-options",
+        axum::http::HeaderValue::from_static("DENY"),
+    );
+    headers.insert(
+        "x-xss-protection",
+        axum::http::HeaderValue::from_static("1; mode=block"),
+    );
     // All JS/CSS is bundled inline — only external resource is Google Fonts.
     headers.insert(
         "content-security-policy",
-        "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://fonts.gstatic.com; img-src 'self' data: blob:; connect-src 'self' ws://localhost:* ws://127.0.0.1:* wss://localhost:* wss://127.0.0.1:*; font-src 'self' https://fonts.gstatic.com; media-src 'self' blob:; frame-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'self'"
-            .parse()
-            .unwrap(),
+        axum::http::HeaderValue::from_static(
+            "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://fonts.gstatic.com; img-src 'self' data: blob:; connect-src 'self' ws://localhost:* ws://127.0.0.1:* wss://localhost:* wss://127.0.0.1:*; font-src 'self' https://fonts.gstatic.com; media-src 'self' blob:; frame-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'self'",
+        ),
     );
     headers.insert(
         "referrer-policy",
-        "strict-origin-when-cross-origin".parse().unwrap(),
+        axum::http::HeaderValue::from_static("strict-origin-when-cross-origin"),
     );
     headers.insert(
         "cache-control",
-        "no-store, no-cache, must-revalidate".parse().unwrap(),
+        axum::http::HeaderValue::from_static("no-store, no-cache, must-revalidate"),
     );
     headers.insert(
         "strict-transport-security",
-        "max-age=63072000; includeSubDomains".parse().unwrap(),
+        axum::http::HeaderValue::from_static("max-age=63072000; includeSubDomains"),
     );
     response
 }

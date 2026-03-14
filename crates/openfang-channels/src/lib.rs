@@ -47,6 +47,7 @@ pub mod discourse;
 pub mod gitter;
 pub mod gotify;
 pub mod linkedin;
+mod log_sanitize;
 pub mod mumble;
 pub mod ntfy;
 pub mod webhook;

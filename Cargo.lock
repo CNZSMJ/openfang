@@ -3803,6 +3803,7 @@ dependencies = [
 name = "openfang-api"
 version = "0.4.0"
 dependencies = [
+ "argon2",
  "async-trait",
  "axum",
  "base64 0.22.1",
@@ -3876,6 +3877,7 @@ dependencies = [
 name = "openfang-cli"
 version = "0.4.0"
 dependencies = [
+ "chrono",
  "clap",
  "clap_complete",
  "colored",

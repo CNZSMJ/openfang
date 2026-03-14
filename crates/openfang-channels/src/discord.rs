@@ -256,17 +256,39 @@ impl ChannelAdapter for DiscordAdapter {
                             let has_seq = sequence.read().await.is_some();
 
                             let gateway_msg = if has_session && has_seq {
-                                let sid = session_id_store.read().await.clone().unwrap();
-                                let seq = *sequence.read().await;
-                                info!("Discord: sending RESUME (session={sid})");
-                                serde_json::json!({
-                                    "op": opcode::RESUME,
-                                    "d": {
-                                        "token": token.as_str(),
-                                        "session_id": sid,
-                                        "seq": seq
+                                let sid = match session_id_store.read().await.clone() {
+                                    Some(sid) => sid,
+                                    None => {
+                                        warn!("Discord: session disappeared before RESUME, falling back to IDENTIFY");
+                                        String::new()
                                     }
-                                })
+                                };
+                                let seq = *sequence.read().await;
+                                if sid.is_empty() {
+                                    info!("Discord: sending IDENTIFY");
+                                    serde_json::json!({
+                                        "op": opcode::IDENTIFY,
+                                        "d": {
+                                            "token": token.as_str(),
+                                            "intents": intents,
+                                            "properties": {
+                                                "os": "linux",
+                                                "browser": "openfang",
+                                                "device": "openfang"
+                                            }
+                                        }
+                                    })
+                                } else {
+                                    info!("Discord: sending RESUME (session={sid})");
+                                    serde_json::json!({
+                                        "op": opcode::RESUME,
+                                        "d": {
+                                            "token": token.as_str(),
+                                            "session_id": sid,
+                                            "seq": seq
+                                        }
+                                    })
+                                }
                             } else {
                                 info!("Discord: sending IDENTIFY");
                                 serde_json::json!({
@@ -283,14 +305,22 @@ impl ChannelAdapter for DiscordAdapter {
                                 })
                             };
 
-                            if let Err(e) = ws_tx
-                                .send(tokio_tungstenite::tungstenite::Message::Text(
-                                    serde_json::to_string(&gateway_msg).unwrap(),
-                                ))
-                                .await
-                            {
-                                error!("Discord: failed to send IDENTIFY/RESUME: {e}");
-                                break 'inner true;
+                            match serde_json::to_string(&gateway_msg) {
+                                Ok(payload_text) => {
+                                    if let Err(e) = ws_tx
+                                        .send(tokio_tungstenite::tungstenite::Message::Text(
+                                            payload_text,
+                                        ))
+                                        .await
+                                    {
+                                        error!("Discord: failed to send IDENTIFY/RESUME: {e}");
+                                        break 'inner true;
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("Discord: failed to serialize IDENTIFY/RESUME payload: {e}");
+                                    break 'inner true;
+                                }
                             }
                         }
 
@@ -346,11 +376,15 @@ impl ChannelAdapter for DiscordAdapter {
                             // Server requests immediate heartbeat
                             let seq = *sequence.read().await;
                             let hb = serde_json::json!({ "op": opcode::HEARTBEAT, "d": seq });
-                            let _ = ws_tx
-                                .send(tokio_tungstenite::tungstenite::Message::Text(
-                                    serde_json::to_string(&hb).unwrap(),
-                                ))
-                                .await;
+                            if let Ok(hb_text) = serde_json::to_string(&hb) {
+                                let _ = ws_tx
+                                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                                        hb_text,
+                                    ))
+                                    .await;
+                            } else {
+                                warn!("Discord: failed to serialize heartbeat payload");
+                            }
                         }
 
                         opcode::HEARTBEAT_ACK => {

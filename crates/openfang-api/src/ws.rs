@@ -888,8 +888,8 @@ async fn handle_command(
             serde_json::json!({"type": "command_result", "command": cmd, "message": msg})
         }
         "budget" => {
-            let budget = &state.kernel.config.budget;
-            let status = state.kernel.metering.budget_status(budget);
+            let budget = state.kernel.current_budget();
+            let status = state.kernel.metering.budget_status(&budget);
             let fmt = |v: f64| -> String {
                 if v > 0.0 {
                     format!("${v:.2}")
@@ -912,7 +912,7 @@ async fn handle_command(
             let msg = if !state.kernel.config.network_enabled {
                 "OFP network disabled.".to_string()
             } else {
-                match &state.kernel.peer_registry {
+                match state.kernel.peer_registry.get() {
                     Some(registry) => {
                         let peers = registry.all_peers();
                         if peers.is_empty() {

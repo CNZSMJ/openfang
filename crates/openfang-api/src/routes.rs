@@ -505,11 +505,16 @@ pub async fn get_agent_session(
                                     // served back when loading session history.
                                     let file_id = uuid::Uuid::new_v4().to_string();
                                     let upload_dir = std::env::temp_dir().join("openfang_uploads");
-                                    let _ = std::fs::create_dir_all(&upload_dir);
+                                    if let Err(e) = std::fs::create_dir_all(&upload_dir) {
+                                        tracing::warn!(dir = ?upload_dir, error = %e, "Failed to create upload cache dir");
+                                    }
                                     if let Ok(bytes) =
                                         base64::engine::general_purpose::STANDARD.decode(data)
                                     {
-                                        let _ = std::fs::write(upload_dir.join(&file_id), &bytes);
+                                        let file_path = upload_dir.join(&file_id);
+                                        if let Err(e) = std::fs::write(&file_path, &bytes) {
+                                            tracing::warn!(path = ?file_path, error = %e, "Failed to cache session image");
+                                        }
                                         UPLOAD_REGISTRY.insert(
                                             file_id.clone(),
                                             UploadMeta {
@@ -2485,10 +2490,7 @@ pub async fn configure_channel(
                     Json(serde_json::json!({"error": format!("Failed to write secret: {e}")})),
                 );
             }
-            // SAFETY: We are the only writer; this is a single-threaded config operation
-            unsafe {
-                std::env::set_var(env_var, value);
-            }
+            std::env::set_var(env_var, value);
             // Also write the env var NAME to config.toml so the channel section
             // is not empty and the kernel knows which env var to read.
             config_fields.insert(
@@ -2568,11 +2570,15 @@ pub async fn remove_channel(
     // Remove all secret env vars for this channel
     for field_def in meta.fields {
         if let Some(env_var) = field_def.env_var {
-            let _ = remove_secret_env(&secrets_path, env_var);
-            // SAFETY: Single-threaded config operation
-            unsafe {
-                std::env::remove_var(env_var);
+            if let Err(e) = remove_secret_env(&secrets_path, env_var) {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(
+                        serde_json::json!({"error": format!("Failed to remove secret env var '{env_var}': {e}")}),
+                    ),
+                );
             }
+            std::env::remove_var(env_var);
         }
     }
 
@@ -3535,10 +3541,17 @@ pub async fn delete_agent_kv_key(
     }
     for candidate in deleted_keys.clone() {
         if let Ok(metadata_key) = openfang_types::memory::memory_metadata_key(&candidate) {
-            let _ = state
+            if let Err(e) = state
                 .kernel
                 .memory
-                .structured_delete(agent_id, &metadata_key);
+                .structured_delete(agent_id, &metadata_key)
+            {
+                tracing::warn!(
+                    key = %metadata_key,
+                    error = %e,
+                    "Failed to delete memory metadata key"
+                );
+            }
         }
     }
 
@@ -3915,8 +3928,11 @@ pub async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl Into
 pub async fn list_skills(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let skills_dir = state.kernel.config.home_dir.join("skills");
     let mut registry = openfang_skills::registry::SkillRegistry::new(skills_dir);
-    let _ = registry.load_bundled();
-    let _ = registry.load_all();
+    let bundled_count = registry.load_bundled();
+    tracing::debug!(count = bundled_count, "Loaded bundled skills");
+    if let Err(e) = registry.load_all() {
+        tracing::warn!(error = %e, "Failed to load installed skills");
+    }
 
     let skills: Vec<serde_json::Value> = registry
         .list()
@@ -3997,8 +4013,11 @@ pub async fn uninstall_skill(
 ) -> impl IntoResponse {
     let skills_dir = state.kernel.config.home_dir.join("skills");
     let mut registry = openfang_skills::registry::SkillRegistry::new(skills_dir);
-    let _ = registry.load_bundled();
-    let _ = registry.load_all();
+    let bundled_count = registry.load_bundled();
+    tracing::debug!(count = bundled_count, "Loaded bundled skills before uninstall");
+    if let Err(e) = registry.load_all() {
+        tracing::warn!(error = %e, "Failed to load installed skills before uninstall");
+    }
 
     match registry.remove(&req.name) {
         Ok(()) => {
@@ -5515,7 +5534,7 @@ pub async fn network_status(State(state): State<Arc<AppState>>) -> impl IntoResp
         && !state.kernel.config.network.shared_secret.is_empty();
 
     let (node_id, listen_address, connected_peers, total_peers) =
-        if let Some(ref peer_node) = state.kernel.peer_node {
+        if let Some(peer_node) = state.kernel.peer_node.get() {
             let registry = peer_node.registry();
             (
                 peer_node.node_id().to_string(),
@@ -5720,10 +5739,11 @@ pub async fn usage_daily(State(state): State<Arc<AppState>>) -> impl IntoRespons
 
 /// GET /api/budget — Current budget status (limits, spend, % used).
 pub async fn budget_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let budget = state.kernel.current_budget();
     let status = state
         .kernel
         .metering
-        .budget_status(&state.kernel.config.budget);
+        .budget_status(&budget);
     Json(serde_json::to_value(&status).unwrap_or_default())
 }
 
@@ -5732,34 +5752,29 @@ pub async fn update_budget(
     State(state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    // SAFETY: Budget config is updated in-place. Since KernelConfig is behind
-    // an Arc and we only have &self, we use ptr mutation (same pattern as OFP).
-    let config_ptr = &state.kernel.config as *const openfang_types::config::KernelConfig
-        as *mut openfang_types::config::KernelConfig;
-
-    // Apply updates
-    unsafe {
+    state.kernel.update_runtime_budget(|budget| {
         if let Some(v) = body["max_hourly_usd"].as_f64() {
-            (*config_ptr).budget.max_hourly_usd = v;
+            budget.max_hourly_usd = v;
         }
         if let Some(v) = body["max_daily_usd"].as_f64() {
-            (*config_ptr).budget.max_daily_usd = v;
+            budget.max_daily_usd = v;
         }
         if let Some(v) = body["max_monthly_usd"].as_f64() {
-            (*config_ptr).budget.max_monthly_usd = v;
+            budget.max_monthly_usd = v;
         }
         if let Some(v) = body["alert_threshold"].as_f64() {
-            (*config_ptr).budget.alert_threshold = v.clamp(0.0, 1.0);
+            budget.alert_threshold = v.clamp(0.0, 1.0);
         }
         if let Some(v) = body["default_max_llm_tokens_per_hour"].as_u64() {
-            (*config_ptr).budget.default_max_llm_tokens_per_hour = v;
+            budget.default_max_llm_tokens_per_hour = v;
         }
-    }
+    });
 
+    let budget = state.kernel.current_budget();
     let status = state
         .kernel
         .metering
-        .budget_status(&state.kernel.config.budget);
+        .budget_status(&budget);
     Json(serde_json::to_value(&status).unwrap_or_default())
 }
 
@@ -5892,7 +5907,9 @@ pub async fn update_agent_budget(
         Ok(()) => {
             // Persist updated entry
             if let Some(entry) = state.kernel.registry.get(agent_id) {
-                let _ = state.kernel.memory.save_agent(&entry);
+                if let Err(e) = state.kernel.memory.save_agent(&entry) {
+                    tracing::warn!(agent_id = %agent_id, error = %e, "Failed to persist agent budget update");
+                }
             }
             (
                 StatusCode::OK,
@@ -6194,7 +6211,9 @@ pub async fn patch_agent(
 
     // Persist updated entry to SQLite
     if let Some(entry) = state.kernel.registry.get(agent_id) {
-        let _ = state.kernel.memory.save_agent(&entry);
+        if let Err(e) = state.kernel.memory.save_agent(&entry) {
+            tracing::warn!(agent_id = %agent_id, error = %e, "Failed to persist patched agent");
+        }
         (
             StatusCode::OK,
             Json(
@@ -7809,10 +7828,13 @@ pub async fn set_provider_key(
             if let Ok(existing) = std::fs::read_to_string(&config_path) {
                 // Remove existing [default_model] section if present, then append
                 let cleaned = remove_toml_section(&existing, "default_model");
-                let _ =
-                    std::fs::write(&config_path, format!("{}\n{}", cleaned.trim(), update_toml));
-            } else {
-                let _ = std::fs::write(&config_path, update_toml);
+                if let Err(e) =
+                    std::fs::write(&config_path, format!("{}\n{}", cleaned.trim(), update_toml))
+                {
+                    tracing::warn!(path = ?config_path, error = %e, "Failed to persist default_model switch");
+                }
+            } else if let Err(e) = std::fs::write(&config_path, update_toml) {
+                tracing::warn!(path = ?config_path, error = %e, "Failed to create config.toml with default_model");
             }
 
             // Hot-update the in-memory default model override so resolve_driver()
@@ -8284,7 +8306,9 @@ fn write_secret_env(path: &std::path::Path, key: &str, value: &str) -> Result<()
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+            tracing::warn!(path = ?path, error = %e, "Failed to set secrets.env permissions");
+        }
     }
 
     Ok(())
@@ -8581,7 +8605,9 @@ pub async fn remove_integration(
     state.kernel.extension_health.unregister(&id);
 
     // Hot-disconnect the removed MCP server
-    let _ = state.kernel.reload_extension_mcps().await;
+    if let Err(e) = state.kernel.reload_extension_mcps().await {
+        tracing::warn!(integration = %id, error = %e, "Failed to reload MCP servers after uninstall");
+    }
 
     (
         StatusCode::OK,
@@ -8993,11 +9019,13 @@ pub async fn run_schedule(
             break;
         }
     }
-    let _ = state.kernel.memory.structured_set(
+    if let Err(e) = state.kernel.memory.structured_set(
         shared_id,
         SCHEDULES_KEY,
         serde_json::Value::Array(schedules_updated),
-    );
+    ) {
+        tracing::warn!(schedule_id = %id, error = %e, "Failed to update schedule run metadata");
+    }
 
     let kernel_handle: Arc<dyn KernelHandle> = state.kernel.clone() as Arc<dyn KernelHandle>;
     match state
@@ -9096,7 +9124,9 @@ pub async fn update_agent_identity(
         Ok(()) => {
             // Persist identity to SQLite
             if let Some(entry) = state.kernel.registry.get(agent_id) {
-                let _ = state.kernel.memory.save_agent(&entry);
+                if let Err(e) = state.kernel.memory.save_agent(&entry) {
+                    tracing::warn!(agent_id = %agent_id, error = %e, "Failed to persist agent identity");
+                }
             }
             (
                 StatusCode::OK,
@@ -9441,7 +9471,9 @@ pub async fn clone_agent(
                     let src_file = src_can.join(fname);
                     let dst_file = dst_can.join(fname);
                     if src_file.exists() {
-                        let _ = std::fs::copy(&src_file, &dst_file);
+                        if let Err(e) = std::fs::copy(&src_file, &dst_file) {
+                            tracing::warn!(from = ?src_file, to = ?dst_file, error = %e, "Failed to copy workspace identity file during clone");
+                        }
                     }
                 }
             }
@@ -9449,10 +9481,13 @@ pub async fn clone_agent(
     }
 
     // Copy identity from source
-    let _ = state
+    if let Err(e) = state
         .kernel
         .registry
-        .update_identity(new_id, source.identity.clone());
+        .update_identity(new_id, source.identity.clone())
+    {
+        tracing::warn!(agent_id = %new_id, error = %e, "Failed to copy agent identity to cloned agent");
+    }
 
     (
         StatusCode::CREATED,
@@ -9724,7 +9759,9 @@ pub async fn set_agent_file(
         );
     }
     if let Err(e) = std::fs::rename(&tmp_path, &file_path) {
-        let _ = std::fs::remove_file(&tmp_path);
+        if let Err(cleanup_err) = std::fs::remove_file(&tmp_path) {
+            tracing::warn!(path = ?tmp_path, error = %cleanup_err, "Failed to cleanup temporary file after rename error");
+        }
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("Rename failed: {e}")})),
@@ -10522,7 +10559,9 @@ pub async fn delete_cron_job(
             let job_id = openfang_types::scheduler::CronJobId(uuid);
             match state.kernel.cron_scheduler.remove_job(job_id) {
                 Ok(_) => {
-                    let _ = state.kernel.cron_scheduler.persist();
+                    if let Err(e) = state.kernel.cron_scheduler.persist() {
+                        tracing::warn!(job_id = %id, error = %e, "Failed to persist cron state after delete");
+                    }
                     (
                         StatusCode::OK,
                         Json(serde_json::json!({"status": "deleted"})),
@@ -10553,7 +10592,9 @@ pub async fn toggle_cron_job(
             let job_id = openfang_types::scheduler::CronJobId(uuid);
             match state.kernel.cron_scheduler.set_enabled(job_id, enabled) {
                 Ok(()) => {
-                    let _ = state.kernel.cron_scheduler.persist();
+                    if let Err(e) = state.kernel.cron_scheduler.persist() {
+                        tracing::warn!(job_id = %id, error = %e, "Failed to persist cron state after enable/disable");
+                    }
                     (
                         StatusCode::OK,
                         Json(serde_json::json!({"id": id, "enabled": enabled})),
@@ -11576,16 +11617,16 @@ pub async fn auth_login(
     State(state): State<Arc<AppState>>,
     Json(req): Json<serde_json::Value>,
 ) -> axum::response::Response {
-    use axum::response::Response;
-    use axum::body::Body;
+    use axum::response::IntoResponse;
 
     let auth_cfg = &state.kernel.config.auth;
     if !auth_cfg.enabled {
-        return Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .header("content-type", "application/json")
-            .body(Body::from(serde_json::json!({"error": "Auth not enabled"}).to_string()))
-            .unwrap();
+        return (
+            StatusCode::NOT_FOUND,
+            [("content-type", "application/json")],
+            serde_json::json!({"error": "Auth not enabled"}).to_string(),
+        )
+            .into_response();
     }
 
     let username = req.get("username").and_then(|v| v.as_str()).unwrap_or("");
@@ -11611,11 +11652,12 @@ pub async fn auth_login(
             "dashboard login failed",
             format!("username: {username}"),
         );
-        return Response::builder()
-            .status(StatusCode::UNAUTHORIZED)
-            .header("content-type", "application/json")
-            .body(Body::from(serde_json::json!({"error": "Invalid credentials"}).to_string()))
-            .unwrap();
+        return (
+            StatusCode::UNAUTHORIZED,
+            [("content-type", "application/json")],
+            serde_json::json!({"error": "Invalid credentials"}).to_string(),
+        )
+            .into_response();
     }
 
     // Derive the session secret the same way as server.rs
@@ -11640,16 +11682,16 @@ pub async fn auth_login(
         format!("username: {username}"),
     );
 
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", "application/json")
-        .header("set-cookie", &cookie)
-        .body(Body::from(serde_json::json!({
+    (
+        StatusCode::OK,
+        [("content-type", "application/json"), ("set-cookie", cookie.as_str())],
+        serde_json::json!({
             "status": "ok",
             "token": token,
             "username": username,
-        }).to_string()))
-        .unwrap()
+        }).to_string(),
+    )
+        .into_response()
 }
 
 /// POST /api/auth/logout — Clear the session cookie.

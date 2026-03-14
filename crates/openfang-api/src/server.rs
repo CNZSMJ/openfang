@@ -7,6 +7,7 @@ use crate::routes::{self, AppState};
 use crate::webchat;
 use crate::ws;
 use axum::Router;
+use axum::http::HeaderValue;
 use openfang_kernel::OpenFangKernel;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -45,7 +46,7 @@ pub async fn build_router(
     let state = Arc::new(AppState {
         kernel: kernel.clone(),
         started_at: Instant::now(),
-        peer_registry: kernel.peer_registry.as_ref().map(|r| Arc::new(r.clone())),
+        peer_registry: kernel.peer_registry.get().map(|r| Arc::new(r.clone())),
         bridge_manager: tokio::sync::Mutex::new(bridge),
         channels_config: tokio::sync::RwLock::new(channels_config),
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),
@@ -58,19 +59,14 @@ pub async fn build_router(
     let cors = if state.kernel.config.api_key.trim().is_empty() {
         // No auth → restrict CORS to localhost origins (include both 127.0.0.1 and localhost)
         let port = listen_addr.port();
-        let mut origins: Vec<axum::http::HeaderValue> = vec![
-            format!("http://{listen_addr}").parse().unwrap(),
-            format!("http://localhost:{port}").parse().unwrap(),
-        ];
+        let mut origins: Vec<HeaderValue> = Vec::new();
+        push_origin(&mut origins, format!("http://{listen_addr}"));
+        push_origin(&mut origins, format!("http://localhost:{port}"));
         // Also allow common dev ports
         for p in [3000u16, 8080] {
             if p != port {
-                if let Ok(v) = format!("http://127.0.0.1:{p}").parse() {
-                    origins.push(v);
-                }
-                if let Ok(v) = format!("http://localhost:{p}").parse() {
-                    origins.push(v);
-                }
+                push_origin(&mut origins, format!("http://127.0.0.1:{p}"));
+                push_origin(&mut origins, format!("http://localhost:{p}"));
             }
         }
         CorsLayer::new()
@@ -81,21 +77,22 @@ pub async fn build_router(
         // Auth enabled → restrict CORS to localhost + configured origins.
         // SECURITY: CorsLayer::permissive() is dangerous — any website could
         // make cross-origin requests. Restrict to known origins instead.
-        let mut origins: Vec<axum::http::HeaderValue> = vec![
-            format!("http://{listen_addr}").parse().unwrap(),
-            "http://localhost:4200".parse().unwrap(),
-            "http://127.0.0.1:4200".parse().unwrap(),
-            "http://localhost:8080".parse().unwrap(),
-            "http://127.0.0.1:8080".parse().unwrap(),
-        ];
+        let mut origins: Vec<HeaderValue> = Vec::new();
+        push_origin(&mut origins, format!("http://{listen_addr}"));
+        push_origin(&mut origins, "http://localhost:4200".to_string());
+        push_origin(&mut origins, "http://127.0.0.1:4200".to_string());
+        push_origin(&mut origins, "http://localhost:8080".to_string());
+        push_origin(&mut origins, "http://127.0.0.1:8080".to_string());
         // Add the actual listen address variants
         if listen_addr.port() != 4200 && listen_addr.port() != 8080 {
-            if let Ok(v) = format!("http://localhost:{}", listen_addr.port()).parse() {
-                origins.push(v);
-            }
-            if let Ok(v) = format!("http://127.0.0.1:{}", listen_addr.port()).parse() {
-                origins.push(v);
-            }
+            push_origin(
+                &mut origins,
+                format!("http://localhost:{}", listen_addr.port()),
+            );
+            push_origin(
+                &mut origins,
+                format!("http://127.0.0.1:{}", listen_addr.port()),
+            );
         }
         CorsLayer::new()
             .allow_origin(origins)
@@ -790,7 +787,11 @@ pub async fn run_daemon(
             }
             // Stale PID file (process dead or different process reused PID), remove it
             info!("Removing stale daemon info file");
-            let _ = std::fs::remove_file(info_path);
+            if let Err(e) = std::fs::remove_file(info_path) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(path = ?info_path, error = %e, "Failed to remove stale daemon info file");
+                }
+            }
         }
 
         let daemon_info = DaemonInfo {
@@ -800,10 +801,18 @@ pub async fn run_daemon(
             version: env!("CARGO_PKG_VERSION").to_string(),
             platform: std::env::consts::OS.to_string(),
         };
-        if let Ok(json) = serde_json::to_string_pretty(&daemon_info) {
-            let _ = std::fs::write(info_path, json);
-            // SECURITY: Restrict daemon info file permissions (contains PID and port).
-            restrict_permissions(info_path);
+        match serde_json::to_string_pretty(&daemon_info) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(info_path, json) {
+                    tracing::warn!(path = ?info_path, error = %e, "Failed to write daemon info file");
+                } else {
+                    // SECURITY: Restrict daemon info file permissions (contains PID and port).
+                    restrict_permissions(info_path);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to serialize daemon info");
+            }
         }
     }
 
@@ -840,7 +849,11 @@ pub async fn run_daemon(
 
     // Clean up daemon info file
     if let Some(info_path) = daemon_info_path {
-        let _ = std::fs::remove_file(info_path);
+        if let Err(e) = std::fs::remove_file(info_path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(path = ?info_path, error = %e, "Failed to remove daemon info file");
+            }
+        }
     }
 
     // Stop channel bridges
@@ -860,7 +873,9 @@ pub async fn run_daemon(
 #[cfg(unix)]
 fn restrict_permissions(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+        tracing::warn!(path = ?path, error = %e, "Failed to set daemon info permissions");
+    }
 }
 
 #[cfg(not(unix))]
@@ -881,17 +896,57 @@ async fn shutdown_signal(api_shutdown: Arc<tokio::sync::Notify>) {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
-        let mut sigint = signal(SignalKind::interrupt()).expect("Failed to listen for SIGINT");
-        let mut sigterm = signal(SignalKind::terminate()).expect("Failed to listen for SIGTERM");
+        let mut sigint = match signal(SignalKind::interrupt()) {
+            Ok(sig) => Some(sig),
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to listen for SIGINT");
+                None
+            }
+        };
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(sig) => Some(sig),
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to listen for SIGTERM");
+                None
+            }
+        };
 
-        tokio::select! {
-            _ = sigint.recv() => {
-                info!("Received SIGINT (Ctrl+C), shutting down...");
+        match (sigint.as_mut(), sigterm.as_mut()) {
+            (Some(sigint), Some(sigterm)) => {
+                tokio::select! {
+                    _ = sigint.recv() => {
+                        info!("Received SIGINT (Ctrl+C), shutting down...");
+                    }
+                    _ = sigterm.recv() => {
+                        info!("Received SIGTERM, shutting down...");
+                    }
+                    _ = api_shutdown.notified() => {
+                        info!("Shutdown requested via API, shutting down...");
+                    }
+                }
             }
-            _ = sigterm.recv() => {
-                info!("Received SIGTERM, shutting down...");
+            (Some(sigint), None) => {
+                tokio::select! {
+                    _ = sigint.recv() => {
+                        info!("Received SIGINT (Ctrl+C), shutting down...");
+                    }
+                    _ = api_shutdown.notified() => {
+                        info!("Shutdown requested via API, shutting down...");
+                    }
+                }
             }
-            _ = api_shutdown.notified() => {
+            (None, Some(sigterm)) => {
+                tokio::select! {
+                    _ = sigterm.recv() => {
+                        info!("Received SIGTERM, shutting down...");
+                    }
+                    _ = api_shutdown.notified() => {
+                        info!("Shutdown requested via API, shutting down...");
+                    }
+                }
+            }
+            (None, None) => {
+                api_shutdown.notified().await;
                 info!("Shutdown requested via API, shutting down...");
             }
         }
@@ -963,5 +1018,12 @@ fn is_daemon_responding(addr: &str) -> bool {
         std::net::TcpStream::connect(addr_only)
             .map(|_| true)
             .unwrap_or(false)
+    }
+}
+
+fn push_origin(origins: &mut Vec<HeaderValue>, origin: String) {
+    match HeaderValue::from_str(&origin) {
+        Ok(value) => origins.push(value),
+        Err(e) => tracing::warn!(origin = %origin, error = %e, "Skipping invalid CORS origin"),
     }
 }

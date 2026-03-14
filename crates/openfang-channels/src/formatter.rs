@@ -337,7 +337,11 @@ impl<'a> EventCursor<'a> {
                 break;
             }
 
-            match self.next().expect("peeked event must exist") {
+            let Some(next_event) = self.next() else {
+                break;
+            };
+
+            match next_event {
                 Event::Text(text) => push_text(&mut nodes, &text),
                 Event::Code(code) => nodes.push(InlineNode::Code(code.into_string())),
                 Event::SoftBreak | Event::HardBreak => push_text(&mut nodes, "\n"),

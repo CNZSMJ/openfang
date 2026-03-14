@@ -497,7 +497,6 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
         msg
     }
 
-    #[allow(dead_code)]
     async fn manage_schedule_text(&self, action: &str, args: &[String]) -> String {
         match action {
             "add" => {
@@ -864,10 +863,19 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
             if let Some(tid) = thread_id {
                 kv_val["thread_id"] = serde_json::json!(tid);
             }
-            let _ = self
+            if let Err(e) = self
                 .kernel
                 .memory
-                .structured_set(agent_id, "delivery.last_channel", kv_val);
+                .structured_set(agent_id, "delivery.last_channel", kv_val)
+            {
+                tracing::warn!(
+                    agent_id = %agent_id,
+                    channel,
+                    recipient,
+                    error = %e,
+                    "Failed to persist delivery.last_channel"
+                );
+            }
         }
     }
 
@@ -890,8 +898,8 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
     // ── Budget, Network, A2A ──
 
     async fn budget_text(&self) -> String {
-        let budget = &self.kernel.config.budget;
-        let status = self.kernel.metering.budget_status(budget);
+        let budget = self.kernel.current_budget();
+        let status = self.kernel.metering.budget_status(&budget);
 
         let fmt_limit = |v: f64| -> String {
             if v > 0.0 {
@@ -934,7 +942,7 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
             return "OFP peer network is disabled. Set network_enabled = true in config.toml."
                 .to_string();
         }
-        match &self.kernel.peer_registry {
+        match self.kernel.peer_registry.get() {
             Some(registry) => {
                 let peers = registry.all_peers();
                 if peers.is_empty() {

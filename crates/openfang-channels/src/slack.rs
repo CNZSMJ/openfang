@@ -271,14 +271,22 @@ impl ChannelAdapter for SlackAdapter {
                             let envelope_id = payload["envelope_id"].as_str().unwrap_or("");
                             if !envelope_id.is_empty() {
                                 let ack = serde_json::json!({ "envelope_id": envelope_id });
-                                if let Err(e) = ws_tx
-                                    .send(tokio_tungstenite::tungstenite::Message::Text(
-                                        serde_json::to_string(&ack).unwrap(),
-                                    ))
-                                    .await
-                                {
-                                    error!("Slack: failed to send ack: {e}");
-                                    break 'inner true;
+                                match serde_json::to_string(&ack) {
+                                    Ok(ack_text) => {
+                                        if let Err(e) = ws_tx
+                                            .send(tokio_tungstenite::tungstenite::Message::Text(
+                                                ack_text,
+                                            ))
+                                            .await
+                                        {
+                                            error!("Slack: failed to send ack: {e}");
+                                            break 'inner true;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        error!("Slack: failed to serialize ack payload: {e}");
+                                        break 'inner true;
+                                    }
                                 }
                             }
 

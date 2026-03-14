@@ -1,6 +1,9 @@
 //! Stateless session token authentication for the dashboard.
 //! Tokens are HMAC-SHA256 signed and contain username + expiry.
 
+use argon2::password_hash::rand_core::OsRng;
+use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::Argon2;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
@@ -55,15 +58,36 @@ pub fn verify_session_token(token: &str, secret: &str) -> Option<String> {
     }
 }
 
-/// Hash a password with SHA256 for config storage.
+/// Hash a password for config storage (Argon2 PHC string).
 pub fn hash_password(password: &str) -> String {
+    let salt = SaltString::generate(&mut OsRng);
+    match Argon2::default().hash_password(password.as_bytes(), &salt) {
+        Ok(hash) => hash.to_string(),
+        // Keep a deterministic fallback for unusual environments where Argon2
+        // hashing cannot be initialized.
+        Err(_) => legacy_hash_password(password),
+    }
+}
+
+fn legacy_hash_password(password: &str) -> String {
     use sha2::Digest;
     hex::encode(Sha256::digest(password.as_bytes()))
 }
 
-/// Verify a password against a stored SHA256 hash (constant-time).
+/// Verify a password against a stored hash.
+///
+/// Supports Argon2 PHC hashes (recommended) and legacy SHA256 hex hashes.
 pub fn verify_password(password: &str, stored_hash: &str) -> bool {
-    let computed = hash_password(password);
+    if stored_hash.starts_with("$argon2") {
+        if let Ok(parsed) = PasswordHash::new(stored_hash) {
+            return Argon2::default()
+                .verify_password(password.as_bytes(), &parsed)
+                .is_ok();
+        }
+        return false;
+    }
+
+    let computed = legacy_hash_password(password);
     use subtle::ConstantTimeEq;
     if computed.len() != stored_hash.len() {
         return false;
@@ -78,8 +102,16 @@ mod tests {
     #[test]
     fn test_hash_and_verify_password() {
         let hash = hash_password("secret123");
+        assert!(hash.starts_with("$argon2"));
         assert!(verify_password("secret123", &hash));
         assert!(!verify_password("wrong", &hash));
+    }
+
+    #[test]
+    fn test_verify_password_legacy_sha256() {
+        let legacy = legacy_hash_password("legacy-pass");
+        assert!(verify_password("legacy-pass", &legacy));
+        assert!(!verify_password("wrong", &legacy));
     }
 
     #[test]

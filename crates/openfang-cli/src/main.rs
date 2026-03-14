@@ -23,9 +23,21 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 #[cfg(windows)]
 use std::sync::atomic::Ordering;
+use tracing_subscriber::fmt::format::Writer;
+use tracing_subscriber::fmt::time::FormatTime;
 
 /// Global flag set by the Ctrl+C handler.
 static CTRLC_PRESSED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone, Copy, Debug, Default)]
+struct LocalLogTimer;
+
+impl FormatTime for LocalLogTimer {
+    fn format_time(&self, w: &mut Writer<'_>) -> std::fmt::Result {
+        let ts = chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, false);
+        write!(w, "{ts}")
+    }
+}
 
 /// Install a Ctrl+C handler that force-exits the process.
 /// On Windows/MINGW, the default handler doesn't reliably interrupt blocking
@@ -800,6 +812,7 @@ fn init_tracing_stderr() {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
+        .with_timer(LocalLogTimer)
         .init();
 }
 
@@ -826,6 +839,7 @@ fn init_tracing_file() {
                     tracing_subscriber::EnvFilter::try_from_default_env()
                         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
                 )
+                .with_timer(LocalLogTimer)
                 .with_writer(std::sync::Mutex::new(file))
                 .with_ansi(false)
                 .init();
@@ -834,6 +848,7 @@ fn init_tracing_file() {
             // Fallback: suppress all output rather than corrupt the TUI
             tracing_subscriber::fmt()
                 .with_max_level(tracing::Level::ERROR)
+                .with_timer(LocalLogTimer)
                 .with_writer(std::io::sink)
                 .init();
         }

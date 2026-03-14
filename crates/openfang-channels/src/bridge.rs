@@ -4,6 +4,7 @@
 //! `BridgeManager` which owns running adapters and dispatches messages.
 
 use crate::formatter;
+use crate::log_sanitize::sanitize_channel_error_for_log;
 use crate::router::AgentRouter;
 use crate::types::{
     default_phase_emoji, AgentPhase, ChannelAdapter, ChannelContent, ChannelMessage, ChannelUser,
@@ -433,7 +434,8 @@ async fn send_response(
     };
 
     if let Err(e) = result {
-        error!("Failed to send response: {e}");
+        let sanitized = sanitize_channel_error_for_log(&e.to_string(), &[]);
+        error!("Failed to send response: {sanitized}");
     }
 }
 
@@ -906,9 +908,10 @@ async fn download_image_to_blocks(url: &str, caption: Option<&str>) -> Vec<Conte
     let resp = match client.get(url).send().await {
         Ok(r) => r,
         Err(e) => {
-            warn!("Failed to download image from channel: {e}");
+            let safe = sanitize_channel_error_for_log(&e.to_string(), &[]);
+            warn!("Failed to download image from channel: {safe}");
             return vec![ContentBlock::Text {
-                text: format!("[Image download failed: {e}]"),
+                text: format!("[Image download failed: {safe}]"),
                 provider_metadata: None,
             }];
         }
@@ -927,9 +930,10 @@ async fn download_image_to_blocks(url: &str, caption: Option<&str>) -> Vec<Conte
     let bytes = match resp.bytes().await {
         Ok(b) => b,
         Err(e) => {
-            warn!("Failed to read image bytes: {e}");
+            let safe = sanitize_channel_error_for_log(&e.to_string(), &[]);
+            warn!("Failed to read image bytes: {safe}");
             return vec![ContentBlock::Text {
-                text: format!("[Image read failed: {e}]"),
+                text: format!("[Image read failed: {safe}]"),
                 provider_metadata: None,
             }];
         }
@@ -1746,4 +1750,5 @@ mod tests {
         // No extension — defaults to JPEG
         assert_eq!(media_type_from_url("https://api.telegram.org/file/bot123/photos/file_42"), "image/jpeg");
     }
+
 }

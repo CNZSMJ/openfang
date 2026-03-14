@@ -140,14 +140,16 @@ pub struct OpenFangKernel {
     pub broadcast: openfang_types::config::BroadcastConfig,
     /// Auto-reply engine.
     pub auto_reply_engine: crate::auto_reply::AutoReplyEngine,
+    /// Runtime global budget (hot-updatable via API without mutating immutable config).
+    runtime_budget: std::sync::RwLock<openfang_types::config::BudgetConfig>,
     /// Plugin lifecycle hook registry.
     pub hooks: openfang_runtime::hooks::HookRegistry,
     /// Persistent process manager for interactive sessions (REPLs, servers).
     pub process_manager: Arc<openfang_runtime::process_manager::ProcessManager>,
-    /// OFP peer registry — tracks connected peers.
-    pub peer_registry: Option<openfang_wire::PeerRegistry>,
-    /// OFP peer node — the local networking node.
-    pub peer_node: Option<Arc<openfang_wire::PeerNode>>,
+    /// OFP peer registry — set once when networking starts.
+    pub peer_registry: std::sync::OnceLock<openfang_wire::PeerRegistry>,
+    /// OFP peer node — set once when networking starts.
+    pub peer_node: std::sync::OnceLock<Arc<openfang_wire::PeerNode>>,
     /// Boot timestamp for uptime calculation.
     pub booted_at: std::time::Instant,
     /// WhatsApp Web gateway child process PID (for shutdown cleanup).
@@ -285,10 +287,12 @@ fn ensure_workspace(workspace: &Path) -> KernelResult<()> {
         "created_at": chrono::Local::now().to_rfc3339(),
         "workspace": workspace.display().to_string(),
     });
-    let _ = std::fs::write(
+    if let Err(e) = std::fs::write(
         workspace.join("AGENT.json"),
         serde_json::to_string_pretty(&meta).unwrap_or_default(),
-    );
+    ) {
+        warn!(workspace = %workspace.display(), error = %e, "Failed to write AGENT.json metadata");
+    }
     Ok(())
 }
 
@@ -438,7 +442,13 @@ fn generate_identity_files(
             .open(workspace.join(filename))
         {
             Ok(mut f) => {
-                let _ = f.write_all(content.as_bytes());
+                if let Err(e) = f.write_all(content.as_bytes()) {
+                    warn!(
+                        file = %workspace.join(filename).display(),
+                        error = %e,
+                        "Failed to write identity scaffold file"
+                    );
+                }
             }
             Err(_) => {
                 // File already exists — preserve user edits
@@ -454,7 +464,13 @@ fn generate_identity_files(
             .open(workspace.join("HEARTBEAT.md"))
         {
             Ok(mut f) => {
-                let _ = f.write_all(hb.as_bytes());
+                if let Err(e) = f.write_all(hb.as_bytes()) {
+                    warn!(
+                        file = %workspace.join("HEARTBEAT.md").display(),
+                        error = %e,
+                        "Failed to write HEARTBEAT.md"
+                    );
+                }
             }
             Err(_) => {
                 // File already exists — preserve user edits
@@ -487,7 +503,9 @@ fn append_daily_memory_log(workspace: &Path, response: &str) {
         .append(true)
         .open(&log_path)
     {
-        let _ = writeln!(f, "\n## {timestamp}\n{summary}\n");
+        if let Err(e) = writeln!(f, "\n## {timestamp}\n{summary}\n") {
+            warn!(path = %log_path.display(), error = %e, "Failed to append daily memory log");
+        }
     }
 }
 
@@ -1003,6 +1021,7 @@ impl OpenFangKernel {
         let initial_bindings = config.bindings.clone();
         let initial_broadcast = config.broadcast.clone();
         let auto_reply_engine = crate::auto_reply::AutoReplyEngine::new(config.auto_reply.clone());
+        let runtime_budget = config.budget.clone();
 
         let kernel = Self {
             config,
@@ -1043,10 +1062,11 @@ impl OpenFangKernel {
             bindings: std::sync::Mutex::new(initial_bindings),
             broadcast: initial_broadcast,
             auto_reply_engine,
+            runtime_budget: std::sync::RwLock::new(runtime_budget),
             hooks: openfang_runtime::hooks::HookRegistry::new(),
             process_manager: Arc::new(openfang_runtime::process_manager::ProcessManager::new(5)),
-            peer_registry: None,
-            peer_node: None,
+            peer_registry: std::sync::OnceLock::new(),
+            peer_node: std::sync::OnceLock::new(),
             booted_at: std::time::Instant::now(),
             whatsapp_gateway_pid: Arc::new(std::sync::Mutex::new(None)),
             channel_adapters: dashmap::DashMap::new(),
@@ -2433,8 +2453,9 @@ impl OpenFangKernel {
         kernel_handle: Option<Arc<dyn KernelHandle>>,
     ) -> KernelResult<AgentLoopResult> {
         // Check metering quota before starting
+        let runtime_budget = self.current_budget();
         self.metering
-            .check_global_budget(&self.config.budget)
+            .check_global_budget(&runtime_budget)
             .map_err(KernelError::OpenFang)?;
         self.metering
             .check_quota(agent_id, &entry.manifest.resources)
@@ -3536,7 +3557,9 @@ impl OpenFangKernel {
             .unwrap_or_default();
         if let Some(old) = existing {
             info!(agent = %old.name, id = %old.id, "Removing existing hand agent for reactivation");
-            let _ = self.kill_agent(old.id);
+            if let Err(e) = self.kill_agent(old.id) {
+                warn!(agent = %old.name, id = %old.id, error = %e, "Failed to kill existing hand agent before reactivation");
+            }
         }
 
         // Spawn the agent
@@ -3546,12 +3569,16 @@ impl OpenFangKernel {
         if !saved_triggers.is_empty() {
             let restored = self.triggers.restore_triggers(agent_id, saved_triggers);
             if restored > 0 {
-                info!(
-                    old_agent = %old_agent_id.unwrap(),
-                    new_agent = %agent_id,
-                    restored,
-                    "Reassigned triggers after hand reactivation"
-                );
+                if let Some(old_id) = old_agent_id {
+                    info!(
+                        old_agent = %old_id,
+                        new_agent = %agent_id,
+                        restored,
+                        "Reassigned triggers after hand reactivation"
+                    );
+                } else {
+                    info!(new_agent = %agent_id, restored, "Reassigned triggers after hand reactivation");
+                }
             }
         }
 
@@ -3644,7 +3671,9 @@ impl OpenFangKernel {
     ///
     /// Must be called once after the kernel is wrapped in `Arc`.
     pub fn set_self_handle(self: &Arc<Self>) {
-        let _ = self.self_handle.set(Arc::downgrade(self));
+        if self.self_handle.set(Arc::downgrade(self)).is_err() {
+            warn!("Kernel self_handle was already initialized");
+        }
     }
 
     // ─── Agent Binding management ──────────────────────────────────────
@@ -4195,7 +4224,9 @@ impl OpenFangKernel {
                     interval.tick().await;
                     if kernel.supervisor.is_shutting_down() {
                         // Persist on shutdown
-                        let _ = kernel.cron_scheduler.persist();
+                        if let Err(e) = kernel.cron_scheduler.persist() {
+                            warn!(error = %e, "Failed to persist cron scheduler on shutdown");
+                        }
                         break;
                     }
 
@@ -4395,11 +4426,11 @@ impl OpenFangKernel {
             let port = parts.get(4).unwrap_or(&"9090");
             format!("{ip}:{port}")
                 .parse()
-                .unwrap_or_else(|_| "0.0.0.0:9090".parse().unwrap())
+                .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], 9090)))
         } else {
             listen_addr_str
                 .parse()
-                .unwrap_or_else(|_| "0.0.0.0:9090".parse().unwrap())
+                .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], 9090)))
         };
 
         let node_id = uuid::Uuid::new_v4().to_string();
@@ -4425,13 +4456,11 @@ impl OpenFangKernel {
                     "OFP peer node started"
                 );
 
-                // SAFETY: These fields are only written once during startup.
-                // We use unsafe to set them because start_background_agents runs
-                // after the Arc is created and the kernel is otherwise immutable.
-                let self_ptr = Arc::as_ptr(self) as *mut OpenFangKernel;
-                unsafe {
-                    (*self_ptr).peer_registry = Some(registry.clone());
-                    (*self_ptr).peer_node = Some(node.clone());
+                if self.peer_registry.set(registry.clone()).is_err() {
+                    warn!("OFP peer registry was already initialized");
+                }
+                if self.peer_node.set(node.clone()).is_err() {
+                    warn!("OFP peer node was already initialized");
                 }
 
                 // Connect to bootstrap peers
@@ -4470,6 +4499,26 @@ impl OpenFangKernel {
     /// Get the kernel's strong Arc reference from the stored weak handle.
     fn self_arc(self: &Arc<Self>) -> Arc<Self> {
         Arc::clone(self)
+    }
+
+    /// Get the effective runtime budget snapshot.
+    pub fn current_budget(&self) -> openfang_types::config::BudgetConfig {
+        self.runtime_budget
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Update runtime budget safely without mutating immutable `self.config`.
+    pub fn update_runtime_budget<F>(&self, update: F)
+    where
+        F: FnOnce(&mut openfang_types::config::BudgetConfig),
+    {
+        let mut budget = self
+            .runtime_budget
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        update(&mut budget);
     }
 
     ///
@@ -4578,8 +4627,13 @@ impl OpenFangKernel {
                 // Best-effort kill — don't block shutdown on failure
                 #[cfg(unix)]
                 {
-                    unsafe {
-                        libc::kill(pid as i32, libc::SIGTERM);
+                    if let Err(e) = std::process::Command::new("kill")
+                        .args(["-TERM", &pid.to_string()])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status()
+                    {
+                        warn!(pid, error = %e, "Failed to send SIGTERM to WhatsApp gateway");
                     }
                 }
                 #[cfg(windows)]
@@ -4597,10 +4651,14 @@ impl OpenFangKernel {
 
         // Update agent states to Suspended in persistent storage (not delete)
         for entry in self.registry.list() {
-            let _ = self.registry.set_state(entry.id, AgentState::Suspended);
+            if let Err(e) = self.registry.set_state(entry.id, AgentState::Suspended) {
+                warn!(agent_id = %entry.id, error = %e, "Failed to set agent state to Suspended");
+            }
             // Re-save with Suspended state for clean resume on next boot
             if let Some(updated) = self.registry.get(entry.id) {
-                let _ = self.memory.save_agent(&updated);
+                if let Err(e) = self.memory.save_agent(&updated) {
+                    warn!(agent_id = %entry.id, error = %e, "Failed to persist suspended agent state");
+                }
             }
         }
 
@@ -5518,34 +5576,6 @@ fn copy_skill_dir_recursive(src: &Path, dest: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
-}
-
-/// Apply global budget defaults to an agent's resource quota.
-///
-/// When the global budget config specifies limits and the agent still has
-/// the built-in defaults, override them so agents respect the user's config.
-#[allow(dead_code)]
-fn apply_budget_defaults(
-    budget: &openfang_types::config::BudgetConfig,
-    resources: &mut ResourceQuota,
-) {
-    // Only override hourly if agent has unlimited (0.0) and global is set
-    if budget.max_hourly_usd > 0.0 && resources.max_cost_per_hour_usd == 0.0 {
-        resources.max_cost_per_hour_usd = budget.max_hourly_usd;
-    }
-    // Only override daily/monthly if agent has unlimited (0.0) and global is set
-    if budget.max_daily_usd > 0.0 && resources.max_cost_per_day_usd == 0.0 {
-        resources.max_cost_per_day_usd = budget.max_daily_usd;
-    }
-    if budget.max_monthly_usd > 0.0 && resources.max_cost_per_month_usd == 0.0 {
-        resources.max_cost_per_month_usd = budget.max_monthly_usd;
-    }
-    // Override per-agent hourly token limit when the global default is set.
-    // This lets users raise (or lower) the token budget for all agents at once
-    // via config.toml [budget] default_max_llm_tokens_per_hour = 10000000
-    if budget.default_max_llm_tokens_per_hour > 0 {
-        resources.max_llm_tokens_per_hour = budget.default_max_llm_tokens_per_hour;
-    }
 }
 
 /// Pick a sensible default embedding model for a given provider when the user
