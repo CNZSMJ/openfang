@@ -520,6 +520,23 @@ enum WorkflowCommands {
         /// Path to a JSON file describing the workflow.
         file: PathBuf,
     },
+    /// Get a workflow by ID.
+    Get {
+        /// Workflow ID (UUID).
+        workflow_id: String,
+    },
+    /// Update a workflow from a JSON file.
+    Update {
+        /// Workflow ID (UUID).
+        workflow_id: String,
+        /// Path to a JSON file with the updated workflow definition.
+        file: PathBuf,
+    },
+    /// Delete a workflow by ID.
+    Delete {
+        /// Workflow ID (UUID).
+        workflow_id: String,
+    },
     /// Run a workflow by ID.
     Run {
         /// Workflow ID (UUID).
@@ -893,6 +910,9 @@ fn main() {
         Some(Commands::Workflow(sub)) => match sub {
             WorkflowCommands::List => cmd_workflow_list(),
             WorkflowCommands::Create { file } => cmd_workflow_create(file),
+            WorkflowCommands::Get { workflow_id } => cmd_workflow_get(&workflow_id),
+            WorkflowCommands::Update { workflow_id, file } => cmd_workflow_update(&workflow_id, file),
+            WorkflowCommands::Delete { workflow_id } => cmd_workflow_delete(&workflow_id),
             WorkflowCommands::Run { workflow_id, input } => cmd_workflow_run(&workflow_id, &input),
         },
         Some(Commands::Trigger(sub)) => match sub {
@@ -1073,11 +1093,23 @@ pub(crate) fn find_daemon() -> Option<String> {
 }
 
 /// Build an HTTP client for daemon calls.
+///
+/// When api_key is configured in config.toml, the client automatically
+/// includes a `Authorization: Bearer <key>` header on every request.
+/// When api_key is empty or missing, no auth header is sent.
 pub(crate) fn daemon_client() -> reqwest::blocking::Client {
-    reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .build()
-        .expect("Failed to build HTTP client")
+    let mut builder = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(120));
+
+    if let Some(key) = read_api_key() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Ok(val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {key}")) {
+            headers.insert(reqwest::header::AUTHORIZATION, val);
+        }
+        builder = builder.default_headers(headers);
+    }
+
+    builder.build().expect("Failed to build HTTP client")
 }
 
 /// Helper: send a request to the daemon and parse the JSON body.
@@ -1289,10 +1321,18 @@ fn launch_desktop_app(_openfang_dir: &std::path::Path) {
             ui::blank();
             if let Some(base) = find_daemon() {
                 let url = format!("{base}/");
-                let _ = open_in_browser(&url);
-                // Always print the URL — browser launch may silently fail
-                // (e.g., Chromium sandbox EPERM in containers)
+                if !open_in_browser(&url) {
+                    // Browser launch failed entirely (e.g., sandbox EPERM,
+                    // no display server, container environment).
+                    ui::hint("Could not open a browser automatically.");
+                }
+                // Always print the URL so the user can open it manually,
+                // even when open_in_browser reported success — the spawned
+                // opener may still fail asynchronously.
                 ui::hint(&format!("Dashboard: {url}"));
+            } else {
+                ui::hint("Daemon is not running. Start it with: openfang start");
+                ui::hint("Then open: http://127.0.0.1:4200");
             }
         }
     }
@@ -1340,7 +1380,7 @@ fn provider_list() -> Vec<(&'static str, &'static str, &'static str, &'static st
         (
             "openrouter",
             "OPENROUTER_API_KEY",
-            "openrouter/anthropic/claude-sonnet-4",
+            "openrouter/google/gemini-2.5-flash",
             "OpenRouter",
         ),
         ("minimax", "MINIMAX_API_KEY", "MiniMax-M2.5", "MiniMax"),
@@ -1457,27 +1497,37 @@ fn cmd_start(config: Option<PathBuf>) {
 }
 
 /// Read the api_key from ~/.openfang/config.toml (if any).
+///
+/// Returns `None` when the key is missing, empty, or whitespace-only —
+/// meaning the daemon is running in public (unauthenticated) mode.
 fn read_api_key() -> Option<String> {
+    // 1. Config file takes precedence
     let config_path = cli_openfang_home().join("config.toml");
-    let text = std::fs::read_to_string(config_path).ok()?;
-    let table: toml::Value = text.parse().ok()?;
-    let key = table.get("api_key")?.as_str()?;
-    if key.is_empty() {
-        None
-    } else {
-        Some(key.to_string())
+    if let Ok(text) = std::fs::read_to_string(config_path) {
+        if let Ok(table) = text.parse::<toml::Value>() {
+            if let Some(key) = table.get("api_key").and_then(|v| v.as_str()) {
+                let key = key.trim();
+                if !key.is_empty() {
+                    return Some(key.to_string());
+                }
+            }
+        }
     }
+    // 2. Fall back to OPENFANG_API_KEY env var
+    if let Ok(key) = std::env::var("OPENFANG_API_KEY") {
+        let key = key.trim().to_string();
+        if !key.is_empty() {
+            return Some(key);
+        }
+    }
+    None
 }
 
 fn cmd_stop() {
     match find_daemon() {
         Some(base) => {
             let client = daemon_client();
-            let mut req = client.post(format!("{base}/api/shutdown"));
-            if let Some(key) = read_api_key() {
-                req = req.bearer_auth(key);
-            }
-            match req.send() {
+            match client.post(format!("{base}/api/shutdown")).send() {
                 Ok(r) if r.status().is_success() => {
                     // Wait for daemon to actually stop (up to 5 seconds)
                     for _ in 0..10 {
@@ -2966,16 +3016,31 @@ pub(crate) fn open_in_browser(url: &str) -> bool {
     }
     #[cfg(target_os = "linux")]
     {
-        // Detach from parent to avoid inheriting sandbox restrictions.
-        // Some Chromium-based browsers fail with EPERM when launched from
-        // restricted environments (containers, snaps, flatpaks).
-        std::process::Command::new("xdg-open")
-            .arg(url)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .is_ok()
+        // Try multiple openers in order. xdg-open is the standard, but it
+        // (or the browser it launches) can fail with EPERM in sandboxed
+        // environments (containers, Snap, Flatpak, user-namespace
+        // restrictions). Fall through to alternatives if any opener fails.
+        let openers = [
+            "xdg-open",
+            "sensible-browser",
+            "x-www-browser",
+            "firefox",
+            "google-chrome",
+            "chromium",
+            "chromium-browser",
+        ];
+        for opener in &openers {
+            let result = std::process::Command::new(opener)
+                .arg(url)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+            if result.is_ok() {
+                return true;
+            }
+        }
+        false
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
@@ -3074,6 +3139,100 @@ fn cmd_workflow_run(workflow_id: &str, input: &str) {
     } else {
         eprintln!(
             "Workflow failed: {}",
+            body["error"].as_str().unwrap_or("Unknown error")
+        );
+        std::process::exit(1);
+    }
+}
+
+fn cmd_workflow_get(workflow_id: &str) {
+    let base = require_daemon("workflow get");
+    let client = daemon_client();
+    let body = daemon_json(client.get(format!("{base}/api/workflows/{workflow_id}")).send());
+
+    if body.get("error").is_some() {
+        eprintln!(
+            "Workflow not found: {}",
+            body["error"].as_str().unwrap_or("Unknown error")
+        );
+        std::process::exit(1);
+    }
+
+    println!("Workflow: {}", body["name"].as_str().unwrap_or("?"));
+    println!("  ID:          {}", body["id"].as_str().unwrap_or("?"));
+    println!(
+        "  Description: {}",
+        body["description"].as_str().unwrap_or("")
+    );
+    println!(
+        "  Created:     {}",
+        body["created_at"].as_str().unwrap_or("?")
+    );
+
+    if let Some(steps) = body["steps"].as_array() {
+        println!("  Steps ({}):", steps.len());
+        for (i, s) in steps.iter().enumerate() {
+            let name = s["name"].as_str().unwrap_or("step");
+            let agent = s["agent"]
+                .get("name")
+                .or_else(|| s["agent"].get("id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            println!("    #{}: {} -> {}", i + 1, name, agent);
+        }
+    }
+}
+
+fn cmd_workflow_update(workflow_id: &str, file: PathBuf) {
+    let base = require_daemon("workflow update");
+    if !file.exists() {
+        eprintln!("Workflow file not found: {}", file.display());
+        std::process::exit(1);
+    }
+    let contents = std::fs::read_to_string(&file).unwrap_or_else(|e| {
+        eprintln!("Error reading workflow file: {e}");
+        std::process::exit(1);
+    });
+    let json_body: serde_json::Value = serde_json::from_str(&contents).unwrap_or_else(|e| {
+        eprintln!("Invalid JSON: {e}");
+        std::process::exit(1);
+    });
+
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .put(format!("{base}/api/workflows/{workflow_id}"))
+            .json(&json_body)
+            .send(),
+    );
+
+    if body["status"].as_str() == Some("updated") {
+        println!("Workflow updated successfully!");
+        println!("  ID: {}", body["workflow_id"].as_str().unwrap_or("?"));
+    } else {
+        eprintln!(
+            "Failed to update workflow: {}",
+            body["error"].as_str().unwrap_or("Unknown error")
+        );
+        std::process::exit(1);
+    }
+}
+
+fn cmd_workflow_delete(workflow_id: &str) {
+    let base = require_daemon("workflow delete");
+    let client = daemon_client();
+    let body = daemon_json(
+        client
+            .delete(format!("{base}/api/workflows/{workflow_id}"))
+            .send(),
+    );
+
+    if body["status"].as_str() == Some("removed") {
+        println!("Workflow deleted successfully!");
+        println!("  ID: {}", body["workflow_id"].as_str().unwrap_or("?"));
+    } else {
+        eprintln!(
+            "Failed to delete workflow: {}",
             body["error"].as_str().unwrap_or("Unknown error")
         );
         std::process::exit(1);

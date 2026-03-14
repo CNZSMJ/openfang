@@ -19,6 +19,7 @@ use openfang_types::taint::{TaintLabel, TaintSink, TaintedValue};
 use openfang_types::tool::{ToolDefinition, ToolResult};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
+use openfang_types::tool_compat::normalize_tool_name;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{debug, warn};
@@ -502,6 +503,10 @@ pub async fn execute_tool(
     docker_config: Option<&openfang_types::config::DockerSandboxConfig>,
     process_manager: Option<&crate::process_manager::ProcessManager>,
 ) -> ToolResult {
+    // Normalize the tool name through compat mappings so LLM-hallucinated aliases
+    // (e.g. "fs-write" → "file_write") resolve to the canonical OpenFang name.
+    let tool_name = normalize_tool_name(tool_name);
+
     // Capability enforcement: reject tools not in the allowed list
     if let Some(allowed) = allowed_tools {
         if !allowed.iter().any(|t| t == tool_name) {
@@ -706,7 +711,7 @@ pub async fn execute_tool(
         "cron_cancel" => tool_cron_cancel(input, kernel).await,
 
         // Channel send tool (proactive outbound messaging)
-        "channel_send" => tool_channel_send(input, kernel).await,
+        "channel_send" => tool_channel_send(input, kernel, workspace_root).await,
 
         // Persistent process tools
         "process_start" => tool_process_start(input, process_manager, caller_agent_id).await,
@@ -1571,7 +1576,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         // --- Channel send tool (proactive outbound messaging) ---
         tool_definition! {
             name: "channel_send".to_string(),
-            description: "Send a message or media to a user on a configured channel (email, telegram, slack, etc). For email: recipient is the email address; optionally set subject. For media: set image_url or file_url to send an image or file instead of (or alongside) text.".to_string(),
+            description: "Send a message or media to a user on a configured channel (email, telegram, slack, etc). For email: recipient is the email address; optionally set subject. For media: set image_url, file_url, or file_path to send an image or file instead of (or alongside) text. Use thread_id to reply in a specific thread/topic.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1581,7 +1586,9 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     "message": { "type": "string", "description": "The message body to send (required for text, optional caption for media)" },
                     "image_url": { "type": "string", "description": "URL of an image to send (supported on Telegram, Discord, Slack)" },
                     "file_url": { "type": "string", "description": "URL of a file to send as attachment" },
-                    "filename": { "type": "string", "description": "Filename for file attachments (defaults to 'file')" }
+                    "file_path": { "type": "string", "description": "Local file path to send as attachment (reads from disk; use instead of file_url for local files)" },
+                    "filename": { "type": "string", "description": "Filename for file attachments (defaults to the basename of file_path, or 'file')" },
+                    "thread_id": { "type": "string", "description": "Thread/topic ID to reply in (e.g., Telegram message_thread_id, Slack thread_ts)" }
                 },
                 "required": ["channel", "recipient"]
             }),
@@ -3097,6 +3104,7 @@ async fn tool_cron_cancel(
 async fn tool_channel_send(
     input: &serde_json::Value,
     kernel: Option<&Arc<dyn KernelHandle>>,
+    workspace_root: Option<&Path>,
 ) -> Result<String, String> {
     let kh = require_kernel(kernel)?;
 
@@ -3105,23 +3113,37 @@ async fn tool_channel_send(
         .ok_or("Missing 'channel' parameter")?
         .trim()
         .to_lowercase();
-    let recipient = input["recipient"]
+    let recipient_input = input["recipient"]
         .as_str()
-        .ok_or("Missing 'recipient' parameter")?
-        .trim();
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
 
-    if recipient.is_empty() {
-        return Err("Recipient cannot be empty".to_string());
-    }
+    // If recipient is empty, resolve from channel's default_chat_id config.
+    let recipient = if recipient_input.is_empty() {
+        let default_id = kh.get_channel_default_recipient(&channel).await;
+        match default_id {
+            Some(id) => id,
+            None => return Err(format!(
+                "Missing 'recipient' parameter. Set default_chat_id in [channels.{channel}] config \
+                 or pass recipient explicitly."
+            )),
+        }
+    } else {
+        recipient_input
+    };
+    let recipient = recipient.as_str();
 
-    // Check for media content (image_url or file_url)
+    let thread_id = input["thread_id"].as_str().filter(|s| !s.is_empty());
+
+    // Check for media content (image_url, file_url, or file_path)
     let image_url = input["image_url"].as_str().filter(|s| !s.is_empty());
     let file_url = input["file_url"].as_str().filter(|s| !s.is_empty());
+    let file_path = input["file_path"].as_str().filter(|s| !s.is_empty());
 
     if let Some(url) = image_url {
         let caption = input["message"].as_str().filter(|s| !s.is_empty());
         return kh
-            .send_channel_media(&channel, recipient, "image", url, caption, None)
+            .send_channel_media(&channel, recipient, "image", url, caption, None, thread_id)
             .await;
     }
 
@@ -3129,7 +3151,64 @@ async fn tool_channel_send(
         let caption = input["message"].as_str().filter(|s| !s.is_empty());
         let filename = input["filename"].as_str();
         return kh
-            .send_channel_media(&channel, recipient, "file", url, caption, filename)
+            .send_channel_media(&channel, recipient, "file", url, caption, filename, thread_id)
+            .await;
+    }
+
+    // Local file attachment: read from disk and send as FileData
+    if let Some(raw_path) = file_path {
+        let resolved = resolve_file_path(raw_path, workspace_root)?;
+        let data = tokio::fs::read(&resolved)
+            .await
+            .map_err(|e| format!("Failed to read file '{}': {e}", resolved.display()))?;
+
+        // Derive filename from the path if not explicitly provided
+        let filename = input["filename"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| {
+                resolved
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("file")
+                    .to_string()
+            });
+
+        // Determine MIME type from extension
+        let ext = resolved
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let mime_type = match ext.as_str() {
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "gif" => "image/gif",
+            "webp" => "image/webp",
+            "svg" => "image/svg+xml",
+            "pdf" => "application/pdf",
+            "txt" => "text/plain",
+            "csv" => "text/csv",
+            "json" => "application/json",
+            "xml" => "application/xml",
+            "zip" => "application/zip",
+            "gz" | "gzip" => "application/gzip",
+            "tar" => "application/x-tar",
+            "mp3" => "audio/mpeg",
+            "wav" => "audio/wav",
+            "mp4" => "video/mp4",
+            "doc" => "application/msword",
+            "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "xls" => "application/vnd.ms-excel",
+            "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            _ => "application/octet-stream",
+        };
+
+        return kh
+            .send_channel_file_data(
+                &channel, recipient, data, &filename, mime_type, thread_id,
+            )
             .await;
     }
 
@@ -3160,7 +3239,7 @@ async fn tool_channel_send(
         message.to_string()
     };
 
-    kh.send_channel_message(&channel, recipient, &final_message)
+    kh.send_channel_message(&channel, recipient, &final_message, thread_id)
         .await
 }
 
@@ -4066,10 +4145,7 @@ async fn tool_canvas_present(
     let _ = tokio::fs::create_dir_all(&output_dir).await;
 
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
-    let filename = format!(
-        "canvas_{timestamp}_{}.html",
-        openfang_types::truncate_str(&canvas_id, 8)
-    );
+    let filename = format!("canvas_{timestamp}_{}.html", crate::str_utils::safe_truncate_str(&canvas_id, 8));
     let filepath = output_dir.join(&filename);
 
     // Write the full HTML document
@@ -4825,10 +4901,13 @@ input_schema = { type = "object", properties = { issue = { type = "string" } } }
 
     #[tokio::test]
     async fn test_file_read_missing() {
+        let bad_path = std::env::temp_dir()
+            .join("openfang_test_nonexistent_99999")
+            .join("file.txt");
         let result = execute_tool(
             "test-id",
             "file_read",
-            &serde_json::json!({"path": "/nonexistent/file.txt"}),
+            &serde_json::json!({"path": bad_path.to_str().unwrap()}),
             None,
             None,
             None,
@@ -4845,7 +4924,7 @@ input_schema = { type = "object", properties = { issue = { type = "string" } } }
             None, // process_manager
         )
         .await;
-        assert!(result.is_error);
+        assert!(result.is_error, "Expected error but got: {}", result.content);
     }
 
     #[tokio::test]
@@ -5034,10 +5113,14 @@ input_schema = { type = "object", properties = { issue = { type = "string" } } }
     #[tokio::test]
     async fn test_capability_enforcement_allowed() {
         let allowed = vec!["file_read".to_string()];
+        // Use a cross-platform nonexistent path
+        let bad_path = std::env::temp_dir()
+            .join("openfang_test_nonexistent_12345")
+            .join("file.txt");
         let result = execute_tool(
             "test-id",
             "file_read",
-            &serde_json::json!({"path": "/nonexistent/file.txt"}),
+            &serde_json::json!({"path": bad_path.to_str().unwrap()}),
             None,
             Some(&allowed),
             None,
@@ -5055,8 +5138,81 @@ input_schema = { type = "object", properties = { issue = { type = "string" } } }
         )
         .await;
         // Should fail for file-not-found, NOT for permission denied
+        assert!(result.is_error, "Expected error but got: {}", result.content);
+        assert!(
+            result.content.contains("Failed to read") || result.content.contains("not found") || result.content.contains("No such file"),
+            "Unexpected error: {}", result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_capability_enforcement_aliased_tool_name() {
+        // Agent has "file_write" in allowed tools, but LLM calls "fs-write".
+        // After normalization, this should pass the capability check.
+        let allowed = vec![
+            "file_read".to_string(),
+            "file_write".to_string(),
+            "file_list".to_string(),
+            "shell_exec".to_string(),
+        ];
+        let result = execute_tool(
+            "test-id",
+            "fs-write", // LLM-hallucinated alias
+            &serde_json::json!({"path": "/nonexistent/file.txt", "content": "hello"}),
+            None,
+            Some(&allowed),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None, // media_engine
+            None, // exec_policy
+            None, // tts_engine
+            None, // docker_config
+            None, // process_manager
+        )
+        .await;
+        // Should NOT be "Permission denied" — it should normalize to file_write
+        // and pass the capability check. It will fail for other reasons (path validation).
+        assert!(
+            !result.content.contains("Permission denied"),
+            "fs-write should normalize to file_write and pass capability check, got: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn test_capability_enforcement_aliased_denied() {
+        // Agent does NOT have file_write, and LLM calls "fs-write" — should be denied.
+        let allowed = vec!["file_read".to_string()];
+        let result = execute_tool(
+            "test-id",
+            "fs-write",
+            &serde_json::json!({"path": "/tmp/test.txt", "content": "hello"}),
+            None,
+            Some(&allowed),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None, // media_engine
+            None, // exec_policy
+            None, // tts_engine
+            None, // docker_config
+            None, // process_manager
+        )
+        .await;
         assert!(result.is_error);
-        assert!(result.content.contains("Failed to read"));
+        assert!(
+            result.content.contains("Permission denied"),
+            "fs-write should normalize to file_write which is not in allowed list"
+        );
     }
 
     // --- Schedule parser tests ---

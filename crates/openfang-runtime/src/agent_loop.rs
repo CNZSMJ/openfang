@@ -76,8 +76,7 @@ const MAX_BLOCK_TEXT_LOG_CHARS: usize = 1_500;
 /// Strip a provider prefix from a model ID before sending to the API.
 ///
 /// Many models are stored as `provider/org/model` (e.g. `openrouter/google/gemini-2.5-flash`)
-/// but the upstream API expects just `org/model`. This also handles special routers
-/// like `openrouter/auto` → `auto`.
+/// but the upstream API expects just `org/model` (e.g. `google/gemini-2.5-flash`).
 pub fn strip_provider_prefix(model: &str, provider: &str) -> String {
     let slash_prefix = format!("{}/", provider);
     let colon_prefix = format!("{}:", provider);
@@ -433,6 +432,7 @@ pub async fn run_agent_loop(
     hooks: Option<&crate::hooks::HookRegistry>,
     context_window_tokens: Option<usize>,
     process_manager: Option<&crate::process_manager::ProcessManager>,
+    user_content_blocks: Option<Vec<ContentBlock>>,
 ) -> OpenFangResult<AgentLoopResult> {
     run_agent_loop_with_session_message(
         manifest,
@@ -456,6 +456,7 @@ pub async fn run_agent_loop(
         hooks,
         context_window_tokens,
         process_manager,
+        user_content_blocks,
     )
     .await
 }
@@ -484,6 +485,7 @@ pub async fn run_agent_loop_with_session_message(
     hooks: Option<&crate::hooks::HookRegistry>,
     context_window_tokens: Option<usize>,
     process_manager: Option<&crate::process_manager::ProcessManager>,
+    user_content_blocks: Option<Vec<ContentBlock>>,
 ) -> OpenFangResult<AgentLoopResult> {
     info!(agent = %manifest.name, "Starting agent loop");
 
@@ -570,7 +572,13 @@ pub async fn run_agent_loop_with_session_message(
     let system_prompt = manifest.model.system_prompt.clone();
 
     // Add the user message to session history.
-    session.messages.push(session_user_message);
+    // When content blocks are provided (e.g. text + image from a channel),
+    // use multimodal message format so the LLM receives the image for vision.
+    if let Some(blocks) = user_content_blocks {
+        session.messages.push(Message::user_with_blocks(blocks));
+    } else {
+        session.messages.push(session_user_message);
+    }
 
     // Build the messages for the LLM, filtering system messages
     // System prompt goes into the separate `system` field
@@ -615,6 +623,10 @@ pub async fn run_agent_loop_with_session_message(
             "Trimming old messages to prevent context overflow"
         );
         trim_messages_for_prepended_context(&mut messages, prepended_messages.len());
+        // Re-validate after trimming: the drain may have split a ToolUse/ToolResult
+        // pair across the cut boundary, leaving orphaned blocks that cause the LLM
+        // to return empty responses (input_tokens=0).
+        messages = crate::session_repair::validate_and_repair(&messages);
     }
     if !prepended_messages.is_empty() {
         messages.splice(0..0, prepended_messages);
@@ -742,7 +754,7 @@ pub async fn run_agent_loop_with_session_message(
                         id: tc.id.clone(),
                         name: tc.name.clone(),
                         input: tc.input.clone(),
-                        thought_signature: tc.thought_signature.clone(),
+                        provider_metadata: None,
                     });
                 }
                 response.content = new_blocks;
@@ -782,14 +794,30 @@ pub async fn run_agent_loop_with_session_message(
                     });
                 }
 
-                // One-shot retry: if the very first LLM call returns empty text
-                // with no tool use, try once more before accepting the empty result.
-                // This catches transient LLM hiccups (overload, empty stream, etc.).
-                if text.trim().is_empty() && iteration == 0 && response.tool_calls.is_empty() {
-                    warn!(agent = %manifest.name, "Empty response on first call, retrying once");
-                    messages.push(Message::assistant("[no response]".to_string()));
-                    messages.push(Message::user("Please provide your response.".to_string()));
-                    continue;
+                // One-shot retry: if the LLM returns empty text with no tool use,
+                // try once more before accepting the empty result.
+                // Triggers on first call OR when input_tokens=0 (silently failed request).
+                if text.trim().is_empty() && response.tool_calls.is_empty() {
+                    let is_silent_failure = response.usage.input_tokens == 0
+                        && response.usage.output_tokens == 0;
+                    if iteration == 0 || is_silent_failure {
+                        warn!(
+                            agent = %manifest.name,
+                            iteration,
+                            input_tokens = response.usage.input_tokens,
+                            output_tokens = response.usage.output_tokens,
+                            silent_failure = is_silent_failure,
+                            "Empty response, retrying once"
+                        );
+                        // Re-validate messages before retry — the history may have
+                        // broken tool_use/tool_result pairs that caused the failure.
+                        if is_silent_failure {
+                            messages = crate::session_repair::validate_and_repair(&messages);
+                        }
+                        messages.push(Message::assistant("[no response]".to_string()));
+                        messages.push(Message::user("Please provide your response.".to_string()));
+                        continue;
+                    }
                 }
 
                 // Guard against empty response — covers both iteration 0 and post-tool cycles
@@ -1071,6 +1099,7 @@ pub async fn run_agent_loop_with_session_message(
                              wanted to do and that it requires their approval.]",
                             denial_count
                         ),
+                        provider_metadata: None,
                     });
                 }
 
@@ -1088,6 +1117,7 @@ pub async fn run_agent_loop_with_session_message(
                              alternatives instead of making up data.]",
                             non_denial_errors
                         ),
+                        provider_metadata: None,
                     });
                 }
 
@@ -1263,7 +1293,11 @@ async fn call_with_retry(
             Err(e) => {
                 // Use classifier for smarter error handling
                 let raw_error = e.to_string();
-                let classified = llm_errors::classify_error(&raw_error, None);
+                let status = match &e {
+                    LlmError::Api { status, .. } => Some(*status),
+                    _ => None,
+                };
+                let classified = llm_errors::classify_error(&raw_error, status);
                 warn!(
                     category = ?classified.category,
                     retryable = classified.is_retryable,
@@ -1373,7 +1407,11 @@ async fn stream_with_retry(
             }
             Err(e) => {
                 let raw_error = e.to_string();
-                let classified = llm_errors::classify_error(&raw_error, None);
+                let status = match &e {
+                    LlmError::Api { status, .. } => Some(*status),
+                    _ => None,
+                };
+                let classified = llm_errors::classify_error(&raw_error, status);
                 warn!(
                     category = ?classified.category,
                     retryable = classified.is_retryable,
@@ -1429,6 +1467,7 @@ pub async fn run_agent_loop_streaming(
     hooks: Option<&crate::hooks::HookRegistry>,
     context_window_tokens: Option<usize>,
     process_manager: Option<&crate::process_manager::ProcessManager>,
+    user_content_blocks: Option<Vec<ContentBlock>>,
 ) -> OpenFangResult<AgentLoopResult> {
     info!(agent = %manifest.name, "Starting streaming agent loop");
 
@@ -1514,8 +1553,14 @@ pub async fn run_agent_loop_streaming(
     // to keep the system prompt stable for provider prompt caching.
     let system_prompt = manifest.model.system_prompt.clone();
 
-    // Add the user message to session history
-    session.messages.push(Message::user(user_message));
+    // Add the user message to session history.
+    // When content blocks are provided (e.g. text + image from a channel),
+    // use multimodal message format so the LLM receives the image for vision.
+    if let Some(blocks) = user_content_blocks {
+        session.messages.push(Message::user_with_blocks(blocks));
+    } else {
+        session.messages.push(Message::user(user_message));
+    }
 
     let llm_messages: Vec<Message> = session
         .messages
@@ -1556,6 +1601,10 @@ pub async fn run_agent_loop_streaming(
             "Trimming old messages to prevent context overflow (streaming)"
         );
         trim_messages_for_prepended_context(&mut messages, prepended_messages.len());
+        // Re-validate after trimming: the drain may have split a ToolUse/ToolResult
+        // pair across the cut boundary, leaving orphaned blocks that cause the LLM
+        // to return empty responses (input_tokens=0).
+        messages = crate::session_repair::validate_and_repair(&messages);
     }
     if !prepended_messages.is_empty() {
         messages.splice(0..0, prepended_messages);
@@ -1655,9 +1704,15 @@ pub async fn run_agent_loop_streaming(
         let input_log = format_llm_input_log(&system_prompt, &messages);
         log_llm_event(workspace_root, "INPUT", &api_model, &input_log).await;
 
-        // Notify phase: Streaming (streaming variant always streams)
+        // Notify phase: on first iteration emit Streaming; on subsequent
+        // iterations (after tool execution) emit Thinking so the UI shows
+        // "Thinking..." instead of overwriting streamed text with "streaming".
         if let Some(cb) = on_phase {
-            cb(LoopPhase::Streaming);
+            if iteration == 0 {
+                cb(LoopPhase::Streaming);
+            } else {
+                cb(LoopPhase::Thinking);
+            }
         }
 
         // Stream LLM call with retry, error classification, and circuit breaker
@@ -1702,7 +1757,7 @@ pub async fn run_agent_loop_streaming(
                         id: tc.id.clone(),
                         name: tc.name.clone(),
                         input: tc.input.clone(),
-                        thought_signature: tc.thought_signature.clone(),
+                        provider_metadata: None,
                     });
                 }
                 response.content = new_blocks;
@@ -1741,13 +1796,30 @@ pub async fn run_agent_loop_streaming(
                     });
                 }
 
-                // One-shot retry: if the very first LLM call returns empty text
-                // with no tool use, try once more before accepting the empty result.
-                if text.trim().is_empty() && iteration == 0 && response.tool_calls.is_empty() {
-                    warn!(agent = %manifest.name, "Empty response on first call (streaming), retrying once");
-                    messages.push(Message::assistant("[no response]".to_string()));
-                    messages.push(Message::user("Please provide your response.".to_string()));
-                    continue;
+                // One-shot retry: if the LLM returns empty text with no tool use,
+                // try once more before accepting the empty result.
+                // Triggers on first call OR when input_tokens=0 (silently failed request).
+                if text.trim().is_empty() && response.tool_calls.is_empty() {
+                    let is_silent_failure = response.usage.input_tokens == 0
+                        && response.usage.output_tokens == 0;
+                    if iteration == 0 || is_silent_failure {
+                        warn!(
+                            agent = %manifest.name,
+                            iteration,
+                            input_tokens = response.usage.input_tokens,
+                            output_tokens = response.usage.output_tokens,
+                            silent_failure = is_silent_failure,
+                            "Empty response (streaming), retrying once"
+                        );
+                        // Re-validate messages before retry — the history may have
+                        // broken tool_use/tool_result pairs that caused the failure.
+                        if is_silent_failure {
+                            messages = crate::session_repair::validate_and_repair(&messages);
+                        }
+                        messages.push(Message::assistant("[no response]".to_string()));
+                        messages.push(Message::user("Please provide your response.".to_string()));
+                        continue;
+                    }
                 }
 
                 // Guard against empty response — covers both iteration 0 and post-tool cycles
@@ -2039,6 +2111,7 @@ pub async fn run_agent_loop_streaming(
                              wanted to do and that it requires their approval.]",
                             denial_count
                         ),
+                        provider_metadata: None,
                     });
                 }
 
@@ -2056,6 +2129,7 @@ pub async fn run_agent_loop_streaming(
                              alternatives instead of making up data.]",
                             non_denial_errors
                         ),
+                        provider_metadata: None,
                     });
                 }
 
@@ -2146,15 +2220,28 @@ pub async fn run_agent_loop_streaming(
     Err(OpenFangError::MaxIterationsExceeded(max_iterations))
 }
 
-/// Recover tool calls that LLMs (Groq/Llama, DeepSeek) output as plain text
-/// instead of the proper `tool_calls` API field.
+/// Recover tool calls that LLMs output as plain text instead of the proper
+/// `tool_calls` API field. Covers Groq/Llama, DeepSeek, Qwen, and Ollama models.
 ///
-/// Parses patterns like `<function=tool_name>{"key":"value"}</function>` from
-/// the model's text output, validates tool names against the available tools,
-/// and returns synthetic `ToolCall` entries.
-fn recover_text_tool_calls(text: &str, visible_tools: &[ToolDefinition]) -> Vec<ToolCall> {
+/// Supported patterns:
+/// 1. `<function=tool_name>{"key":"value"}</function>`
+/// 2. `<function>tool_name{"key":"value"}</function>`
+/// 3. `<tool>tool_name{"key":"value"}</tool>`
+/// 4. Markdown code blocks containing `tool_name {"key":"value"}`
+/// 5. Backtick-wrapped `tool_name {"key":"value"}`
+/// 6. `[TOOL_CALL]...[/TOOL_CALL]` blocks (JSON or arrow syntax) — issue #354
+/// 7. `<tool_call>{"name":"tool","arguments":{...}}</tool_call>` — Qwen3, issue #332
+/// 8. Bare JSON `{"name":"tool","arguments":{...}}` objects (last resort, only if no tags found)
+/// 9. `<function name="tool" parameters="{...}" />` — XML attribute style (Groq/Llama)
+/// 10. `<|plugin|>...<|endofblock|>` — Qwen/ChatGLM thinking-model format
+/// 11. `Action: tool\nAction Input: {"key":"value"}` — ReAct-style (LM Studio, GPT-OSS)
+/// 12. `tool_name\n{"key":"value"}` — bare name + JSON on next line (Llama 4 Scout)
+/// 13. `<tool_use>{"name":"tool","arguments":{...}}</tool_use>` — Llama 3.1+ variant
+///
+/// Validates tool names against available tools and returns synthetic `ToolCall` entries.
+fn recover_text_tool_calls(text: &str, available_tools: &[ToolDefinition]) -> Vec<ToolCall> {
     let mut calls = Vec::new();
-    let tool_names: Vec<&str> = visible_tools.iter().map(|t| t.name.as_str()).collect();
+    let tool_names: Vec<&str> = available_tools.iter().map(|t| t.name.as_str()).collect();
 
     // Pattern 1: <function=TOOL_NAME>JSON_BODY</function>
     let mut search_from = 0;
@@ -2204,7 +2291,6 @@ fn recover_text_tool_calls(text: &str, visible_tools: &[ToolDefinition]) -> Vec<
             id: format!("recovered_{}", uuid::Uuid::new_v4()),
             name: tool_name.to_string(),
             input,
-            thought_signature: None,
         });
     }
 
@@ -2268,7 +2354,6 @@ fn recover_text_tool_calls(text: &str, visible_tools: &[ToolDefinition]) -> Vec<
             id: format!("recovered_{}", uuid::Uuid::new_v4()),
             name: tool_name.to_string(),
             input,
-            thought_signature: None,
         });
     }
 
@@ -2315,7 +2400,6 @@ fn recover_text_tool_calls(text: &str, visible_tools: &[ToolDefinition]) -> Vec<
             id: format!("recovered_{}", uuid::Uuid::new_v4()),
             name: tool_name.to_string(),
             input,
-            thought_signature: None,
         });
     }
 
@@ -2348,7 +2432,6 @@ fn recover_text_tool_calls(text: &str, visible_tools: &[ToolDefinition]) -> Vec<
                                         id: format!("recovered_{}", uuid::Uuid::new_v4()),
                                         name: potential_tool.to_string(),
                                         input,
-                                        thought_signature: None,
                                     });
                                 }
                             }
@@ -2396,12 +2479,289 @@ fn recover_text_tool_calls(text: &str, visible_tools: &[ToolDefinition]) -> Vec<
                                 id: format!("recovered_{}", uuid::Uuid::new_v4()),
                                 name: potential_tool.to_string(),
                                 input,
-                                thought_signature: None,
                             });
                         }
                     }
                 }
             }
+        }
+    }
+
+    // Pattern 6: [TOOL_CALL]...[/TOOL_CALL] blocks (Ollama models like Qwen, issue #354)
+    // Handles both JSON args and custom `{tool => "name", args => {--key "value"}}` syntax.
+    search_from = 0;
+    while let Some(start) = text[search_from..].find("[TOOL_CALL]") {
+        let abs_start = search_from + start;
+        let after_tag = abs_start + "[TOOL_CALL]".len();
+
+        let Some(close_offset) = text[after_tag..].find("[/TOOL_CALL]") else {
+            search_from = after_tag;
+            continue;
+        };
+        let inner = text[after_tag..after_tag + close_offset].trim();
+        search_from = after_tag + close_offset + "[/TOOL_CALL]".len();
+
+        // Try standard JSON first: {"name":"tool","arguments":{...}}
+        if let Some((tool_name, input)) = parse_json_tool_call_object(inner, &tool_names) {
+            if !calls
+                .iter()
+                .any(|c| c.name == tool_name && c.input == input)
+            {
+                info!(
+                    tool = tool_name.as_str(),
+                    "Recovered tool call from [TOOL_CALL] block (JSON)"
+                );
+                calls.push(ToolCall {
+                    id: format!("recovered_{}", uuid::Uuid::new_v4()),
+                    name: tool_name,
+                    input,
+                });
+            }
+            continue;
+        }
+
+        // Custom arrow syntax: {tool => "name", args => {--key "value"}}
+        if let Some((tool_name, input)) =
+            parse_arrow_syntax_tool_call(inner, &tool_names)
+        {
+            if !calls
+                .iter()
+                .any(|c| c.name == tool_name && c.input == input)
+            {
+                info!(
+                    tool = tool_name.as_str(),
+                    "Recovered tool call from [TOOL_CALL] block (arrow syntax)"
+                );
+                calls.push(ToolCall {
+                    id: format!("recovered_{}", uuid::Uuid::new_v4()),
+                    name: tool_name,
+                    input,
+                });
+            }
+        }
+    }
+
+    // Pattern 7: <tool_call>JSON</tool_call> (Qwen3 models on Ollama, issue #332)
+    search_from = 0;
+    while let Some(start) = text[search_from..].find("<tool_call>") {
+        let abs_start = search_from + start;
+        let after_tag = abs_start + "<tool_call>".len();
+
+        let Some(close_offset) = text[after_tag..].find("</tool_call>") else {
+            search_from = after_tag;
+            continue;
+        };
+        let inner = text[after_tag..after_tag + close_offset].trim();
+        search_from = after_tag + close_offset + "</tool_call>".len();
+
+        if let Some((tool_name, input)) = parse_json_tool_call_object(inner, &tool_names) {
+            if !calls
+                .iter()
+                .any(|c| c.name == tool_name && c.input == input)
+            {
+                info!(
+                    tool = tool_name.as_str(),
+                    "Recovered tool call from <tool_call> block"
+                );
+                calls.push(ToolCall {
+                    id: format!("recovered_{}", uuid::Uuid::new_v4()),
+                    name: tool_name,
+                    input,
+                });
+            }
+        }
+    }
+
+    // Pattern 9: <function name="tool" parameters="{...}" /> — XML attribute style
+    // Groq/Llama sometimes emit self-closing XML with name/parameters attributes.
+    // The parameters value is HTML-entity-escaped JSON (&quot; etc.).
+    {
+        use regex_lite::Regex;
+        // Match both self-closing <function ... /> and <function ...></function>
+        let re = Regex::new(
+            r#"<function\s+name="([^"]+)"\s+parameters="([^"]*)"[^/]*/?>"#
+        ).unwrap();
+        for caps in re.captures_iter(text) {
+            let tool_name = caps.get(1).unwrap().as_str();
+            let raw_params = caps.get(2).unwrap().as_str();
+
+            if !tool_names.contains(&tool_name) {
+                warn!(tool = tool_name, "XML-attribute tool call for unknown tool — skipping");
+                continue;
+            }
+
+            // Unescape HTML entities (&quot; &amp; &lt; &gt; &apos;)
+            let unescaped = raw_params
+                .replace("&quot;", "\"")
+                .replace("&amp;", "&")
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&apos;", "'");
+
+            let input: serde_json::Value = match serde_json::from_str(&unescaped) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(tool = tool_name, error = %e, "Failed to parse XML-attribute tool call params — skipping");
+                    continue;
+                }
+            };
+
+            if calls.iter().any(|c| c.name == tool_name && c.input == input) {
+                continue;
+            }
+
+            info!(tool = tool_name, "Recovered XML-attribute tool call → synthetic ToolUse");
+            calls.push(ToolCall {
+                id: format!("recovered_{}", uuid::Uuid::new_v4()),
+                name: tool_name.to_string(),
+                input,
+            });
+        }
+    }
+
+    // Pattern 10: <|plugin|>...<|endofblock|> (Qwen/ChatGLM thinking-model format)
+    search_from = 0;
+    while let Some(start) = text[search_from..].find("<|plugin|>") {
+        let abs_start = search_from + start;
+        let after_tag = abs_start + "<|plugin|>".len();
+
+        let close_tag = "<|endofblock|>";
+        let Some(close_offset) = text[after_tag..].find(close_tag) else {
+            search_from = after_tag;
+            continue;
+        };
+        let inner = text[after_tag..after_tag + close_offset].trim();
+        search_from = after_tag + close_offset + close_tag.len();
+
+        if let Some((tool_name, input)) = parse_json_tool_call_object(inner, &tool_names) {
+            if !calls.iter().any(|c| c.name == tool_name && c.input == input) {
+                info!(tool = tool_name.as_str(), "Recovered tool call from <|plugin|> block");
+                calls.push(ToolCall {
+                    id: format!("recovered_{}", uuid::Uuid::new_v4()),
+                    name: tool_name,
+                    input,
+                });
+            }
+        }
+    }
+
+    // Pattern 11: Action: tool_name\nAction Input: {JSON} (ReAct-style, LM Studio / GPT-OSS)
+    {
+        let lines: Vec<&str> = text.lines().collect();
+        let mut i = 0;
+        while i < lines.len() {
+            let line = lines[i].trim();
+            if let Some(tool_part) = line.strip_prefix("Action:").or_else(|| line.strip_prefix("action:")) {
+                let tool_name = tool_part.trim();
+                if tool_names.contains(&tool_name) {
+                    // Look for "Action Input:" on the next line(s)
+                    if i + 1 < lines.len() {
+                        let next = lines[i + 1].trim();
+                        if let Some(json_part) = next.strip_prefix("Action Input:").or_else(|| next.strip_prefix("action input:")).or_else(|| next.strip_prefix("action_input:")) {
+                            let json_str = json_part.trim();
+                            if let Ok(input) = serde_json::from_str::<serde_json::Value>(json_str) {
+                                if !calls.iter().any(|c| c.name == tool_name && c.input == input) {
+                                    info!(tool = tool_name, "Recovered tool call from Action/Action Input pattern");
+                                    calls.push(ToolCall {
+                                        id: format!("recovered_{}", uuid::Uuid::new_v4()),
+                                        name: tool_name.to_string(),
+                                        input,
+                                    });
+                                }
+                            }
+                            i += 2;
+                            continue;
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+
+    // Pattern 12: tool_name\n{"key":"value"} — bare name + JSON on next line (Llama 4 Scout)
+    {
+        let lines: Vec<&str> = text.lines().collect();
+        for i in 0..lines.len().saturating_sub(1) {
+            let name_line = lines[i].trim();
+            // Tool name must be a single word matching a known tool
+            if name_line.contains(' ') || name_line.contains('{') || name_line.is_empty() {
+                continue;
+            }
+            if !tool_names.contains(&name_line) {
+                continue;
+            }
+            // Next line must be valid JSON
+            let json_line = lines[i + 1].trim();
+            if !json_line.starts_with('{') {
+                continue;
+            }
+            if let Ok(input) = serde_json::from_str::<serde_json::Value>(json_line) {
+                if !calls.iter().any(|c| c.name == name_line && c.input == input) {
+                    info!(tool = name_line, "Recovered tool call from name+JSON line pair");
+                    calls.push(ToolCall {
+                        id: format!("recovered_{}", uuid::Uuid::new_v4()),
+                        name: name_line.to_string(),
+                        input,
+                    });
+                }
+            }
+        }
+    }
+
+    // Pattern 13: <tool_use>JSON</tool_use> (Llama 3.1+ variant)
+    search_from = 0;
+    while let Some(start) = text[search_from..].find("<tool_use>") {
+        let abs_start = search_from + start;
+        let after_tag = abs_start + "<tool_use>".len();
+
+        let Some(close_offset) = text[after_tag..].find("</tool_use>") else {
+            search_from = after_tag;
+            continue;
+        };
+        let inner = text[after_tag..after_tag + close_offset].trim();
+        search_from = after_tag + close_offset + "</tool_use>".len();
+
+        if let Some((tool_name, input)) = parse_json_tool_call_object(inner, &tool_names) {
+            if !calls.iter().any(|c| c.name == tool_name && c.input == input) {
+                info!(tool = tool_name.as_str(), "Recovered tool call from <tool_use> block");
+                calls.push(ToolCall {
+                    id: format!("recovered_{}", uuid::Uuid::new_v4()),
+                    name: tool_name,
+                    input,
+                });
+            }
+        }
+    }
+
+    // Pattern 8: Bare JSON tool call objects in text (common Ollama fallback)
+    // Matches: {"name":"tool_name","arguments":{"key":"value"}} not already inside tags
+    // Only try this if no calls were found by tag-based patterns, to avoid false positives.
+    if calls.is_empty() {
+        // Scan for JSON objects that look like tool calls
+        let mut scan_from = 0;
+        while let Some(brace_start) = text[scan_from..].find('{') {
+            let abs_brace = scan_from + brace_start;
+            // Try to parse a JSON object starting here
+            if let Some((tool_name, input)) =
+                try_parse_bare_json_tool_call(&text[abs_brace..], &tool_names)
+            {
+                if !calls
+                    .iter()
+                    .any(|c| c.name == tool_name && c.input == input)
+                {
+                    info!(
+                        tool = tool_name.as_str(),
+                        "Recovered tool call from bare JSON object in text"
+                    );
+                    calls.push(ToolCall {
+                        id: format!("recovered_{}", uuid::Uuid::new_v4()),
+                        name: tool_name,
+                        input,
+                    });
+                }
+            }
+            scan_from = abs_brace + 1;
         }
     }
 
@@ -2474,7 +2834,7 @@ fn format_blocks_for_log(blocks: &[ContentBlock]) -> String {
     let mut lines = Vec::with_capacity(blocks.len());
     for (idx, block) in blocks.iter().enumerate() {
         let line = match block {
-            ContentBlock::Text { text } => format!(
+            ContentBlock::Text { text, .. } => format!(
                 "- block[{idx}] text: {}",
                 truncate_for_log(text, MAX_BLOCK_TEXT_LOG_CHARS)
             ),
@@ -2593,6 +2953,229 @@ async fn log_llm_event(
     } else {
         let _ = writeln!(file);
     }
+}
+
+/// Parse a JSON object that represents a tool call.
+/// Supports formats:
+/// - `{"name":"tool","arguments":{"key":"value"}}`
+/// - `{"name":"tool","parameters":{"key":"value"}}`
+/// - `{"function":"tool","arguments":{"key":"value"}}`
+/// - `{"tool":"tool_name","args":{"key":"value"}}`
+fn parse_json_tool_call_object(
+    text: &str,
+    tool_names: &[&str],
+) -> Option<(String, serde_json::Value)> {
+    let obj: serde_json::Value = serde_json::from_str(text).ok()?;
+    let obj = obj.as_object()?;
+
+    // Extract tool name from various field names
+    let name = obj
+        .get("name")
+        .or_else(|| obj.get("function"))
+        .or_else(|| obj.get("tool"))
+        .and_then(|v| v.as_str())?;
+
+    if !tool_names.contains(&name) {
+        return None;
+    }
+
+    // Extract arguments from various field names
+    let args = obj
+        .get("arguments")
+        .or_else(|| obj.get("parameters"))
+        .or_else(|| obj.get("args"))
+        .or_else(|| obj.get("input"))
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
+
+    // If arguments is a string (some models stringify it), try to parse it
+    let args = if let Some(s) = args.as_str() {
+        serde_json::from_str(s).unwrap_or(serde_json::json!({}))
+    } else {
+        args
+    };
+
+    Some((name.to_string(), args))
+}
+
+/// Parse the custom arrow syntax used by some Ollama models:
+/// `{tool => "name", args => {--key "value"}}` or `{tool => "name", args => {"key":"value"}}`
+fn parse_arrow_syntax_tool_call(
+    text: &str,
+    tool_names: &[&str],
+) -> Option<(String, serde_json::Value)> {
+    // Extract tool name: look for `tool => "name"` or `tool=>"name"`
+    let tool_marker_pos = text.find("tool")?;
+    let after_tool = &text[tool_marker_pos + 4..];
+    // Skip whitespace and `=>`
+    let after_arrow = after_tool.trim_start();
+    let after_arrow = after_arrow.strip_prefix("=>")?;
+    let after_arrow = after_arrow.trim_start();
+
+    // Extract quoted tool name
+    let tool_name = if let Some(stripped) = after_arrow.strip_prefix('"') {
+        let end_quote = stripped.find('"')?;
+        &stripped[..end_quote]
+    } else {
+        // Unquoted: take until comma, whitespace, or '}'
+        let end = after_arrow
+            .find(|c: char| c == ',' || c == '}' || c.is_whitespace())
+            .unwrap_or(after_arrow.len());
+        &after_arrow[..end]
+    };
+
+    if tool_name.is_empty() || !tool_names.contains(&tool_name) {
+        return None;
+    }
+
+    // Extract args: look for `args => {` or `args=>{`
+    let args_value = if let Some(args_pos) = text.find("args") {
+        let after_args = &text[args_pos + 4..];
+        let after_args = after_args.trim_start();
+        let after_args = after_args.strip_prefix("=>")?;
+        let after_args = after_args.trim_start();
+
+        if after_args.starts_with('{') {
+            // Try standard JSON parse first
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(after_args) {
+                v
+            } else {
+                // Parse `--key "value"` / `--key value` style args
+                parse_dash_dash_args(after_args)
+            }
+        } else {
+            serde_json::json!({})
+        }
+    } else {
+        serde_json::json!({})
+    };
+
+    Some((tool_name.to_string(), args_value))
+}
+
+/// Parse `{--key "value", --flag}` or `{--command "ls -F /"}` style arguments
+/// into a JSON object.
+fn parse_dash_dash_args(text: &str) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+
+    // Strip outer braces — find matching close brace
+    let inner = if text.starts_with('{') {
+        let mut depth = 0;
+        let mut end = text.len();
+        for (i, c) in text.char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        text[1..end].trim()
+    } else {
+        text.trim()
+    };
+
+    // Parse --key "value" or --key value pairs
+    let mut remaining = inner;
+    while let Some(dash_pos) = remaining.find("--") {
+        remaining = &remaining[dash_pos + 2..];
+
+        // Extract key: runs until whitespace, '=', '"', or end
+        let key_end = remaining
+            .find(|c: char| c.is_whitespace() || c == '=' || c == '"')
+            .unwrap_or(remaining.len());
+        let key = &remaining[..key_end];
+        if key.is_empty() {
+            continue;
+        }
+        remaining = &remaining[key_end..];
+        remaining = remaining.trim_start();
+
+        // Skip optional '='
+        if remaining.starts_with('=') {
+            remaining = remaining[1..].trim_start();
+        }
+
+        // Extract value
+        if remaining.starts_with('"') {
+            // Quoted value — find closing quote
+            if let Some(end_quote) = remaining[1..].find('"') {
+                let value = &remaining[1..1 + end_quote];
+                map.insert(
+                    key.to_string(),
+                    serde_json::Value::String(value.to_string()),
+                );
+                remaining = &remaining[2 + end_quote..];
+            } else {
+                // Unclosed quote — take rest
+                let value = &remaining[1..];
+                map.insert(
+                    key.to_string(),
+                    serde_json::Value::String(value.to_string()),
+                );
+                break;
+            }
+        } else {
+            // Unquoted value — take until next --, comma, }, or end
+            let val_end = remaining
+                .find([',', '}'])
+                .or_else(|| remaining.find("--"))
+                .unwrap_or(remaining.len());
+            let value = remaining[..val_end].trim();
+            if !value.is_empty() {
+                map.insert(
+                    key.to_string(),
+                    serde_json::Value::String(value.to_string()),
+                );
+            } else {
+                // Flag with no value — set to true
+                map.insert(key.to_string(), serde_json::Value::Bool(true));
+            }
+            remaining = &remaining[val_end..];
+        }
+
+        // Skip comma separator
+        remaining = remaining.trim_start();
+        if remaining.starts_with(',') {
+            remaining = remaining[1..].trim_start();
+        }
+    }
+
+    serde_json::Value::Object(map)
+}
+
+/// Try to parse a bare JSON object as a tool call.
+/// The JSON must have a "name"/"function"/"tool" field matching a known tool.
+fn try_parse_bare_json_tool_call(
+    text: &str,
+    tool_names: &[&str],
+) -> Option<(String, serde_json::Value)> {
+    // Find the end of this JSON object by counting braces
+    let mut depth = 0;
+    let mut end = 0;
+    for (i, c) in text.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = i + 1;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    if end == 0 {
+        return None;
+    }
+
+    parse_json_tool_call_object(&text[..end], tool_names)
 }
 
 #[cfg(test)]
@@ -2990,14 +3573,13 @@ mod tests {
                         id: "tool_1".to_string(),
                         name: "fake_tool".to_string(),
                         input: serde_json::json!({"query": "test"}),
-                        thought_signature: None,
+                        provider_metadata: None,
                     }],
                     stop_reason: StopReason::ToolUse,
                     tool_calls: vec![ToolCall {
                         id: "tool_1".to_string(),
                         name: "fake_tool".to_string(),
                         input: serde_json::json!({"query": "test"}),
-                        thought_signature: None,
                     }],
                     usage: TokenUsage {
                         input_tokens: 10,
@@ -3053,6 +3635,7 @@ mod tests {
             Ok(CompletionResponse {
                 content: vec![ContentBlock::Text {
                     text: "Hello from the agent!".to_string(),
+                    provider_metadata: None,
                 }],
                 stop_reason: StopReason::EndTurn,
                 tool_calls: vec![],
@@ -3099,6 +3682,7 @@ mod tests {
             None, // hooks
             None, // context_window_tokens
             None, // process_manager
+            None, // user_content_blocks
         )
         .await
         .expect("Loop should complete without error");
@@ -3151,6 +3735,7 @@ mod tests {
             None, // hooks
             None, // context_window_tokens
             None, // process_manager
+            None, // user_content_blocks
         )
         .await
         .expect("Loop should complete without error");
@@ -3203,6 +3788,7 @@ mod tests {
             None, // hooks
             None, // context_window_tokens
             None, // process_manager
+            None, // user_content_blocks
         )
         .await
         .expect("Loop should complete without error");
@@ -3248,6 +3834,7 @@ mod tests {
             None, // hooks
             None, // context_window_tokens
             None, // process_manager
+            None, // user_content_blocks
         )
         .await
         .expect("Streaming loop should complete without error");
@@ -3301,6 +3888,7 @@ mod tests {
                 Ok(CompletionResponse {
                     content: vec![ContentBlock::Text {
                         text: "Recovered after retry!".to_string(),
+                        provider_metadata: None,
                     }],
                     stop_reason: StopReason::EndTurn,
                     tool_calls: vec![],
@@ -3370,6 +3958,7 @@ mod tests {
             None,
             None, // context_window_tokens
             None, // process_manager
+            None, // user_content_blocks
         )
         .await
         .expect("Loop should recover via retry");
@@ -3416,6 +4005,7 @@ mod tests {
             None,
             None, // context_window_tokens
             None, // process_manager
+            None, // user_content_blocks
         )
         .await
         .expect("Loop should complete with fallback");
@@ -3470,6 +4060,7 @@ mod tests {
             None, // hooks
             None, // context_window_tokens
             None, // process_manager
+            None, // user_content_blocks
         )
         .await
         .expect("Streaming loop should complete without error");
@@ -3816,6 +4407,467 @@ mod tests {
         assert_eq!(calls.len(), 1);
     }
 
+    // --- Pattern 6: [TOOL_CALL]...[/TOOL_CALL] tests (issue #354) ---
+
+    #[test]
+    fn test_recover_tool_call_block_json() {
+        let tools = vec![ToolDefinition {
+            name: "shell_exec".into(),
+            description: "Execute shell command".into(),
+            input_schema: serde_json::json!({}),
+            defer_loading: false,
+        }];
+        let text = "[TOOL_CALL]\n{\"name\": \"shell_exec\", \"arguments\": {\"command\": \"ls -la\"}}\n[/TOOL_CALL]";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell_exec");
+        assert_eq!(calls[0].input["command"], "ls -la");
+    }
+
+    #[test]
+    fn test_recover_tool_call_block_arrow_syntax() {
+        let tools = vec![ToolDefinition {
+            name: "shell_exec".into(),
+            description: "Execute shell command".into(),
+            input_schema: serde_json::json!({}),
+            defer_loading: false,
+        }];
+        // Exact format from issue #354
+        let text = "[TOOL_CALL]\n{tool => \"shell_exec\", args => {\n--command \"ls -F /\"\n}}\n[/TOOL_CALL]";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell_exec");
+        assert_eq!(calls[0].input["command"], "ls -F /");
+    }
+
+    #[test]
+    fn test_recover_tool_call_block_unknown_tool() {
+        let tools = vec![ToolDefinition {
+            name: "shell_exec".into(),
+            description: "Execute".into(),
+            input_schema: serde_json::json!({}),
+            defer_loading: false,
+        }];
+        let text = "[TOOL_CALL]\n{\"name\": \"hack_system\", \"arguments\": {\"cmd\": \"rm -rf /\"}}\n[/TOOL_CALL]";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn test_recover_tool_call_block_multiple() {
+        let tools = vec![
+            ToolDefinition {
+                name: "shell_exec".into(),
+                description: "Execute".into(),
+                input_schema: serde_json::json!({}),
+                defer_loading: false,
+            },
+            ToolDefinition {
+                name: "file_read".into(),
+                description: "Read".into(),
+                input_schema: serde_json::json!({}),
+                defer_loading: false,
+            },
+        ];
+        let text = "[TOOL_CALL]\n{\"name\": \"shell_exec\", \"arguments\": {\"command\": \"ls\"}}\n[/TOOL_CALL]\nSome text.\n[TOOL_CALL]\n{\"name\": \"file_read\", \"arguments\": {\"path\": \"/tmp/test.txt\"}}\n[/TOOL_CALL]";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "shell_exec");
+        assert_eq!(calls[1].name, "file_read");
+    }
+
+    #[test]
+    fn test_recover_tool_call_block_unclosed() {
+        let tools = vec![ToolDefinition {
+            name: "shell_exec".into(),
+            description: "Execute".into(),
+            input_schema: serde_json::json!({}),
+            defer_loading: false,
+        }];
+        // Unclosed [TOOL_CALL] — pattern 6 skips it, but pattern 8 (bare JSON)
+        // still finds the valid JSON tool call object.
+        let text = "[TOOL_CALL]\n{\"name\": \"shell_exec\", \"arguments\": {\"command\": \"ls\"}}";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 1, "Bare JSON fallback should recover this");
+        assert_eq!(calls[0].name, "shell_exec");
+    }
+
+    // --- Pattern 7: <tool_call>JSON</tool_call> tests (Qwen3, issue #332) ---
+
+    #[test]
+    fn test_recover_tool_call_xml_basic() {
+        let tools = vec![ToolDefinition {
+            name: "shell_exec".into(),
+            description: "Execute".into(),
+            input_schema: serde_json::json!({}),
+            defer_loading: false,
+        }];
+        let text = "<tool_call>\n{\"name\": \"shell_exec\", \"arguments\": {\"command\": \"ls -la\"}}\n</tool_call>";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell_exec");
+        assert_eq!(calls[0].input["command"], "ls -la");
+    }
+
+    #[test]
+    fn test_recover_tool_call_xml_with_surrounding_text() {
+        let tools = vec![ToolDefinition {
+            name: "web_search".into(),
+            description: "Search".into(),
+            input_schema: serde_json::json!({}),
+            defer_loading: false,
+        }];
+        let text = "I'll search for that.\n\n<tool_call>\n{\"name\": \"web_search\", \"arguments\": {\"query\": \"rust async\"}}\n</tool_call>\n\nLet me get results.";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "web_search");
+        assert_eq!(calls[0].input["query"], "rust async");
+    }
+
+    #[test]
+    fn test_recover_tool_call_xml_function_field() {
+        let tools = vec![ToolDefinition {
+            name: "file_read".into(),
+            description: "Read".into(),
+            input_schema: serde_json::json!({}),
+            defer_loading: false,
+        }];
+        let text = "<tool_call>{\"function\": \"file_read\", \"arguments\": {\"path\": \"/etc/hosts\"}}</tool_call>";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "file_read");
+    }
+
+    #[test]
+    fn test_recover_tool_call_xml_parameters_field() {
+        let tools = vec![ToolDefinition {
+            name: "web_fetch".into(),
+            description: "Fetch".into(),
+            input_schema: serde_json::json!({}),
+            defer_loading: false,
+        }];
+        let text = "<tool_call>{\"name\": \"web_fetch\", \"parameters\": {\"url\": \"https://example.com\"}}</tool_call>";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "web_fetch");
+        assert_eq!(calls[0].input["url"], "https://example.com");
+    }
+
+    #[test]
+    fn test_recover_tool_call_xml_stringified_args() {
+        let tools = vec![ToolDefinition {
+            name: "shell_exec".into(),
+            description: "Execute".into(),
+            input_schema: serde_json::json!({}),
+            defer_loading: false,
+        }];
+        let text = "<tool_call>{\"name\": \"shell_exec\", \"arguments\": \"{\\\"command\\\": \\\"pwd\\\"}\"}</tool_call>";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell_exec");
+        assert_eq!(calls[0].input["command"], "pwd");
+    }
+
+    #[test]
+    fn test_recover_tool_call_xml_unknown_tool() {
+        let tools = vec![ToolDefinition {
+            name: "shell_exec".into(),
+            description: "Execute".into(),
+            input_schema: serde_json::json!({}),
+            defer_loading: false,
+        }];
+        let text = "<tool_call>{\"name\": \"hack_system\", \"arguments\": {\"cmd\": \"rm -rf /\"}}</tool_call>";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn test_recover_tool_call_xml_multiple() {
+        let tools = vec![
+            ToolDefinition {
+                name: "shell_exec".into(),
+                description: "Execute".into(),
+                input_schema: serde_json::json!({}),
+                defer_loading: false,
+            },
+            ToolDefinition {
+                name: "web_search".into(),
+                description: "Search".into(),
+                input_schema: serde_json::json!({}),
+                defer_loading: false,
+            },
+        ];
+        let text = "<tool_call>{\"name\": \"shell_exec\", \"arguments\": {\"command\": \"ls\"}}</tool_call>\n<tool_call>{\"name\": \"web_search\", \"arguments\": {\"query\": \"rust\"}}</tool_call>";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "shell_exec");
+        assert_eq!(calls[1].name, "web_search");
+    }
+
+    // --- Pattern 8: Bare JSON tool call object tests ---
+
+    #[test]
+    fn test_recover_bare_json_tool_call() {
+        let tools = vec![ToolDefinition {
+            name: "shell_exec".into(),
+            description: "Execute".into(),
+            input_schema: serde_json::json!({}),
+            defer_loading: false,
+        }];
+        let text = "I'll run that: {\"name\": \"shell_exec\", \"arguments\": {\"command\": \"ls -la\"}}";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell_exec");
+        assert_eq!(calls[0].input["command"], "ls -la");
+    }
+
+    #[test]
+    fn test_recover_bare_json_no_false_positive() {
+        let tools = vec![ToolDefinition {
+            name: "shell_exec".into(),
+            description: "Execute".into(),
+            input_schema: serde_json::json!({}),
+            defer_loading: false,
+        }];
+        let text = "The config looks like {\"debug\": true, \"level\": \"info\"}";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn test_recover_bare_json_skipped_when_tags_found() {
+        let tools = vec![ToolDefinition {
+            name: "shell_exec".into(),
+            description: "Execute".into(),
+            input_schema: serde_json::json!({}),
+            defer_loading: false,
+        }];
+        let text = "<function=shell_exec>{\"command\":\"ls\"}</function> {\"name\": \"shell_exec\", \"arguments\": {\"command\": \"pwd\"}}";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].input["command"], "ls");
+    }
+
+    // --- Pattern 9: XML-attribute style <function name="..." parameters="..." /> ---
+
+    #[test]
+    fn test_recover_xml_attribute_basic() {
+        let tools = vec![ToolDefinition {
+            name: "web_search".into(),
+            description: "Search".into(),
+            input_schema: serde_json::json!({}),
+            defer_loading: false,
+        }];
+        let text = r#"<function name="web_search" parameters="{&quot;query&quot;: &quot;best crypto 2024&quot;}" />"#;
+        let calls = recover_text_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "web_search");
+        assert_eq!(calls[0].input["query"], "best crypto 2024");
+    }
+
+    #[test]
+    fn test_recover_xml_attribute_unknown_tool() {
+        let tools = vec![ToolDefinition {
+            name: "web_search".into(),
+            description: "Search".into(),
+            input_schema: serde_json::json!({}),
+            defer_loading: false,
+        }];
+        let text = r#"<function name="unknown_tool" parameters="{&quot;x&quot;: 1}" />"#;
+        let calls = recover_text_tool_calls(text, &tools);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn test_recover_xml_attribute_non_selfclosing() {
+        let tools = vec![ToolDefinition {
+            name: "shell_exec".into(),
+            description: "Execute".into(),
+            input_schema: serde_json::json!({}),
+            defer_loading: false,
+        }];
+        let text = r#"<function name="shell_exec" parameters="{&quot;command&quot;: &quot;ls&quot;}"></function>"#;
+        let calls = recover_text_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell_exec");
+    }
+
+    // --- Pattern 10: <|plugin|>...<|endofblock|> tests ---
+
+    #[test]
+    fn test_recover_plugin_block() {
+        let tools = vec![ToolDefinition {
+            name: "web_search".into(),
+            description: "Search".into(),
+            input_schema: serde_json::json!({}),
+            defer_loading: false,
+        }];
+        let text = "<|plugin|>\n{\"name\": \"web_search\", \"arguments\": {\"query\": \"rust\"}}\n<|endofblock|>";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "web_search");
+        assert_eq!(calls[0].input["query"], "rust");
+    }
+
+    #[test]
+    fn test_recover_plugin_block_unknown_tool() {
+        let tools = vec![ToolDefinition {
+            name: "web_search".into(),
+            description: "Search".into(),
+            input_schema: serde_json::json!({}),
+            defer_loading: false,
+        }];
+        let text = "<|plugin|>\n{\"name\": \"hack\", \"arguments\": {\"cmd\": \"rm\"}}\n<|endofblock|>";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert!(calls.is_empty());
+    }
+
+    // --- Pattern 11: Action/Action Input tests ---
+
+    #[test]
+    fn test_recover_action_input() {
+        let tools = vec![ToolDefinition {
+            name: "web_search".into(),
+            description: "Search".into(),
+            input_schema: serde_json::json!({}),
+            defer_loading: false,
+        }];
+        let text = "Action: web_search\nAction Input: {\"query\": \"rust programming\"}";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "web_search");
+        assert_eq!(calls[0].input["query"], "rust programming");
+    }
+
+    #[test]
+    fn test_recover_action_input_unknown_tool() {
+        let tools = vec![ToolDefinition {
+            name: "web_search".into(),
+            description: "Search".into(),
+            input_schema: serde_json::json!({}),
+            defer_loading: false,
+        }];
+        let text = "Action: unknown_tool\nAction Input: {\"key\": \"value\"}";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert!(calls.is_empty());
+    }
+
+    // --- Pattern 12: name + JSON on next line tests ---
+
+    #[test]
+    fn test_recover_name_json_nextline() {
+        let tools = vec![ToolDefinition {
+            name: "shell_exec".into(),
+            description: "Execute".into(),
+            input_schema: serde_json::json!({}),
+            defer_loading: false,
+        }];
+        let text = "shell_exec\n{\"command\": \"ls -la\"}";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell_exec");
+        assert_eq!(calls[0].input["command"], "ls -la");
+    }
+
+    #[test]
+    fn test_recover_name_json_nextline_unknown() {
+        let tools = vec![ToolDefinition {
+            name: "shell_exec".into(),
+            description: "Execute".into(),
+            input_schema: serde_json::json!({}),
+            defer_loading: false,
+        }];
+        let text = "unknown_tool\n{\"command\": \"ls\"}";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert!(calls.is_empty());
+    }
+
+    // --- Pattern 13: <tool_use> tests ---
+
+    #[test]
+    fn test_recover_tool_use_block() {
+        let tools = vec![ToolDefinition {
+            name: "web_search".into(),
+            description: "Search".into(),
+            input_schema: serde_json::json!({}),
+            defer_loading: false,
+        }];
+        let text = "<tool_use>{\"name\": \"web_search\", \"arguments\": {\"query\": \"test\"}}</tool_use>";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "web_search");
+    }
+
+    #[test]
+    fn test_recover_tool_use_block_unknown() {
+        let tools = vec![ToolDefinition {
+            name: "web_search".into(),
+            description: "Search".into(),
+            input_schema: serde_json::json!({}),
+            defer_loading: false,
+        }];
+        let text = "<tool_use>{\"name\": \"hack\", \"arguments\": {\"cmd\": \"rm\"}}</tool_use>";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert!(calls.is_empty());
+    }
+
+    // --- Helper function tests ---
+
+    #[test]
+    fn test_parse_dash_dash_args_basic() {
+        let result = parse_dash_dash_args("{--command \"ls -F /\"}");
+        assert_eq!(result["command"], "ls -F /");
+    }
+
+    #[test]
+    fn test_parse_dash_dash_args_multiple() {
+        let result = parse_dash_dash_args("{--file \"test.txt\", --verbose}");
+        assert_eq!(result["file"], "test.txt");
+        assert_eq!(result["verbose"], true);
+    }
+
+    #[test]
+    fn test_parse_dash_dash_args_unquoted_value() {
+        let result = parse_dash_dash_args("{--count 5}");
+        assert_eq!(result["count"], "5");
+    }
+
+    #[test]
+    fn test_parse_json_tool_call_object_standard() {
+        let tool_names = vec!["shell_exec"];
+        let result = parse_json_tool_call_object(
+            "{\"name\": \"shell_exec\", \"arguments\": {\"command\": \"ls\"}}",
+            &tool_names,
+        );
+        assert!(result.is_some());
+        let (name, args) = result.unwrap();
+        assert_eq!(name, "shell_exec");
+        assert_eq!(args["command"], "ls");
+    }
+
+    #[test]
+    fn test_parse_json_tool_call_object_function_field() {
+        let tool_names = vec!["web_fetch"];
+        let result = parse_json_tool_call_object(
+            "{\"function\": \"web_fetch\", \"parameters\": {\"url\": \"https://x.com\"}}",
+            &tool_names,
+        );
+        assert!(result.is_some());
+        let (name, args) = result.unwrap();
+        assert_eq!(name, "web_fetch");
+        assert_eq!(args["url"], "https://x.com");
+    }
+
+    #[test]
+    fn test_parse_json_tool_call_object_unknown_tool() {
+        let tool_names = vec!["shell_exec"];
+        let result = parse_json_tool_call_object(
+            "{\"name\": \"unknown\", \"arguments\": {}}",
+            &tool_names,
+        );
+        assert!(result.is_none());
+    }
+
     // --- End-to-end integration test: text-as-tool-call recovery through agent loop ---
 
     /// Mock driver that simulates a Groq/Llama model outputting tool calls as text.
@@ -3845,6 +4897,7 @@ mod tests {
                 Ok(CompletionResponse {
                     content: vec![ContentBlock::Text {
                         text: r#"Let me search for that. <function=web_search>{"query":"rust async"}</function>"#.to_string(),
+                        provider_metadata: None,
                     }],
                     stop_reason: StopReason::EndTurn,
                     tool_calls: vec![], // BUG: no tool_calls!
@@ -3858,6 +4911,7 @@ mod tests {
                 Ok(CompletionResponse {
                     content: vec![ContentBlock::Text {
                         text: "Based on the search results, Rust async is great!".to_string(),
+                        provider_metadata: None,
                     }],
                     stop_reason: StopReason::EndTurn,
                     tool_calls: vec![],
@@ -3920,6 +4974,7 @@ mod tests {
             None, // hooks
             None, // context_window_tokens
             None, // process_manager
+            None, // user_content_blocks
         )
         .await
         .expect("Agent loop should complete");
@@ -3986,6 +5041,7 @@ mod tests {
             None,
             None,
             None,
+            None, // user_content_blocks
         )
         .await
         .expect("Normal loop should complete");
@@ -4048,6 +5104,7 @@ mod tests {
             None, // hooks
             None, // context_window_tokens
             None, // process_manager
+            None, // user_content_blocks
         )
         .await
         .expect("Streaming loop should complete");

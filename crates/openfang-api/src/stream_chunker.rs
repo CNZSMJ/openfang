@@ -140,9 +140,21 @@ impl StreamChunker {
 }
 
 /// Find the last occurrence of a pattern within a byte range.
+///
+/// Both `range.start` and `range.end` are clamped to the nearest valid UTF-8
+/// char boundary so that slicing never panics on multi-byte content.
 fn find_last_in_range(text: &str, pattern: &str, range: &std::ops::Range<usize>) -> Option<usize> {
-    let start = openfang_types::truncate_str(text, range.start).len();
-    let end = openfang_types::truncate_str(text, range.end.min(text.len())).len();
+    let len = text.len();
+    // Clamp end to text length and walk back to a char boundary
+    let mut end = range.end.min(len);
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    // Walk start forward to the nearest char boundary (never past end)
+    let mut start = range.start.min(end);
+    while start < end && !text.is_char_boundary(start) {
+        start += 1;
+    }
     if start >= end {
         return None;
     }

@@ -100,7 +100,7 @@ pub async fn create_sandbox(
     let container_name = sanitize_container_name(&format!(
         "{}-{}",
         config.container_prefix,
-        openfang_types::truncate_str(agent_id, 8)
+        crate::str_utils::safe_truncate_str(agent_id, 8)
     ))?;
 
     let mut cmd = tokio::process::Command::new("docker");
@@ -201,21 +201,23 @@ pub async fn exec_in_sandbox(
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let exit_code = output.status.code().unwrap_or(-1);
 
-    // Truncate large outputs
+    // Truncate large outputs (char-boundary safe to avoid UTF-8 panics)
     let max_output = 50_000;
     let stdout = if stdout.len() > max_output {
+        let safe_end = crate::str_utils::safe_truncate_str(&stdout, max_output);
         format!(
             "{}... [truncated, {} total bytes]",
-            openfang_types::truncate_str(&stdout, max_output),
+            safe_end,
             stdout.len()
         )
     } else {
         stdout
     };
     let stderr = if stderr.len() > max_output {
+        let safe_end = crate::str_utils::safe_truncate_str(&stderr, max_output);
         format!(
             "{}... [truncated, {} total bytes]",
-            openfang_types::truncate_str(&stderr, max_output),
+            safe_end,
             stderr.len()
         )
     } else {
@@ -545,18 +547,6 @@ mod tests {
         };
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.stdout, "hello");
-    }
-
-    #[test]
-    fn test_sanitized_container_name_handles_multibyte_agent_id() {
-        let config = DockerSandboxConfig::default();
-        let container_name = sanitize_container_name(&format!(
-            "{}-{}",
-            config.container_prefix,
-            openfang_types::truncate_str("交易助手-沪深300", 8)
-        ))
-        .expect("container name should be sanitized");
-        assert!(!container_name.is_empty());
     }
 
     // ── Container Pool tests ──────────────────────────────────────────

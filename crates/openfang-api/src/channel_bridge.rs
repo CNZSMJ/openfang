@@ -51,6 +51,7 @@ use openfang_channels::mumble::MumbleAdapter;
 use openfang_channels::ntfy::NtfyAdapter;
 use openfang_channels::webhook::WebhookAdapter;
 use openfang_kernel::OpenFangKernel;
+use openfang_runtime::str_utils::safe_truncate_str;
 use openfang_types::agent::AgentId;
 use openfang_types::inbound::InboundMessage;
 use std::sync::Arc;
@@ -59,7 +60,7 @@ use tracing::{error, info, warn};
 
 fn short_id(id: impl std::fmt::Display) -> String {
     let id = id.to_string();
-    openfang_types::truncate_str(&id, 8).to_string()
+    safe_truncate_str(&id, 8).to_string()
 }
 
 /// Wraps `OpenFangKernel` to implement `ChannelBridgeHandle`.
@@ -87,6 +88,33 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
         let result = self
             .kernel
             .send_message_rich(agent_id, message)
+            .await
+            .map_err(|e| format!("{e}"))?;
+        Ok(result.response)
+    }
+
+    async fn send_message_with_blocks(
+        &self,
+        agent_id: AgentId,
+        blocks: Vec<openfang_types::message::ContentBlock>,
+    ) -> Result<String, String> {
+        // Extract text for the message parameter (used for memory recall / logging)
+        let text: String = blocks
+            .iter()
+            .filter_map(|b| match b {
+                openfang_types::message::ContentBlock::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let text = if text.is_empty() {
+            "[Image]".to_string()
+        } else {
+            text
+        };
+        let result = self
+            .kernel
+            .send_message_with_blocks(agent_id, &text, blocks)
             .await
             .map_err(|e| format!("{e}"))?;
         Ok(result.response)
@@ -469,6 +497,7 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
         msg
     }
 
+    #[allow(dead_code)]
     async fn manage_schedule_text(&self, action: &str, args: &[String]) -> String {
         match action {
             "add" => {
@@ -557,6 +586,19 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
                             } => message.clone(),
                             openfang_types::scheduler::CronAction::SystemEvent { text } => {
                                 text.clone()
+                            }
+                            openfang_types::scheduler::CronAction::WorkflowRun {
+                                workflow_id,
+                                input,
+                                ..
+                            } => {
+                                format!(
+                                    "Run workflow {workflow_id}{}",
+                                    input
+                                        .as_deref()
+                                        .map(|i| format!(" with input: {i}"))
+                                        .unwrap_or_default()
+                                )
                             }
                         };
                         match self.kernel.send_message(j.agent_id, &message).await {
@@ -665,9 +707,18 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
             ));
         }
         self.kernel
-            .set_agent_model(agent_id, model)
+            .set_agent_model(agent_id, model, None)
             .map_err(|e| format!("{e}"))?;
-        Ok(format!("Model switched to: {model}"))
+        // Read back resolved model+provider from registry
+        let entry = self
+            .kernel
+            .registry
+            .get(agent_id)
+            .ok_or_else(|| "Agent not found after model switch".to_string())?;
+        Ok(format!(
+            "Model switched to: {} (provider: {})",
+            entry.manifest.model.model, entry.manifest.model.provider
+        ))
     }
 
     async fn stop_run(&self, agent_id: AgentId) -> Result<String, String> {
@@ -793,6 +844,7 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
         recipient: &str,
         success: bool,
         error: Option<&str>,
+        thread_id: Option<&str>,
     ) {
         let receipt = if success {
             openfang_kernel::DeliveryTracker::sent_receipt(channel, recipient)
@@ -805,9 +857,13 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
         };
         self.kernel.delivery_tracker.record(agent_id, receipt);
 
-        // Persist last channel for cron CronDelivery::LastChannel
+        // Persist last channel for cron CronDelivery::LastChannel.
+        // Include thread_id when present so forum-topic context survives restarts.
         if success {
-            let kv_val = serde_json::json!({"channel": channel, "recipient": recipient});
+            let mut kv_val = serde_json::json!({"channel": channel, "recipient": recipient});
+            if let Some(tid) = thread_id {
+                kv_val["thread_id"] = serde_json::json!(tid);
+            }
             let _ = self
                 .kernel
                 .memory
@@ -953,16 +1009,40 @@ fn parse_trigger_pattern(s: &str) -> Option<openfang_kernel::triggers::TriggerPa
     }
 }
 
-/// Read a token from an env var, returning None with a warning if missing/empty.
-fn read_token(env_var: &str, adapter_name: &str) -> Option<String> {
-    match std::env::var(env_var) {
+/// Resolve a token: if the value looks like an actual secret (contains `:`,
+/// starts with `xoxb-`, `xapp-`, `sk-`, etc.), use it directly.
+/// Otherwise treat it as an env var name and look it up.
+fn read_token(env_var_or_token: &str, adapter_name: &str) -> Option<String> {
+    // Heuristic: actual tokens contain `:` (Telegram, Discord) or start with
+    // known prefixes. Env var names are uppercase ASCII identifiers.
+    let looks_like_token = env_var_or_token.contains(':')
+        || env_var_or_token.starts_with("xoxb-")
+        || env_var_or_token.starts_with("xapp-")
+        || env_var_or_token.starts_with("sk-")
+        || env_var_or_token.starts_with("Bearer ");
+
+    if looks_like_token {
+        warn!(
+            "{adapter_name}: config field contains what looks like an actual token \
+             rather than an env var name — using it directly. \
+             Tip: store the token in an env var and use the var name instead for security."
+        );
+        return Some(env_var_or_token.to_string());
+    }
+
+    match std::env::var(env_var_or_token) {
         Ok(t) if !t.is_empty() => Some(t),
         Ok(_) => {
-            warn!("{adapter_name} bot token env var '{env_var}' is empty, skipping");
+            warn!(
+                "{adapter_name} token env var '{env_var_or_token}' is set but empty, skipping"
+            );
             None
         }
         Err(_) => {
-            warn!("{adapter_name} bot token env var '{env_var}' not set, skipping");
+            warn!(
+                "{adapter_name} token env var '{env_var_or_token}' not set, skipping. \
+                 Set it with: export {env_var_or_token}=<your-token>"
+            );
             None
         }
     }
@@ -1050,6 +1130,7 @@ pub async fn start_channel_bridge_with_config(
                 tg_config.allowed_users.clone(),
                 tg_config.allowed_chats.clone(),
                 poll_interval,
+                tg_config.api_url.clone(),
                 tg_config.max_image_bytes,
             ));
             adapters.push((adapter, tg_config.default_agent.clone()));
@@ -1078,6 +1159,8 @@ pub async fn start_channel_bridge_with_config(
                     app_token,
                     bot_token,
                     sl_config.allowed_channels.clone(),
+                    sl_config.auto_thread_reply,
+                    sl_config.thread_ttl_hours,
                 ));
                 adapters.push((adapter, sl_config.default_agent.clone()));
             }
