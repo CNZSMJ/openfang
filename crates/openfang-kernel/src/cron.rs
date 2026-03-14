@@ -322,7 +322,15 @@ pub fn compute_next_run_after(
     after: chrono::DateTime<Utc>,
 ) -> chrono::DateTime<Utc> {
     match schedule {
-        CronSchedule::At { at } => *at,
+        CronSchedule::At { at } => {
+            if after >= *at {
+                // If the time has passed, advance to the same time tomorrow
+                // to fulfill the "recurring at this time" intuition if one_shot is false.
+                *at + Duration::days(1)
+            } else {
+                *at
+            }
+        }
         CronSchedule::Every { every_secs } => after + Duration::seconds(*every_secs as i64),
         CronSchedule::Cron { expr, tz: _ } => {
             // Convert standard 5/6-field cron to 7-field for the `cron` crate.

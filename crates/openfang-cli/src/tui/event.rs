@@ -400,6 +400,7 @@ pub fn spawn_daemon_stream(
                                 id: String::new(),
                                 name: tool.to_string(),
                                 input: json["input"].clone(),
+                                thought_signature: None,
                             }));
                         }
                     }

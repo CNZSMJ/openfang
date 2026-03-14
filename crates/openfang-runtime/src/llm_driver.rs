@@ -109,6 +109,7 @@ pub enum StreamEvent {
         id: String,
         name: String,
         input: serde_json::Value,
+        thought_signature: Option<String>,
     },
     /// Incremental thinking/reasoning text.
     ThinkingDelta { text: String },
@@ -228,6 +229,7 @@ mod tests {
                 id: "t1".to_string(),
                 name: "web_search".to_string(),
                 input: serde_json::json!({"query": "rust"}),
+                thought_signature: None,
             },
             StreamEvent::ContentComplete {
                 stop_reason: StopReason::EndTurn,
