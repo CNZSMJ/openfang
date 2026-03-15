@@ -33,6 +33,24 @@ struct ProviderDefaults {
     key_required: bool,
 }
 
+fn normalize_minimax_anthropic_base_url(base_url: String) -> String {
+    let trimmed = base_url.trim_end_matches('/').to_string();
+
+    if trimmed.ends_with("/anthropic/v1") {
+        return trimmed.trim_end_matches("/v1").to_string();
+    }
+
+    // Accept OpenAI-style MiniMax URLs from old configs and map them to Anthropic mode.
+    if (trimmed.contains("api.minimaxi.") || trimmed.contains("api.minimax."))
+        && trimmed.ends_with("/v1")
+    {
+        let root = trimmed.trim_end_matches("/v1");
+        return format!("{root}/anthropic");
+    }
+
+    trimmed
+}
+
 /// Get defaults for known providers.
 fn provider_defaults(provider: &str) -> Option<ProviderDefaults> {
     match provider {
@@ -263,7 +281,7 @@ pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmErr
         return Ok(Arc::new(anthropic::AnthropicDriver::new(api_key, base_url)));
     }
 
-    // MiniMax uses OpenAI-compatible chat completions endpoints.
+    // MiniMax uses Anthropic-compatible messages endpoints.
     if provider == "minimax" {
         let api_key = config
             .api_key
@@ -272,11 +290,12 @@ pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmErr
             .ok_or_else(|| {
                 LlmError::MissingApiKey("Set MINIMAX_API_KEY environment variable".to_string())
             })?;
-        let base_url = config
+        let raw_base_url = config
             .base_url
             .clone()
             .unwrap_or_else(|| MINIMAX_BASE_URL.to_string());
-        return Ok(Arc::new(openai::OpenAIDriver::new(api_key, base_url)));
+        let base_url = normalize_minimax_anthropic_base_url(raw_base_url);
+        return Ok(Arc::new(anthropic::AnthropicDriver::new(api_key, base_url)));
     }
 
     // Gemini uses a different API format — special case
@@ -715,8 +734,30 @@ mod tests {
         assert!(d.key_required);
     }
 
+    #[test]
+    fn test_normalize_minimax_anthropic_base_url_known_variants() {
+        assert_eq!(
+            normalize_minimax_anthropic_base_url("https://api.minimaxi.com/anthropic".to_string()),
+            "https://api.minimaxi.com/anthropic"
+        );
+        assert_eq!(
+            normalize_minimax_anthropic_base_url(
+                "https://api.minimaxi.com/anthropic/v1".to_string()
+            ),
+            "https://api.minimaxi.com/anthropic"
+        );
+        assert_eq!(
+            normalize_minimax_anthropic_base_url("https://api.minimaxi.com/v1".to_string()),
+            "https://api.minimaxi.com/anthropic"
+        );
+        assert_eq!(
+            normalize_minimax_anthropic_base_url("http://127.0.0.1:18080".to_string()),
+            "http://127.0.0.1:18080"
+        );
+    }
+
     #[tokio::test]
-    async fn test_minimax_uses_openai_chat_completions_endpoint() {
+    async fn test_minimax_uses_anthropic_messages_endpoint() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test listener");
@@ -729,7 +770,7 @@ mod tests {
             let request = String::from_utf8_lossy(&buf[..n]).to_string();
             let first_line = request.lines().next().unwrap_or_default().to_string();
 
-            let body = r#"{"id":"chatcmpl-test","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+            let body = r#"{"content":[{"type":"text","text":"OK"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#;
             let response = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
                 body.len(),
@@ -746,7 +787,7 @@ mod tests {
         let driver = create_driver(&DriverConfig {
             provider: "minimax".to_string(),
             api_key: Some("test-key".to_string()),
-            base_url: Some(format!("http://{addr}")),
+            base_url: Some(format!("http://{addr}/anthropic/v1")),
             skip_permissions: true,
         })
         .expect("create minimax driver");
@@ -771,7 +812,7 @@ mod tests {
 
         let request_line = server.await.expect("server join");
         assert!(
-            request_line.starts_with("POST /chat/completions "),
+            request_line.starts_with("POST /anthropic/v1/messages "),
             "unexpected request line: {request_line}"
         );
     }
