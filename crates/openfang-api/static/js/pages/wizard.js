@@ -172,6 +172,16 @@ function buildTemplateScaffold(template, agentName) {
   };
 }
 
+/** Escape a string for use inside TOML triple-quoted strings ("""\n...\n"""). */
+function wizardTomlMultilineEscape(s) {
+  return s.replace(/\\/g, '\\\\').replace(/"""/g, '""\\"');
+}
+
+/** Escape a string for use inside a TOML basic (single-line) string ("..."). */
+function wizardTomlBasicEscape(s) {
+  return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n').replace(/\r/g, '\\r').replace(/\t/g, '\\t');
+}
+
 function wizardPage() {
   return {
     step: 1,
@@ -501,10 +511,12 @@ function wizardPage() {
     },
 
     get canGoNext() {
-      if (this.step === 2) return this.keySaved || this.hasConfiguredProvider;
+      if (this.step === 2) return this.keySaved || this.hasConfiguredProvider || this.claudeCodeDetected;
       if (this.step === 3) return this.agentName.trim().length > 0;
       return true;
     },
+
+    claudeCodeDetected: false,
 
     get hasConfiguredProvider() {
       var self = this;
@@ -627,6 +639,28 @@ function wizardPage() {
       this.testingProvider = false;
     },
 
+    async detectClaudeCode() {
+      this.testingProvider = true;
+      this.testResult = null;
+      try {
+        var result = await OpenFangAPI.post('/api/providers/claude-code/test', {});
+        this.testResult = result;
+        if (result.status === 'ok') {
+          this.claudeCodeDetected = true;
+          this.keySaved = true;
+          this.setupSummary.provider = 'Claude Code';
+          OpenFangToast.success('Claude Code detected (' + (result.latency_ms || '?') + 'ms)');
+        } else {
+          this.testResult = { status: 'error', error: 'Claude Code CLI not detected' };
+          OpenFangToast.error('Claude Code CLI not detected. Make sure you\'ve run: npm install -g @anthropic-ai/claude-code && claude auth');
+        }
+      } catch(e) {
+        this.testResult = { status: 'error', error: e.message };
+        OpenFangToast.error('Claude Code CLI not detected. Make sure you\'ve run: npm install -g @anthropic-ai/claude-code && claude auth');
+      }
+      this.testingProvider = false;
+    },
+
     // ── Step 3: Agent creation ──
 
     selectTemplate(index) {
@@ -656,13 +690,14 @@ function wizardPage() {
       }
 
       var toml = '';
-      toml += 'name = "' + name.replace(/"/g, '\\"') + '"\n';
-      toml += 'description = "' + tpl.description.replace(/"/g, '\\"') + '"\n';
+      toml += 'name = "' + wizardTomlBasicEscape(name) + '"\n';
+      toml += 'description = "' + wizardTomlBasicEscape(tpl.description) + '"\n';
       toml += 'module = "builtin:chat"\n';
       toml += 'profile = "' + tpl.profile + '"\n\n';
       toml += '[model]\nprovider = "' + provider + '"\n';
       toml += 'model = "' + model + '"\n';
-      toml += 'system_prompt = """\n' + thinSystemPrompt(name, tpl.role_summary) + '\n"""\n';
+      var systemPrompt = tpl.system_prompt || thinSystemPrompt(name, tpl.role_summary);
+      toml += 'system_prompt = """\n' + wizardTomlMultilineEscape(systemPrompt) + '\n"""\n';
 
       this.creatingAgent = true;
       try {
@@ -691,7 +726,7 @@ function wizardPage() {
         gemini: 'gemini-2.5-flash',
         groq: 'llama-3.3-70b-versatile',
         deepseek: 'deepseek-chat',
-        openrouter: 'openrouter/auto',
+        openrouter: 'openrouter/google/gemini-2.5-flash',
         mistral: 'mistral-large-latest',
         together: 'meta-llama/Llama-3-70b-chat-hf',
         fireworks: 'accounts/fireworks/models/llama-v3p1-70b-instruct',

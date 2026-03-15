@@ -2,7 +2,7 @@
 //!
 //! Contains drivers for Anthropic Claude, Google Gemini, OpenAI-compatible APIs, and more.
 //! Supports: Anthropic, Gemini, OpenAI, Groq, OpenRouter, DeepSeek, Together,
-//! Mistral, Fireworks, Ollama, vLLM, and any OpenAI-compatible endpoint.
+//! Mistral, Fireworks, Ollama, vLLM, Chutes.ai, and any OpenAI-compatible endpoint.
 
 pub mod anthropic;
 pub mod claude_code;
@@ -10,13 +10,14 @@ pub mod copilot;
 pub mod fallback;
 pub mod gemini;
 pub mod openai;
+pub mod qwen_code;
 
 use crate::llm_driver::{DriverConfig, LlmDriver, LlmError};
 use openfang_types::model_catalog::{
-    AI21_BASE_URL, ANTHROPIC_BASE_URL, CEREBRAS_BASE_URL, COHERE_BASE_URL, DEEPSEEK_BASE_URL,
-    FIREWORKS_BASE_URL, GEMINI_BASE_URL, GROQ_BASE_URL, HUGGINGFACE_BASE_URL, LEMONADE_BASE_URL,
-    LMSTUDIO_BASE_URL,
-    MINIMAX_BASE_URL, MISTRAL_BASE_URL, MOONSHOT_BASE_URL, OLLAMA_BASE_URL, OPENAI_BASE_URL,
+    AI21_BASE_URL, ANTHROPIC_BASE_URL, CEREBRAS_BASE_URL, CHUTES_BASE_URL, COHERE_BASE_URL,
+    DEEPSEEK_BASE_URL, FIREWORKS_BASE_URL, GEMINI_BASE_URL, GROQ_BASE_URL, HUGGINGFACE_BASE_URL,
+    KIMI_CODING_BASE_URL, LEMONADE_BASE_URL, LMSTUDIO_BASE_URL, MINIMAX_BASE_URL,
+    MISTRAL_BASE_URL, MOONSHOT_BASE_URL, OLLAMA_BASE_URL, OPENAI_BASE_URL,
     OPENROUTER_BASE_URL, PERPLEXITY_BASE_URL, QIANFAN_BASE_URL, QWEN_BASE_URL,
     REPLICATE_BASE_URL, SAMBANOVA_BASE_URL, TOGETHER_BASE_URL, VENICE_BASE_URL, VLLM_BASE_URL,
     VOLCENGINE_BASE_URL, VOLCENGINE_CODING_BASE_URL, XAI_BASE_URL, ZAI_BASE_URL,
@@ -30,6 +31,24 @@ struct ProviderDefaults {
     api_key_env: &'static str,
     /// If true, the API key is required (error if missing).
     key_required: bool,
+}
+
+fn normalize_minimax_anthropic_base_url(base_url: String) -> String {
+    let trimmed = base_url.trim_end_matches('/').to_string();
+
+    if trimmed.ends_with("/anthropic/v1") {
+        return trimmed.trim_end_matches("/v1").to_string();
+    }
+
+    // Accept OpenAI-style MiniMax URLs from old configs and map them to Anthropic mode.
+    if (trimmed.contains("api.minimaxi.") || trimmed.contains("api.minimax."))
+        && trimmed.ends_with("/v1")
+    {
+        let root = trimmed.trim_end_matches("/v1");
+        return format!("{root}/anthropic");
+    }
+
+    trimmed
 }
 
 /// Get defaults for known providers.
@@ -150,9 +169,14 @@ fn provider_defaults(provider: &str) -> Option<ProviderDefaults> {
             api_key_env: "",
             key_required: false,
         }),
-        "moonshot" | "kimi" => Some(ProviderDefaults {
+        "moonshot" | "kimi" | "kimi2" => Some(ProviderDefaults {
             base_url: MOONSHOT_BASE_URL,
             api_key_env: "MOONSHOT_API_KEY",
+            key_required: true,
+        }),
+        "kimi_coding" => Some(ProviderDefaults {
+            base_url: KIMI_CODING_BASE_URL,
+            api_key_env: "KIMI_API_KEY",
             key_required: true,
         }),
         "qwen" | "dashscope" | "model_studio" => Some(ProviderDefaults {
@@ -175,7 +199,7 @@ fn provider_defaults(provider: &str) -> Option<ProviderDefaults> {
             api_key_env: "ZHIPU_API_KEY",
             key_required: true,
         }),
-        "zai" => Some(ProviderDefaults {
+        "zai" | "z.ai" => Some(ProviderDefaults {
             base_url: ZAI_BASE_URL,
             api_key_env: "ZHIPU_API_KEY",
             key_required: true,
@@ -198,6 +222,11 @@ fn provider_defaults(provider: &str) -> Option<ProviderDefaults> {
         "volcengine_coding" => Some(ProviderDefaults {
             base_url: VOLCENGINE_CODING_BASE_URL,
             api_key_env: "VOLCENGINE_API_KEY",
+            key_required: true,
+        }),
+        "chutes" => Some(ProviderDefaults {
+            base_url: CHUTES_BASE_URL,
+            api_key_env: "CHUTES_API_KEY",
             key_required: true,
         }),
         "venice" => Some(ProviderDefaults {
@@ -231,6 +260,7 @@ fn provider_defaults(provider: &str) -> Option<ProviderDefaults> {
 /// - `huggingface` — Hugging Face Inference API
 /// - `xai` — xAI (Grok)
 /// - `replicate` — Replicate
+/// - `chutes` — Chutes.ai (serverless open-source model inference)
 /// - Any custom provider with `base_url` set uses OpenAI-compatible format
 pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmError> {
     let provider = config.provider.as_str();
@@ -251,7 +281,7 @@ pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmErr
         return Ok(Arc::new(anthropic::AnthropicDriver::new(api_key, base_url)));
     }
 
-    // MiniMax uses Anthropic API format
+    // MiniMax uses Anthropic-compatible messages endpoints.
     if provider == "minimax" {
         let api_key = config
             .api_key
@@ -260,10 +290,11 @@ pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmErr
             .ok_or_else(|| {
                 LlmError::MissingApiKey("Set MINIMAX_API_KEY environment variable".to_string())
             })?;
-        let base_url = config
+        let raw_base_url = config
             .base_url
             .clone()
             .unwrap_or_else(|| MINIMAX_BASE_URL.to_string());
+        let base_url = normalize_minimax_anthropic_base_url(raw_base_url);
         return Ok(Arc::new(anthropic::AnthropicDriver::new(api_key, base_url)));
     }
 
@@ -308,7 +339,19 @@ pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmErr
     // Claude Code CLI — subprocess-based, no API key needed
     if provider == "claude-code" {
         let cli_path = config.base_url.clone();
-        return Ok(Arc::new(claude_code::ClaudeCodeDriver::new(cli_path)));
+        return Ok(Arc::new(claude_code::ClaudeCodeDriver::new(
+            cli_path,
+            config.skip_permissions,
+        )));
+    }
+
+    // Qwen Code CLI — subprocess-based, uses Qwen OAuth (free tier)
+    if provider == "qwen-code" {
+        let cli_path = config.base_url.clone();
+        return Ok(Arc::new(qwen_code::QwenCodeDriver::new(
+            cli_path,
+            config.skip_permissions,
+        )));
     }
 
     // GitHub Copilot — wraps OpenAI-compatible driver with automatic token exchange.
@@ -334,6 +377,22 @@ pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmErr
         )));
     }
 
+    // Kimi for Code — Anthropic-compatible endpoint
+    if provider == "kimi_coding" {
+        let api_key = config
+            .api_key
+            .clone()
+            .or_else(|| std::env::var("KIMI_API_KEY").ok())
+            .ok_or_else(|| {
+                LlmError::MissingApiKey("Set KIMI_API_KEY environment variable".to_string())
+            })?;
+        let base_url = config
+            .base_url
+            .clone()
+            .unwrap_or_else(|| KIMI_CODING_BASE_URL.to_string());
+        return Ok(Arc::new(anthropic::AnthropicDriver::new(api_key, base_url)));
+    }
+
     // All other providers use OpenAI-compatible format
     if let Some(defaults) = provider_defaults(provider) {
         let api_key = config
@@ -357,13 +416,38 @@ pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmErr
         return Ok(Arc::new(openai::OpenAIDriver::new(api_key, base_url)));
     }
 
-    // Unknown provider — if base_url is set, treat as custom OpenAI-compatible
+    // Unknown provider — if base_url is set, treat as custom OpenAI-compatible.
+    // For custom providers, try the convention {PROVIDER_UPPER}_API_KEY as env var
+    // when no explicit api_key was passed. This lets users just set e.g. NVIDIA_API_KEY
+    // in their environment and use provider = "nvidia" without extra config.
     if let Some(ref base_url) = config.base_url {
-        let api_key = config.api_key.clone().unwrap_or_default();
+        let api_key = config.api_key.clone().unwrap_or_else(|| {
+            let env_var = format!("{}_API_KEY", provider.to_uppercase().replace('-', "_"));
+            std::env::var(&env_var).unwrap_or_default()
+        });
         return Ok(Arc::new(openai::OpenAIDriver::new(
             api_key,
             base_url.clone(),
         )));
+    }
+
+    // No base_url either — last resort: check if the user set an API key env var
+    // using the convention {PROVIDER_UPPER}_API_KEY. If found, use OpenAI-compatible
+    // driver with a default base URL derived from common patterns.
+    {
+        let env_var = format!("{}_API_KEY", provider.to_uppercase().replace('-', "_"));
+        if let Ok(api_key) = std::env::var(&env_var) {
+            if !api_key.is_empty() {
+                return Err(LlmError::Api {
+                    status: 0,
+                    message: format!(
+                        "Provider '{}' has API key ({} is set) but no base_url configured. \
+                         Add base_url to your [default_model] config or set it in [provider_urls].",
+                        provider, env_var
+                    ),
+                });
+            }
+        }
     }
 
     Err(LlmError::Api {
@@ -372,7 +456,7 @@ pub fn create_driver(config: &DriverConfig) -> Result<Arc<dyn LlmDriver>, LlmErr
             "Unknown provider '{}'. Supported: anthropic, gemini, openai, groq, openrouter, \
              deepseek, together, mistral, fireworks, ollama, vllm, lmstudio, perplexity, \
              cohere, ai21, cerebras, sambanova, huggingface, xai, replicate, github-copilot, \
-             venice, codex, claude-code. Or set base_url for a custom OpenAI-compatible endpoint.",
+             chutes, venice, codex, claude-code. Or set base_url for a custom OpenAI-compatible endpoint.",
             provider
         ),
     })
@@ -390,7 +474,7 @@ pub fn detect_available_provider() -> Option<(&'static str, &'static str, &'stat
         ("gemini", "gemini-2.5-flash", "GEMINI_API_KEY"),
         ("groq", "llama-3.3-70b-versatile", "GROQ_API_KEY"),
         ("deepseek", "deepseek-chat", "DEEPSEEK_API_KEY"),
-        ("openrouter", "openrouter/anthropic/claude-sonnet-4", "OPENROUTER_API_KEY"),
+        ("openrouter", "openrouter/google/gemini-2.5-flash", "OPENROUTER_API_KEY"),
         ("mistral", "mistral-large-latest", "MISTRAL_API_KEY"),
         ("together", "meta-llama/Llama-3-70b-chat-hf", "TOGETHER_API_KEY"),
         ("fireworks", "accounts/fireworks/models/llama-v3p1-70b-instruct", "FIREWORKS_API_KEY"),
@@ -439,17 +523,24 @@ pub fn known_providers() -> &'static [&'static str] {
         "minimax",
         "zhipu",
         "zhipu_coding",
+        "zai",
+        "kimi_coding",
         "qianfan",
         "volcengine",
+        "chutes",
         "venice",
         "codex",
         "claude-code",
+        "qwen-code",
     ]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm_driver::CompletionRequest;
+    use openfang_types::message::{Message, MessageContent, Role};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn test_provider_defaults_groq() {
@@ -483,6 +574,7 @@ mod tests {
             provider: "my-custom-llm".to_string(),
             api_key: Some("test".to_string()),
             base_url: Some("http://localhost:9999/v1".to_string()),
+            skip_permissions: true,
         };
         let driver = create_driver(&config);
         assert!(driver.is_ok());
@@ -494,6 +586,7 @@ mod tests {
             provider: "nonexistent".to_string(),
             api_key: None,
             base_url: None,
+            skip_permissions: true,
         };
         let driver = create_driver(&config);
         assert!(driver.is_err());
@@ -536,11 +629,15 @@ mod tests {
         assert!(providers.contains(&"minimax"));
         assert!(providers.contains(&"zhipu"));
         assert!(providers.contains(&"zhipu_coding"));
+        assert!(providers.contains(&"zai"));
+        assert!(providers.contains(&"kimi_coding"));
         assert!(providers.contains(&"qianfan"));
         assert!(providers.contains(&"volcengine"));
+        assert!(providers.contains(&"chutes"));
         assert!(providers.contains(&"codex"));
         assert!(providers.contains(&"claude-code"));
-        assert_eq!(providers.len(), 31);
+        assert!(providers.contains(&"qwen-code"));
+        assert_eq!(providers.len(), 35);
     }
 
     #[test]
@@ -579,5 +676,157 @@ mod tests {
         assert_eq!(d.base_url, "https://api-inference.huggingface.co/v1");
         assert_eq!(d.api_key_env, "HF_API_KEY");
         assert!(d.key_required);
+    }
+
+    #[test]
+    fn test_custom_provider_convention_env_var() {
+        // Set NVIDIA_API_KEY env var, then create a custom "nvidia" provider with base_url.
+        // The driver should pick up the key automatically via convention.
+        let unique_key = "test-nvidia-key-12345";
+        std::env::set_var("NVIDIA_API_KEY", unique_key);
+        let config = DriverConfig {
+            provider: "nvidia".to_string(),
+            api_key: None, // not explicitly passed
+            base_url: Some("https://integrate.api.nvidia.com/v1".to_string()),
+            skip_permissions: true,
+        };
+        let driver = create_driver(&config);
+        assert!(driver.is_ok(), "Custom provider with env var convention should succeed");
+        std::env::remove_var("NVIDIA_API_KEY");
+    }
+
+    #[test]
+    fn test_custom_provider_no_key_no_url_errors() {
+        // Custom provider with neither API key nor base_url should error.
+        let config = DriverConfig {
+            provider: "nvidia".to_string(),
+            api_key: None,
+            base_url: None,
+            skip_permissions: true,
+        };
+        let driver = create_driver(&config);
+        assert!(driver.is_err());
+    }
+
+    #[test]
+    fn test_custom_provider_key_no_url_helpful_error() {
+        // Custom provider with key set (via env) but no base_url should give helpful error.
+        let unique_key = "test-nvidia-key-67890";
+        std::env::set_var("NVIDIA_API_KEY", unique_key);
+        let config = DriverConfig {
+            provider: "nvidia".to_string(),
+            api_key: None,
+            base_url: None,
+            skip_permissions: true,
+        };
+        let result = create_driver(&config);
+        assert!(result.is_err());
+        let err = result.err().unwrap().to_string();
+        assert!(err.contains("base_url"), "Error should mention base_url: {}", err);
+        std::env::remove_var("NVIDIA_API_KEY");
+    }
+
+    #[test]
+    fn test_provider_defaults_kimi_coding() {
+        let d = provider_defaults("kimi_coding").unwrap();
+        assert_eq!(d.base_url, "https://api.kimi.com/coding");
+        assert_eq!(d.api_key_env, "KIMI_API_KEY");
+        assert!(d.key_required);
+    }
+
+    #[test]
+    fn test_normalize_minimax_anthropic_base_url_known_variants() {
+        assert_eq!(
+            normalize_minimax_anthropic_base_url("https://api.minimaxi.com/anthropic".to_string()),
+            "https://api.minimaxi.com/anthropic"
+        );
+        assert_eq!(
+            normalize_minimax_anthropic_base_url(
+                "https://api.minimaxi.com/anthropic/v1".to_string()
+            ),
+            "https://api.minimaxi.com/anthropic"
+        );
+        assert_eq!(
+            normalize_minimax_anthropic_base_url("https://api.minimaxi.com/v1".to_string()),
+            "https://api.minimaxi.com/anthropic"
+        );
+        assert_eq!(
+            normalize_minimax_anthropic_base_url("http://127.0.0.1:18080".to_string()),
+            "http://127.0.0.1:18080"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_minimax_uses_anthropic_messages_endpoint() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("listener local addr");
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept connection");
+            let mut buf = [0u8; 8192];
+            let n = socket.read(&mut buf).await.expect("read request");
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            let first_line = request.lines().next().unwrap_or_default().to_string();
+
+            let body = r#"{"content":[{"type":"text","text":"OK"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+
+            first_line
+        });
+
+        let driver = create_driver(&DriverConfig {
+            provider: "minimax".to_string(),
+            api_key: Some("test-key".to_string()),
+            base_url: Some(format!("http://{addr}/anthropic/v1")),
+            skip_permissions: true,
+        })
+        .expect("create minimax driver");
+
+        let response = driver
+            .complete(CompletionRequest {
+                model: "MiniMax-M2.5".to_string(),
+                messages: vec![Message {
+                    role: Role::User,
+                    content: MessageContent::text("Say OK"),
+                }],
+                tools: vec![],
+                max_tokens: 32,
+                temperature: 0.0,
+                system: None,
+                thinking: None,
+            })
+            .await
+            .expect("minimax completion");
+
+        assert_eq!(response.text(), "OK");
+
+        let request_line = server.await.expect("server join");
+        assert!(
+            request_line.starts_with("POST /anthropic/v1/messages "),
+            "unexpected request line: {request_line}"
+        );
+    }
+
+    #[test]
+    fn test_custom_provider_explicit_key_with_url() {
+        // When api_key is explicitly passed, it should be used regardless of env var.
+        let config = DriverConfig {
+            provider: "my-custom-provider".to_string(),
+            api_key: Some("explicit-key".to_string()),
+            base_url: Some("https://api.example.com/v1".to_string()),
+            skip_permissions: true,
+        };
+        let driver = create_driver(&config);
+        assert!(driver.is_ok());
     }
 }

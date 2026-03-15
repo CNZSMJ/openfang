@@ -264,9 +264,10 @@ function chatPage() {
       if (model.id === this.currentAgent.model_name) { this.showModelSwitcher = false; return; }
       var self = this;
       this.modelSwitching = true;
-      OpenFangAPI.put('/api/agents/' + this.currentAgent.id + '/model', { model: model.id }).then(function() {
-        self.currentAgent.model_name = model.id;
-        self.currentAgent.model_provider = model.provider;
+      OpenFangAPI.put('/api/agents/' + this.currentAgent.id + '/model', { model: model.id }).then(function(resp) {
+        // Use server-resolved model/provider to stay in sync (fixes #387/#466)
+        self.currentAgent.model_name = (resp && resp.model) || model.id;
+        self.currentAgent.model_provider = (resp && resp.provider) || model.provider;
         OpenFangToast.success('Switched to ' + (model.display_name || model.id));
         self.showModelSwitcher = false;
         self.modelSwitching = false;
@@ -421,9 +422,12 @@ function chatPage() {
           if (self.currentAgent) {
             if (cmdArgs) {
               OpenFangAPI.put('/api/agents/' + self.currentAgent.id + '/model', { model: cmdArgs }).then(function(resp) {
-                self.currentAgent.model_name = cmdArgs;
-                if (resp && resp.provider) { self.currentAgent.model_provider = resp.provider; }
-                self.messages.push({ id: ++msgId, role: 'system', text: 'Model switched to: `' + cmdArgs + '`' + (resp && resp.provider ? ' (provider: `' + resp.provider + '`)' : ''), meta: '', tools: [] });
+                // Use server-resolved model/provider (fixes #387/#466)
+                var resolvedModel = (resp && resp.model) || cmdArgs;
+                var resolvedProvider = (resp && resp.provider) || '';
+                self.currentAgent.model_name = resolvedModel;
+                if (resolvedProvider) { self.currentAgent.model_provider = resolvedProvider; }
+                self.messages.push({ id: ++msgId, role: 'system', text: 'Model switched to: `' + resolvedModel + '`' + (resolvedProvider ? ' (provider: `' + resolvedProvider + '`)' : ''), meta: '', tools: [] });
                 self.scrollToBottom();
               }).catch(function(e) { OpenFangToast.error('Model switch failed: ' + e.message); });
             } else {
@@ -646,17 +650,32 @@ function chatPage() {
           // Show tool/phase progress so the user sees the agent is working
           var phaseMsg = this.messages.length ? this.messages[this.messages.length - 1] : null;
           if (phaseMsg && (phaseMsg.thinking || phaseMsg.streaming)) {
-            var detail = data.detail || data.phase || 'Working...';
-            // Context warning: show prominently
+            // Skip phases that have no user-meaningful display text — "streaming"
+            // and "done" are lifecycle signals, not status to show in the chat bubble.
+            if (data.phase === 'streaming' || data.phase === 'done') {
+              break;
+            }
+            // Context warning: show prominently as a separate system message
             if (data.phase === 'context_warning') {
-              this.messages.push({ id: ++msgId, role: 'system', text: detail, meta: '', tools: [] });
+              var cwDetail = data.detail || 'Context limit reached.';
+              this.messages.push({ id: ++msgId, role: 'system', text: cwDetail, meta: '', tools: [] });
             } else if (data.phase === 'thinking' && this.thinkingMode === 'stream') {
               // Stream reasoning tokens to a collapsible panel
               if (!phaseMsg._reasoning) phaseMsg._reasoning = '';
-              phaseMsg._reasoning += (detail || '') + '\n';
+              phaseMsg._reasoning += (data.detail || '') + '\n';
               phaseMsg.text = '<details><summary>Reasoning...</summary>\n\n' + phaseMsg._reasoning + '</details>';
-            } else {
-              phaseMsg.text = detail;
+            } else if (phaseMsg.thinking) {
+              // Only update text on messages still in thinking state (not yet
+              // receiving streamed content) to avoid overwriting accumulated text.
+              var phaseDetail;
+              if (data.phase === 'tool_use') {
+                phaseDetail = 'Using ' + (data.detail || 'tool') + '...';
+              } else if (data.phase === 'thinking') {
+                phaseDetail = 'Thinking...';
+              } else {
+                phaseDetail = data.detail || 'Working...';
+              }
+              phaseMsg.text = phaseDetail;
             }
           }
           this.scrollToBottom();

@@ -27,7 +27,10 @@ impl AnthropicDriver {
         Self {
             api_key: Zeroizing::new(api_key),
             base_url,
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .user_agent(crate::USER_AGENT)
+                .build()
+                .unwrap_or_default(),
         }
     }
 }
@@ -475,7 +478,6 @@ impl LlmDriver for AnthropicDriver {
                                         id: id.clone(),
                                         name: name.clone(),
                                         input,
-                                        thought_signature: None,
                                     })
                                     .await;
                             }
@@ -505,7 +507,7 @@ impl LlmDriver for AnthropicDriver {
             for block in blocks {
                 match block {
                     ContentBlockAccum::Text(text) => {
-                        content.push(ContentBlock::Text { text });
+                        content.push(ContentBlock::Text { text, provider_metadata: None });
                     }
                     ContentBlockAccum::Thinking(thinking) => {
                         content.push(ContentBlock::Thinking { thinking });
@@ -521,13 +523,12 @@ impl LlmDriver for AnthropicDriver {
                             id: id.clone(),
                             name: name.clone(),
                             input: input.clone(),
-                            thought_signature: None,
+                            provider_metadata: None,
                         });
                         tool_calls.push(ToolCall {
                             id,
                             name,
                             input,
-                            thought_signature: None,
                         });
                     }
                 }
@@ -566,7 +567,7 @@ fn convert_message(msg: &Message) -> ApiMessage {
             let api_blocks: Vec<ApiContentBlock> = blocks
                 .iter()
                 .filter_map(|block| match block {
-                    ContentBlock::Text { text } => {
+                    ContentBlock::Text { text, .. } => {
                         Some(ApiContentBlock::Text { text: text.clone() })
                     }
                     ContentBlock::Image { media_type, data } => Some(ApiContentBlock::Image {
@@ -576,9 +577,7 @@ fn convert_message(msg: &Message) -> ApiMessage {
                             data: data.clone(),
                         },
                     }),
-                    ContentBlock::ToolUse {
-                        id, name, input, ..
-                    } => Some(ApiContentBlock::ToolUse {
+                    ContentBlock::ToolUse { id, name, input, .. } => Some(ApiContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),
                         input: input.clone(),
@@ -615,20 +614,19 @@ fn convert_response(api: ApiResponse) -> CompletionResponse {
     for block in api.content {
         match block {
             ResponseContentBlock::Text { text } => {
-                content.push(ContentBlock::Text { text });
+                content.push(ContentBlock::Text { text, provider_metadata: None });
             }
             ResponseContentBlock::ToolUse { id, name, input } => {
                 content.push(ContentBlock::ToolUse {
                     id: id.clone(),
                     name: name.clone(),
                     input: input.clone(),
-                    thought_signature: None,
+                    provider_metadata: None,
                 });
                 tool_calls.push(ToolCall {
                     id,
                     name,
                     input,
-                    thought_signature: None,
                 });
             }
             ResponseContentBlock::Thinking { thinking } => {

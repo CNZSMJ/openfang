@@ -43,13 +43,24 @@ pub async fn request_logging(request: Request<Body>, next: Next) -> Response<Bod
     response
 }
 
+/// Authentication state passed to the auth middleware.
+#[derive(Clone)]
+pub struct AuthState {
+    pub api_key: String,
+    pub auth_enabled: bool,
+    pub session_secret: String,
+}
+
 /// Bearer token authentication middleware.
 ///
-/// When `api_key` is non-empty, requests to non-public endpoints must include
-/// `Authorization: Bearer <api_key>`. If the key is empty, only whitelisted
-/// public endpoints are accessible — all others return 401.
+/// When `api_key` is non-empty (after trimming), requests to non-public
+/// endpoints must include `Authorization: Bearer <api_key>`.
+/// If the key is empty or whitespace-only, auth is disabled entirely
+/// (public/local development mode).
+///
+/// When dashboard auth is enabled, session cookies are also accepted.
 pub async fn auth(
-    axum::extract::State(api_key): axum::extract::State<String>,
+    axum::extract::State(auth_state): axum::extract::State<AuthState>,
     request: Request<Body>,
     next: Next,
 ) -> Response<Body> {
@@ -113,18 +124,23 @@ pub async fn auth(
         || (path == "/api/workflows" && is_get)
         || path == "/api/logs/stream"  // SSE stream, read-only
         || (path.starts_with("/api/cron/") && is_get)
-        || path.starts_with("/api/providers/github-copilot/oauth/");
+        || path.starts_with("/api/providers/github-copilot/oauth/")
+        || path == "/api/auth/login"
+        || path == "/api/auth/logout"
+        || (path == "/api/auth/check" && is_get);
 
     if is_public {
         return next.run(request).await;
     }
 
-    // If no API key configured, skip auth entirely.
-    // Users who don't set api_key accept that all endpoints are open.
-    // To secure the dashboard, set api_key in config.toml.
-    if api_key.is_empty() {
+    // If no API key configured (empty, whitespace-only, or missing), skip auth
+    // entirely. Users who don't set api_key accept that all endpoints are open.
+    // To secure the dashboard, set a non-empty api_key in config.toml.
+    let api_key_trimmed = auth_state.api_key.trim().to_string();
+    if api_key_trimmed.is_empty() && !auth_state.auth_enabled {
         return next.run(request).await;
     }
+    let api_key = api_key_trimmed.as_str();
 
     // Check Authorization: Bearer <token> header, then fallback to X-API-Key
     let bearer_token = request
@@ -170,6 +186,17 @@ pub async fn auth(
         return next.run(request).await;
     }
 
+    // Check session cookie (dashboard login sessions)
+    if auth_state.auth_enabled {
+        if let Some(token) = extract_session_cookie(&request) {
+            if crate::session_auth::verify_session_token(&token, &auth_state.session_secret)
+                .is_some()
+            {
+                return next.run(request).await;
+            }
+        }
+    }
+
     // Determine error message: was a credential provided but wrong, or missing entirely?
     let credential_provided = header_auth.is_some() || query_auth.is_some();
     let error_msg = if credential_provided {
@@ -187,31 +214,53 @@ pub async fn auth(
         .unwrap_or_default()
 }
 
+/// Extract the `openfang_session` cookie value from a request.
+fn extract_session_cookie(request: &Request<Body>) -> Option<String> {
+    request
+        .headers()
+        .get("cookie")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|cookies| {
+            cookies
+                .split(';')
+                .find_map(|c| c.trim().strip_prefix("openfang_session=").map(|v| v.to_string()))
+        })
+}
+
 /// Security headers middleware — applied to ALL API responses.
 pub async fn security_headers(request: Request<Body>, next: Next) -> Response<Body> {
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
-    headers.insert("x-content-type-options", "nosniff".parse().unwrap());
-    headers.insert("x-frame-options", "DENY".parse().unwrap());
-    headers.insert("x-xss-protection", "1; mode=block".parse().unwrap());
+    headers.insert(
+        "x-content-type-options",
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        "x-frame-options",
+        axum::http::HeaderValue::from_static("DENY"),
+    );
+    headers.insert(
+        "x-xss-protection",
+        axum::http::HeaderValue::from_static("1; mode=block"),
+    );
     // All JS/CSS is bundled inline — only external resource is Google Fonts.
     headers.insert(
         "content-security-policy",
-        "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://fonts.gstatic.com; img-src 'self' data: blob:; connect-src 'self' ws://localhost:* ws://127.0.0.1:* wss://localhost:* wss://127.0.0.1:*; font-src 'self' https://fonts.gstatic.com; media-src 'self' blob:; frame-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'self'"
-            .parse()
-            .unwrap(),
+        axum::http::HeaderValue::from_static(
+            "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://fonts.gstatic.com; img-src 'self' data: blob:; connect-src 'self' ws://localhost:* ws://127.0.0.1:* wss://localhost:* wss://127.0.0.1:*; font-src 'self' https://fonts.gstatic.com; media-src 'self' blob:; frame-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'self'",
+        ),
     );
     headers.insert(
         "referrer-policy",
-        "strict-origin-when-cross-origin".parse().unwrap(),
+        axum::http::HeaderValue::from_static("strict-origin-when-cross-origin"),
     );
     headers.insert(
         "cache-control",
-        "no-store, no-cache, must-revalidate".parse().unwrap(),
+        axum::http::HeaderValue::from_static("no-store, no-cache, must-revalidate"),
     );
     headers.insert(
         "strict-transport-security",
-        "max-age=63072000; includeSubDomains".parse().unwrap(),
+        axum::http::HeaderValue::from_static("max-age=63072000; includeSubDomains"),
     );
     response
 }
