@@ -280,18 +280,50 @@
       - 真实回复同时返回 shared probe 对应的 `Alpha launch is blocked on QA signoff.` 与 semantic probe 对应的 `WEIGHT-SEMANTIC-20260315`
       - verifier 的 `~/.openfang/workspaces/memory-weight-verifier-20260315/logs/llm.log` 中，第二轮 `*** MEMORY TRACE` 明确包含：
         - `1. source=shared source_rank=1 source_weight=1.485 tie_break_priority=1 fused_score=0.02434 ... WEIGHT-SHARED-20260315 ...`
-        - `2. source=semantic source_rank=1 source_weight=1.000 tie_break_priority=3 fused_score=0.01639 ... WEIGHT-SEMANTIC-20260315 ...`
+      - `2. source=semantic source_rank=1 source_weight=1.000 tie_break_priority=3 fused_score=0.01639 ... WEIGHT-SEMANTIC-20260315 ...`
       - 这证明 shared governed candidate 已不再只是和 semantic 等权并列，而是会按 query-aware weight / tie-break 在 unified recall 中真实前置
       - `/api/budget` 中 `daily_spend` 从 `0.11647460000000001` 增到 `0.12132120000000002`，`/api/budget/agents` 中 verifier agent 花费为 `0.004846600000000001`
+      - 临时 verifier agent、其 workspace、共享 probe 与关联 DB rows 已在验证后清理；daemon 已按流程停止
+  - 已完成 Phase 2 第五批 fused memory context helper 再下沉：
+    - `openfang-types::memory` 新增统一的跨源 recall composition helper：
+      - `MemoryContextFusionResult`
+      - `rank_semantic_memory_context_candidates`
+      - `rank_governed_memory_context_candidates_for_query`
+      - `build_fused_memory_context_for_query`
+    - semantic memory 的 prompt-time 渲染与去重不再由 runtime 私有实现，已与 governed shared candidate 一起下沉到共享层
+    - governed shared memory 的渲染继续复用上一轮显式 `source_weight` / `tie_break_priority` 规则；runtime 现在直接消费 fused result，而不是自己重新拼 semantic/shared recall
+    - `render_memory_freshness` 与 `render_memory_lifecycle_state` 已提升为 `openfang-types::memory` 的共享导出，供 runtime orchestration / trace 复用
+    - `openfang-runtime::agent_loop` 现在主要保留：
+      - `MEMORY_TRACE` 记录
+      - orchestration signal 组装
+      - prompt 注入
+    - 新增/更新单测覆盖：
+      - semantic candidate 去重与标签渲染改为覆盖共享 helper
+      - governed candidate 的 lifecycle / tag / query-prioritization 改为覆盖共享 helper
+      - fused memory context helper 会稳定返回 shared-first 的跨源融合结果
+  - 已完成本轮 fused memory context helper 验证：
+    - `cargo build --workspace --lib`
+    - `cargo test --workspace`
+    - `cargo clippy --workspace --all-targets -- -D warnings`
+    - `cargo build -p openfang-cli`
+    - live shared helper downshift 验证通过：
+      - 临时创建 `memory-context-helper-verifier-20260315-171345` agent，并通过 memory API 写入 `project.alpha.helper_downshift_status` shared governed probe
+      - 第一轮真实消息注入 `HELPER-DOWNSHIFT-SEMANTIC-20260315-171345`，随后执行 `POST /api/agents/{id}/session/reset` 清空会话上下文，再二次询问 `What is blocking the alpha launch, and what is the onboarding waiver code?`
+      - 第二轮真实回复同时返回 shared probe 对应的 `QA signoff` blocker 与 semantic probe 对应的 `HELPER-DOWNSHIFT-SEMANTIC-20260315-171345`
+      - verifier 的 `~/.openfang/workspaces/memory-context-helper-verifier-20260315-171345/logs/llm.log` 中，第二轮 `*** MEMORY TRACE` 明确包含：
+        - `1. source=shared source_rank=1 source_weight=1.559 tie_break_priority=0 fused_score=0.02556 ... HELPER-DOWNSHIFT-SHARED-20260315-171345 ...`
+        - `2. source=semantic source_rank=1 source_weight=1.000 tie_break_priority=3 fused_score=0.01639 ... HELPER-DOWNSHIFT-SEMANTIC-20260315-171345 ...`
+      - 同一轮 `Relevant recalled memories` 也同时出现 shared / semantic 两条条目，说明 helper 下沉后真实 prompt 注入没有断线
+      - `/api/budget` 中 `daily_spend` 从 `0.11647460000000001` 增到 `0.12204940000000002`，`/api/budget/agents` 中 verifier agent 花费为 `0.0055748`
       - 临时 verifier agent、其 workspace、共享 probe 与关联 DB rows 已在验证后清理；daemon 已按流程停止
 
 ## 进行中
 
-- 继续推进 Phase 2：在 prompt-time fusion helper 与 source-weight / tie-break 已下沉到 `openfang-types` 后，评估是否继续把 semantic candidate 组装与 unified recall 接口再下沉一层，避免 runtime 仍保留半套 recall composition。
+- 继续推进 Phase 2：shared retrieval helper 已覆盖 semantic/shared candidate 组装与 fused recall 选择，下一步评估是否把最终 memory context message composition / trace payload 也进一步收口到共享 retrieval contract。
 
 ## 下一步动作
 
-- 评估是否要把 semantic candidate 的格式化/选择与 shared candidate 一起继续下沉成更统一的 retrieval helper / API，而不是由 runtime 保留最后一层 recall composition。
+- 评估是否要把最终 `Relevant recalled memories` 文本组装与 trace payload schema 一起下沉成统一 retrieval output，而不是由 runtime 保留最后一层 prompt/message composition。
 - 继续观察 governed metadata 的显式 `source_weight` / `tie_break_priority` 是否需要引入更多 lifecycle bucket 或 namespace/kind-specific weight，而不只是当前 query/lifecycle/promotion 三元组合。
 - 评估是否要把 `MEMORY_TRACE` 的 source/fused 信息进一步同步到 structured telemetry / tracing fields，而不只写入 `llm.log` 文本。
 - 在切换电脑或结束一轮实质性工作前，持续更新本文件。
@@ -299,7 +331,7 @@
 ## 风险与阻塞
 
 - 当前现有 agent 的 tool-call 路径存在两类既有兼容问题：`assistant` 的 gemini path 仍有 `thought_signature` 错误，`Researcher` 的 MiniMax path 也出现了 tool-result id 不匹配；因此本轮 dashboard cleanup live LLM verification 同样改用临时无工具 MiniMax verifier agent 完成。
-- Phase 2 虽然已经把 fusion policy 下沉到了 `openfang-types::memory`，但 semantic candidate 的渲染与最终 recall message composition 仍在 runtime；距离“底层统一 retrieval 接口”还有一层没有收口。
+- Phase 2 虽然已经把 semantic/shared candidate 渲染与 fused recall 选择下沉到了 `openfang-types::memory`，但最终 prompt 注入文本与 trace payload 仍在 runtime；距离“底层统一 retrieval contract”还有最后一层没有收口。
 - 如果后续启动工作时不先读取本文件，分支纪律和连续性可能重新漂移。
 
 ## 验证清单
