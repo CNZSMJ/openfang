@@ -21,10 +21,9 @@ use openfang_types::agent::AgentId;
 use openfang_types::agent::AgentManifest;
 use openfang_types::error::{OpenFangError, OpenFangResult};
 use openfang_types::memory::{
-    Memory, MemoryFilter, MemoryFreshness, MemoryLifecycleState, MemorySource,
     select_governed_memory_prompt_candidates_for_query,
-    summarize_memory_cleanup_for_orchestration,
-    summarize_governed_memory_orchestration_for_query,
+    summarize_governed_memory_orchestration_for_query, summarize_memory_cleanup_for_orchestration,
+    Memory, MemoryFilter, MemoryFreshness, MemoryLifecycleState, MemorySource,
 };
 use openfang_types::message::{
     ContentBlock, Message, MessageContent, Role, StopReason, TokenUsage,
@@ -159,11 +158,7 @@ fn load_recent_session_summaries_from_entries(
 
             Some((
                 key.clone(),
-                format!(
-                    "{}: {}",
-                    key,
-                    openfang_types::truncate_str(rendered, 320)
-                ),
+                format!("{}: {}", key, openfang_types::truncate_str(rendered, 320)),
             ))
         })
         .collect();
@@ -205,49 +200,49 @@ fn format_governed_memory_candidates(
         limit,
         Some(user_message),
     )
-        .into_iter()
-        .filter_map(|candidate| {
-            let rendered_value = match candidate.value {
-                serde_json::Value::String(text) => text,
-                other => serde_json::to_string(&other).ok()?,
-            };
-            let rendered_value = rendered_value.trim();
-            if rendered_value.is_empty() {
-                return None;
-            }
+    .into_iter()
+    .filter_map(|candidate| {
+        let rendered_value = match candidate.value {
+            serde_json::Value::String(text) => text,
+            other => serde_json::to_string(&other).ok()?,
+        };
+        let rendered_value = rendered_value.trim();
+        if rendered_value.is_empty() {
+            return None;
+        }
 
-            let mut qualifiers = vec![
-                format!("kind={}", candidate.metadata.kind),
-                format!(
-                    "freshness={}",
-                    render_memory_freshness(&candidate.metadata.freshness)
-                ),
-                format!(
-                    "lifecycle={}",
-                    render_memory_lifecycle_state(candidate.lifecycle.state)
-                ),
-            ];
-            if !candidate.metadata.tags.is_empty() {
-                qualifiers.push(format!("tags={}", candidate.metadata.tags.join(",")));
-            }
-            if candidate.lifecycle.promotion_candidate {
-                qualifiers.push("promotion_candidate".to_string());
-            }
+        let mut qualifiers = vec![
+            format!("kind={}", candidate.metadata.kind),
+            format!(
+                "freshness={}",
+                render_memory_freshness(&candidate.metadata.freshness)
+            ),
+            format!(
+                "lifecycle={}",
+                render_memory_lifecycle_state(candidate.lifecycle.state)
+            ),
+        ];
+        if !candidate.metadata.tags.is_empty() {
+            qualifiers.push(format!("tags={}", candidate.metadata.tags.join(",")));
+        }
+        if candidate.lifecycle.promotion_candidate {
+            qualifiers.push("promotion_candidate".to_string());
+        }
 
-            let rendered = format!(
-                "[{}] ({}) {}",
-                candidate.key,
-                qualifiers.join(", "),
-                openfang_types::truncate_str(rendered_value, 240)
-            );
+        let rendered = format!(
+            "[{}] ({}) {}",
+            candidate.key,
+            qualifiers.join(", "),
+            openfang_types::truncate_str(rendered_value, 240)
+        );
 
-            if seen.insert(rendered.clone()) {
-                Some(rendered)
-            } else {
-                None
-            }
-        })
-        .collect()
+        if seen.insert(rendered.clone()) {
+            Some(rendered)
+        } else {
+            None
+        }
+    })
+    .collect()
 }
 
 fn format_governed_memory_orchestration_signals(
@@ -315,19 +310,19 @@ fn format_memory_cleanup_orchestration_signals(
 
     for signal in snapshot.legacy_repairs {
         match signal.action {
-            openfang_types::memory::MemoryCleanupAction::MigrateLegacyKey => rendered.push(
-                format!(
+            openfang_types::memory::MemoryCleanupAction::MigrateLegacyKey => {
+                rendered.push(format!(
                     "Run memory_cleanup before reuse: migrate legacy key [{}] to [{}]",
                     signal.key,
-                    signal.canonical_key.unwrap_or_else(|| "unknown".to_string())
-                ),
-            ),
-            openfang_types::memory::MemoryCleanupAction::DeleteLegacyKey => rendered.push(
-                format!(
-                    "Run memory_cleanup before reuse: delete duplicate legacy key [{}]",
-                    signal.key
-                ),
-            ),
+                    signal
+                        .canonical_key
+                        .unwrap_or_else(|| "unknown".to_string())
+                ))
+            }
+            openfang_types::memory::MemoryCleanupAction::DeleteLegacyKey => rendered.push(format!(
+                "Run memory_cleanup before reuse: delete duplicate legacy key [{}]",
+                signal.key
+            )),
             _ => {}
         }
     }
@@ -496,11 +491,11 @@ pub async fn run_agent_loop_with_session_message(
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
 
-    // Recall relevant memories — prefer vector similarity search when embedding driver is available
+    // Recall relevant memories — prefer hybrid recall when an embedding driver is available
     let _memories = if let Some(emb) = embedding_driver {
         match emb.embed_one(user_message).await {
             Ok(query_vec) => {
-                debug!("Using vector recall (dims={})", query_vec.len());
+                debug!("Using hybrid recall (dims={})", query_vec.len());
                 memory
                     .recall_with_embedding_async(
                         user_message,
@@ -515,7 +510,7 @@ pub async fn run_agent_loop_with_session_message(
                     .unwrap_or_default()
             }
             Err(e) => {
-                warn!("Embedding recall failed, falling back to text search: {e}");
+                warn!("Embedding recall failed, falling back to text-only search: {e}");
                 memory
                     .recall(
                         user_message,
@@ -680,8 +675,12 @@ pub async fn run_agent_loop_with_session_message(
         debug!(iteration, "Agent loop iteration");
 
         // Context overflow recovery pipeline (replaces emergency_trim_messages)
-        let recovery =
-            recover_from_overflow(&mut messages, &system_prompt, tool_runner.visible_tools(), ctx_window);
+        let recovery = recover_from_overflow(
+            &mut messages,
+            &system_prompt,
+            tool_runner.visible_tools(),
+            ctx_window,
+        );
         if recovery == RecoveryStage::FinalError {
             warn!("Context overflow unrecoverable — suggest /reset or /compact");
         }
@@ -724,7 +723,10 @@ pub async fn run_agent_loop_with_session_message(
         // Log LLM Output
         let output_log = format!(
             "Response: {}\nTool Calls: {:?}\nStop Reason: {:?}\nUsage: {:?}",
-            response.text(), response.tool_calls, response.stop_reason, response.usage
+            response.text(),
+            response.tool_calls,
+            response.stop_reason,
+            response.usage
         );
         log_llm_event(workspace_root, "OUTPUT", &api_model, &output_log).await;
 
@@ -738,8 +740,7 @@ pub async fn run_agent_loop_with_session_message(
             StopReason::EndTurn | StopReason::StopSequence
         ) && response.tool_calls.is_empty()
         {
-            let recovered =
-                recover_text_tool_calls(&response.text(), tool_runner.visible_tools());
+            let recovered = recover_text_tool_calls(&response.text(), tool_runner.visible_tools());
             if !recovered.is_empty() {
                 info!(
                     count = recovered.len(),
@@ -798,8 +799,8 @@ pub async fn run_agent_loop_with_session_message(
                 // try once more before accepting the empty result.
                 // Triggers on first call OR when input_tokens=0 (silently failed request).
                 if text.trim().is_empty() && response.tool_calls.is_empty() {
-                    let is_silent_failure = response.usage.input_tokens == 0
-                        && response.usage.output_tokens == 0;
+                    let is_silent_failure =
+                        response.usage.input_tokens == 0 && response.usage.output_tokens == 0;
                     if iteration == 0 || is_silent_failure {
                         warn!(
                             agent = %manifest.name,
@@ -1087,10 +1088,13 @@ pub async fn run_agent_loop_with_session_message(
                 }
 
                 // Detect approval denials and inject guidance to prevent infinite retry loops
-                let denial_count = tool_result_blocks.iter().filter(|b| {
-                    matches!(b, ContentBlock::ToolResult { content, is_error: true, .. }
+                let denial_count = tool_result_blocks
+                    .iter()
+                    .filter(|b| {
+                        matches!(b, ContentBlock::ToolResult { content, is_error: true, .. }
                         if content.contains("requires human approval and was denied"))
-                }).count();
+                    })
+                    .count();
                 if denial_count > 0 {
                     tool_result_blocks.push(ContentBlock::Text {
                         text: format!(
@@ -1104,9 +1108,10 @@ pub async fn run_agent_loop_with_session_message(
                 }
 
                 // Detect tool errors and inject guidance to prevent fabrication
-                let error_count = tool_result_blocks.iter().filter(|b| {
-                    matches!(b, ContentBlock::ToolResult { is_error: true, .. })
-                }).count();
+                let error_count = tool_result_blocks
+                    .iter()
+                    .filter(|b| matches!(b, ContentBlock::ToolResult { is_error: true, .. }))
+                    .count();
                 let non_denial_errors = error_count.saturating_sub(denial_count);
                 if non_denial_errors > 0 {
                     tool_result_blocks.push(ContentBlock::Text {
@@ -1478,11 +1483,11 @@ pub async fn run_agent_loop_streaming(
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
 
-    // Recall relevant memories — prefer vector similarity search when embedding driver is available
+    // Recall relevant memories — prefer hybrid recall when an embedding driver is available
     let _memories = if let Some(emb) = embedding_driver {
         match emb.embed_one(user_message).await {
             Ok(query_vec) => {
-                debug!("Using vector recall (streaming, dims={})", query_vec.len());
+                debug!("Using hybrid recall (streaming, dims={})", query_vec.len());
                 memory
                     .recall_with_embedding_async(
                         user_message,
@@ -1497,7 +1502,7 @@ pub async fn run_agent_loop_streaming(
                     .unwrap_or_default()
             }
             Err(e) => {
-                warn!("Embedding recall failed (streaming), falling back to text search: {e}");
+                warn!("Embedding recall failed (streaming), falling back to text-only search: {e}");
                 memory
                     .recall(
                         user_message,
@@ -1729,7 +1734,10 @@ pub async fn run_agent_loop_streaming(
         // Log LLM Output (streaming)
         let output_log = format!(
             "Response (concatenated): {}\nTool Calls: {:?}\nStop Reason: {:?}\nUsage: {:?}",
-            response.text(), response.tool_calls, response.stop_reason, response.usage
+            response.text(),
+            response.tool_calls,
+            response.stop_reason,
+            response.usage
         );
         log_llm_event(workspace_root, "OUTPUT", &api_model, &output_log).await;
 
@@ -1742,8 +1750,7 @@ pub async fn run_agent_loop_streaming(
             StopReason::EndTurn | StopReason::StopSequence
         ) && response.tool_calls.is_empty()
         {
-            let recovered =
-                recover_text_tool_calls(&response.text(), tool_runner.visible_tools());
+            let recovered = recover_text_tool_calls(&response.text(), tool_runner.visible_tools());
             if !recovered.is_empty() {
                 info!(
                     count = recovered.len(),
@@ -1800,8 +1807,8 @@ pub async fn run_agent_loop_streaming(
                 // try once more before accepting the empty result.
                 // Triggers on first call OR when input_tokens=0 (silently failed request).
                 if text.trim().is_empty() && response.tool_calls.is_empty() {
-                    let is_silent_failure = response.usage.input_tokens == 0
-                        && response.usage.output_tokens == 0;
+                    let is_silent_failure =
+                        response.usage.input_tokens == 0 && response.usage.output_tokens == 0;
                     if iteration == 0 || is_silent_failure {
                         warn!(
                             agent = %manifest.name,
@@ -2099,10 +2106,13 @@ pub async fn run_agent_loop_streaming(
                 }
 
                 // Detect approval denials and inject guidance to prevent infinite retry loops
-                let denial_count = tool_result_blocks.iter().filter(|b| {
-                    matches!(b, ContentBlock::ToolResult { content, is_error: true, .. }
+                let denial_count = tool_result_blocks
+                    .iter()
+                    .filter(|b| {
+                        matches!(b, ContentBlock::ToolResult { content, is_error: true, .. }
                         if content.contains("requires human approval and was denied"))
-                }).count();
+                    })
+                    .count();
                 if denial_count > 0 {
                     tool_result_blocks.push(ContentBlock::Text {
                         text: format!(
@@ -2116,9 +2126,10 @@ pub async fn run_agent_loop_streaming(
                 }
 
                 // Detect tool errors and inject guidance to prevent fabrication
-                let error_count = tool_result_blocks.iter().filter(|b| {
-                    matches!(b, ContentBlock::ToolResult { is_error: true, .. })
-                }).count();
+                let error_count = tool_result_blocks
+                    .iter()
+                    .filter(|b| matches!(b, ContentBlock::ToolResult { is_error: true, .. }))
+                    .count();
                 let non_denial_errors = error_count.saturating_sub(denial_count);
                 if non_denial_errors > 0 {
                     tool_result_blocks.push(ContentBlock::Text {
@@ -2521,9 +2532,7 @@ fn recover_text_tool_calls(text: &str, available_tools: &[ToolDefinition]) -> Ve
         }
 
         // Custom arrow syntax: {tool => "name", args => {--key "value"}}
-        if let Some((tool_name, input)) =
-            parse_arrow_syntax_tool_call(inner, &tool_names)
-        {
+        if let Some((tool_name, input)) = parse_arrow_syntax_tool_call(inner, &tool_names) {
             if !calls
                 .iter()
                 .any(|c| c.name == tool_name && c.input == input)
@@ -2578,15 +2587,17 @@ fn recover_text_tool_calls(text: &str, available_tools: &[ToolDefinition]) -> Ve
     {
         use regex_lite::Regex;
         // Match both self-closing <function ... /> and <function ...></function>
-        let re = Regex::new(
-            r#"<function\s+name="([^"]+)"\s+parameters="([^"]*)"[^/]*/?>"#
-        ).unwrap();
+        let re =
+            Regex::new(r#"<function\s+name="([^"]+)"\s+parameters="([^"]*)"[^/]*/?>"#).unwrap();
         for caps in re.captures_iter(text) {
             let tool_name = caps.get(1).unwrap().as_str();
             let raw_params = caps.get(2).unwrap().as_str();
 
             if !tool_names.contains(&tool_name) {
-                warn!(tool = tool_name, "XML-attribute tool call for unknown tool — skipping");
+                warn!(
+                    tool = tool_name,
+                    "XML-attribute tool call for unknown tool — skipping"
+                );
                 continue;
             }
 
@@ -2606,11 +2617,17 @@ fn recover_text_tool_calls(text: &str, available_tools: &[ToolDefinition]) -> Ve
                 }
             };
 
-            if calls.iter().any(|c| c.name == tool_name && c.input == input) {
+            if calls
+                .iter()
+                .any(|c| c.name == tool_name && c.input == input)
+            {
                 continue;
             }
 
-            info!(tool = tool_name, "Recovered XML-attribute tool call → synthetic ToolUse");
+            info!(
+                tool = tool_name,
+                "Recovered XML-attribute tool call → synthetic ToolUse"
+            );
             calls.push(ToolCall {
                 id: format!("recovered_{}", uuid::Uuid::new_v4()),
                 name: tool_name.to_string(),
@@ -2634,8 +2651,14 @@ fn recover_text_tool_calls(text: &str, available_tools: &[ToolDefinition]) -> Ve
         search_from = after_tag + close_offset + close_tag.len();
 
         if let Some((tool_name, input)) = parse_json_tool_call_object(inner, &tool_names) {
-            if !calls.iter().any(|c| c.name == tool_name && c.input == input) {
-                info!(tool = tool_name.as_str(), "Recovered tool call from <|plugin|> block");
+            if !calls
+                .iter()
+                .any(|c| c.name == tool_name && c.input == input)
+            {
+                info!(
+                    tool = tool_name.as_str(),
+                    "Recovered tool call from <|plugin|> block"
+                );
                 calls.push(ToolCall {
                     id: format!("recovered_{}", uuid::Uuid::new_v4()),
                     name: tool_name,
@@ -2651,17 +2674,30 @@ fn recover_text_tool_calls(text: &str, available_tools: &[ToolDefinition]) -> Ve
         let mut i = 0;
         while i < lines.len() {
             let line = lines[i].trim();
-            if let Some(tool_part) = line.strip_prefix("Action:").or_else(|| line.strip_prefix("action:")) {
+            if let Some(tool_part) = line
+                .strip_prefix("Action:")
+                .or_else(|| line.strip_prefix("action:"))
+            {
                 let tool_name = tool_part.trim();
                 if tool_names.contains(&tool_name) {
                     // Look for "Action Input:" on the next line(s)
                     if i + 1 < lines.len() {
                         let next = lines[i + 1].trim();
-                        if let Some(json_part) = next.strip_prefix("Action Input:").or_else(|| next.strip_prefix("action input:")).or_else(|| next.strip_prefix("action_input:")) {
+                        if let Some(json_part) = next
+                            .strip_prefix("Action Input:")
+                            .or_else(|| next.strip_prefix("action input:"))
+                            .or_else(|| next.strip_prefix("action_input:"))
+                        {
                             let json_str = json_part.trim();
                             if let Ok(input) = serde_json::from_str::<serde_json::Value>(json_str) {
-                                if !calls.iter().any(|c| c.name == tool_name && c.input == input) {
-                                    info!(tool = tool_name, "Recovered tool call from Action/Action Input pattern");
+                                if !calls
+                                    .iter()
+                                    .any(|c| c.name == tool_name && c.input == input)
+                                {
+                                    info!(
+                                        tool = tool_name,
+                                        "Recovered tool call from Action/Action Input pattern"
+                                    );
                                     calls.push(ToolCall {
                                         id: format!("recovered_{}", uuid::Uuid::new_v4()),
                                         name: tool_name.to_string(),
@@ -2697,8 +2733,14 @@ fn recover_text_tool_calls(text: &str, available_tools: &[ToolDefinition]) -> Ve
                 continue;
             }
             if let Ok(input) = serde_json::from_str::<serde_json::Value>(json_line) {
-                if !calls.iter().any(|c| c.name == name_line && c.input == input) {
-                    info!(tool = name_line, "Recovered tool call from name+JSON line pair");
+                if !calls
+                    .iter()
+                    .any(|c| c.name == name_line && c.input == input)
+                {
+                    info!(
+                        tool = name_line,
+                        "Recovered tool call from name+JSON line pair"
+                    );
                     calls.push(ToolCall {
                         id: format!("recovered_{}", uuid::Uuid::new_v4()),
                         name: name_line.to_string(),
@@ -2723,8 +2765,14 @@ fn recover_text_tool_calls(text: &str, available_tools: &[ToolDefinition]) -> Ve
         search_from = after_tag + close_offset + "</tool_use>".len();
 
         if let Some((tool_name, input)) = parse_json_tool_call_object(inner, &tool_names) {
-            if !calls.iter().any(|c| c.name == tool_name && c.input == input) {
-                info!(tool = tool_name.as_str(), "Recovered tool call from <tool_use> block");
+            if !calls
+                .iter()
+                .any(|c| c.name == tool_name && c.input == input)
+            {
+                info!(
+                    tool = tool_name.as_str(),
+                    "Recovered tool call from <tool_use> block"
+                );
                 calls.push(ToolCall {
                     id: format!("recovered_{}", uuid::Uuid::new_v4()),
                     name: tool_name,
@@ -2934,10 +2982,16 @@ async fn log_llm_event(
     };
 
     let header = match event_type {
-        "INPUT" => format!("\n{}\n[{}] >>> INPUT (Model: {})\n{}\n", separator, timestamp, model, sub_separator),
+        "INPUT" => format!(
+            "\n{}\n[{}] >>> INPUT (Model: {})\n{}\n",
+            separator, timestamp, model, sub_separator
+        ),
         "OUTPUT" => format!("\n[{}] <<< OUTPUT\n{}\n", timestamp, sub_separator),
         "TOOL_RESULT" => format!("\n[{}] === TOOL RESULT\n{}\n", timestamp, sub_separator),
-        _ => format!("\n[{}] EVENT: {}\n{}\n", timestamp, event_type, sub_separator),
+        _ => format!(
+            "\n[{}] EVENT: {}\n{}\n",
+            timestamp, event_type, sub_separator
+        ),
     };
 
     if let Err(e) = write!(file, "{}{}", header, display_content) {
@@ -2945,7 +2999,11 @@ async fn log_llm_event(
     }
 
     if truncated {
-        let _ = write!(file, "\n[... CONTENT TRUNCATED AT {} CHARS ...]\n", max_chars);
+        let _ = write!(
+            file,
+            "\n[... CONTENT TRUNCATED AT {} CHARS ...]\n",
+            max_chars
+        );
     }
 
     if event_type == "TOOL_RESULT" || event_type == "OUTPUT" {
@@ -3397,11 +3455,8 @@ mod tests {
             ),
         ];
 
-        let rendered = format_governed_memory_candidates(
-            "What is the alpha project status?",
-            &entries,
-            2,
-        );
+        let rendered =
+            format_governed_memory_candidates("What is the alpha project status?", &entries, 2);
 
         assert_eq!(rendered.len(), 2);
         assert!(rendered[0].contains("[project.alpha.status]"));
@@ -3466,10 +3521,7 @@ mod tests {
     #[test]
     fn test_format_memory_cleanup_orchestration_signals_surfaces_maintenance_actions() {
         let entries = vec![
-            (
-                "legacy_theme".to_string(),
-                serde_json::json!("solarized"),
-            ),
+            ("legacy_theme".to_string(), serde_json::json!("solarized")),
             (
                 "project.alpha.note".to_string(),
                 serde_json::json!("Alpha note"),
@@ -3509,7 +3561,10 @@ mod tests {
         trim_messages_for_prepended_context(&mut messages, 2);
 
         assert_eq!(messages.len(), MAX_HISTORY_MESSAGES - 2);
-        assert_eq!(messages.first().unwrap().content.text_content(), "message 2");
+        assert_eq!(
+            messages.first().unwrap().content.text_content(),
+            "message 2"
+        );
         assert_eq!(
             messages.last().unwrap().content.text_content(),
             format!("message {}", MAX_HISTORY_MESSAGES - 1)
@@ -4402,7 +4457,8 @@ mod tests {
             input_schema: serde_json::json!({}),
         }];
         // Same call in both function tag and tool tag — should only appear once
-        let text = r#"<function=exec>{"command":"ls"}</function> <tool>exec{"command":"ls"}</tool>"#;
+        let text =
+            r#"<function=exec>{"command":"ls"}</function> <tool>exec{"command":"ls"}</tool>"#;
         let calls = recover_text_tool_calls(text, &tools);
         assert_eq!(calls.len(), 1);
     }
@@ -4614,7 +4670,8 @@ mod tests {
             input_schema: serde_json::json!({}),
             defer_loading: false,
         }];
-        let text = "I'll run that: {\"name\": \"shell_exec\", \"arguments\": {\"command\": \"ls -la\"}}";
+        let text =
+            "I'll run that: {\"name\": \"shell_exec\", \"arguments\": {\"command\": \"ls -la\"}}";
         let calls = recover_text_tool_calls(text, &tools);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "shell_exec");
@@ -4717,7 +4774,8 @@ mod tests {
             input_schema: serde_json::json!({}),
             defer_loading: false,
         }];
-        let text = "<|plugin|>\n{\"name\": \"hack\", \"arguments\": {\"cmd\": \"rm\"}}\n<|endofblock|>";
+        let text =
+            "<|plugin|>\n{\"name\": \"hack\", \"arguments\": {\"cmd\": \"rm\"}}\n<|endofblock|>";
         let calls = recover_text_tool_calls(text, &tools);
         assert!(calls.is_empty());
     }
@@ -4792,7 +4850,8 @@ mod tests {
             input_schema: serde_json::json!({}),
             defer_loading: false,
         }];
-        let text = "<tool_use>{\"name\": \"web_search\", \"arguments\": {\"query\": \"test\"}}</tool_use>";
+        let text =
+            "<tool_use>{\"name\": \"web_search\", \"arguments\": {\"query\": \"test\"}}</tool_use>";
         let calls = recover_text_tool_calls(text, &tools);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "web_search");
@@ -4861,10 +4920,8 @@ mod tests {
     #[test]
     fn test_parse_json_tool_call_object_unknown_tool() {
         let tool_names = vec!["shell_exec"];
-        let result = parse_json_tool_call_object(
-            "{\"name\": \"unknown\", \"arguments\": {}}",
-            &tool_names,
-        );
+        let result =
+            parse_json_tool_call_object("{\"name\": \"unknown\", \"arguments\": {}}", &tool_names);
         assert!(result.is_none());
     }
 

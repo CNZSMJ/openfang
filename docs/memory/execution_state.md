@@ -179,23 +179,42 @@
     - 由于 legacy bucket 当前限制为 2，prompt-time signal 中优先显示的是两条既有 shared legacy bare key；本次注入的 `maintenance_signal_legacy_probe` 则通过 cleanup audit 被验证命中
     - verifier 的真实回复明确说明 shared memory 在复用前需要治理，并点名 backfill metadata / orphan sidecar 删除；`/api/budget` 中 `daily_spend` 从 `0.12500442` 增到 `0.13069252`，`/api/budget/agents` 中新增 verifier agent 花费 `0.005688100000000001`
     - maintenance probes 已通过 sqlite 直接删除，临时 verifier agent 已删除，daemon 已按流程停止
+  - 已完成 Phase 2 第一批 hybrid recall 落地：
+    - `openfang-memory::semantic` 的 `recall_with_embedding` 已从“向量召回失败时退回 text search”升级为真正的 hybrid recall：并行计算 text rank 与 vector rank，再用 RRF 融合排序
+    - hybrid recall 现在会保留未嵌入但 text 命中的 memory fragment，不再像原先 vector-only 分支那样天然丢失 `embedding = NULL` 的候选
+    - `openfang-runtime::agent_loop` 的 streaming / non-streaming 两条主路径都已改为显式记录 `Using hybrid recall`，embedding 失败时退回 `text-only search`
+    - 新增/更新单测覆盖：
+      - exact keyword 命中但无 embedding 的 memory 仍可被 hybrid recall 拉回前列
+      - mixed embedded / non-embedded 结果仍保留非 embedding 记录作为尾部候选，不回归旧行为
+  - 已完成本轮验证：
+    - `cargo build --workspace --lib`
+    - `cargo test --workspace`
+    - `cargo clippy --workspace --all-targets -- -D warnings`
+    - live hybrid recall 验证通过：
+      - 本机 Ollama 在线，`/api/tags` 返回 `qwen3-embedding:4b` 与 `qwen3-embedding:0.6b`
+      - `~/.openfang/config.toml` 的 `[memory]` 已确认使用 `embedding_provider = "ollama"` 与 `embedding_model = "qwen3-embedding:0.6b"`
+      - 真实 `assistant` message 后，`~/.openfang/workspaces/assistant/logs/llm.log` 的 `Relevant recalled memories` 中出现 `ZXCV9001-HTEST-20260315` probe，证明 recall 注入真实进入 prompt
+      - 进一步创建临时 `hybrid-live-verifier-20260315` agent，先写入 `TEXTONLY-PROBE-20260315` probe，再通过 sqlite 将对应 `memories.embedding` 显式置空、删除该 agent 的 `sessions` / `canonical_sessions`
+      - 在上述“fresh session + embedding = NULL”条件下，真实 `/api/agents/{id}/message` 仍返回 `TEXTONLY-PROBE-20260315 is the accounts receivable override code.`
+      - 同一轮 verifier 的 `llm.log` 中 `Relevant recalled memories` 明确包含 `TEXTONLY-PROBE-20260315` probe，证明 text arm 已真实接线，而不是只剩向量召回
+      - live 验证期间 `/api/budget` 的 `daily_spend` 从 `0.09705190000000001` 增到 `0.12042470000000001`
+      - 临时 verifier agent、其 DB 行与 workspace 已在验证后清理；daemon 已按流程停止
 
 ## 进行中
 
-- 准备进入 Phase 2：embedding / hybrid retrieval 的接线边界、provider 选择、以及如何消费现有 governed metadata。
+- 继续推进 Phase 2：在 semantic hybrid recall 已落地后，补 governed shared memory 与 semantic recall 的融合边界，以及 query-time 消费顺序。
 
 ## 下一步动作
 
-- 读取并对齐 Phase 2 设计目标：embedding provider、fallback、以及 governed metadata 在 hybrid retrieval 中的消费顺序。
-- 决定 Phase 2 的最小落地点：先接 embedding recall、还是直接做 hybrid retrieval 排序与回退。
-- 把当前 embedding 运行前提补齐后再开始 live verification；本机 `http://localhost:11434/v1/embeddings` 当前离线，会影响 Phase 2 验证路径。
+- 评估是否要把现有 `Governed memory candidates` 也提升为 hybrid candidate source，而不只是在 prompt 中与 semantic recall 并列展示。
+- 明确 governed metadata 在 hybrid retrieval 中的消费顺序：query profile / lifecycle / promotion candidate 应该作为 pre-filter、fusion weight 还是 post-rerank tie-break。
+- 评估是否需要为 hybrid recall 增加显式可观测性（例如 trace/log 标记 text rank vs vector rank 命中来源），避免后续 live 验证仍需借助 sqlite 手工探针。
 - 在切换电脑或结束一轮实质性工作前，持续更新本文件。
 
 ## 风险与阻塞
 
-- `cargo clippy --workspace --all-targets -- -D warnings` 当前仍被 `openfang-cli/src/main.rs` 中既有问题阻塞；按仓库约束，本轮未修改 `openfang-cli`。
-- 当前 embedding provider 本地端点 `http://localhost:11434/v1/embeddings` 离线，live LLM 调用期间会回退到 text search；这不阻塞本轮 KV governance 验证，但会影响 embedding recall 路径验证。
 - 当前现有 agent 的 tool-call 路径存在两类既有兼容问题：`assistant` 的 gemini path 仍有 `thought_signature` 错误，`Researcher` 的 MiniMax path 也出现了 tool-result id 不匹配；因此本轮 dashboard cleanup live LLM verification 同样改用临时无工具 MiniMax verifier agent 完成。
+- Phase 2 目前只覆盖 semantic memory 的 hybrid recall；governed shared memory 仍通过单独的 prompt candidate/orchestration helper 进入模型，尚未和 semantic arm 做统一融合排序。
 - 如果后续启动工作时不先读取本文件，分支纪律和连续性可能重新漂移。
 
 ## 验证清单
@@ -207,4 +226,4 @@
 
 ## 最后更新时间
 
-- 2026-03-14 Asia/Shanghai
+- 2026-03-15 Asia/Shanghai
