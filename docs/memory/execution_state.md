@@ -199,22 +199,43 @@
       - 同一轮 verifier 的 `llm.log` 中 `Relevant recalled memories` 明确包含 `TEXTONLY-PROBE-20260315` probe，证明 text arm 已真实接线，而不是只剩向量召回
       - live 验证期间 `/api/budget` 的 `daily_spend` 从 `0.09705190000000001` 增到 `0.12042470000000001`
       - 临时 verifier agent、其 DB 行与 workspace 已在验证后清理；daemon 已按流程停止
+  - 已完成 Phase 2 第二批 governed+semantic prompt-time fusion 落地：
+    - `openfang-runtime::agent_loop` 现在会把 semantic recalled fragments 与 governed shared memory candidates 先各自 query-time 排序，再用等权 RRF 融成同一组 `Relevant recalled memories`
+    - `openfang-runtime::prompt_builder` 不再单独输出 `Governed memory candidates` 区段；governed shared memory 现在以 `Shared memory [...]` 形式进入同一 recall section，semantic 片段则显式标记为 `Semantic memory [...]`
+    - governance attention / maintenance 两类 orchestration signal 仍保持独立区段，没有因为 recall 融合而丢失动作提示
+    - 新增/更新单测覆盖：
+      - semantic 与 shared governed candidate 会按 RRF 进入同一 recall 列表
+      - memory context message 只保留 fused recall section，不再保留旧的 governed-only section
+  - 已完成本轮补充验证：
+    - `cargo build --workspace --lib`
+    - `cargo test --workspace`
+    - `cargo clippy --workspace --all-targets -- -D warnings`
+    - live governed+semantic fusion 验证通过：
+      - 临时创建 `hybrid-fusion-verifier-20260315` agent，并通过 memory API 写入 `project.alpha.fusion_status` shared governed probe
+      - 第一轮真实消息注入 `SEMANTIC-FUSION-PROBE-20260315`，第二轮询问 `What is blocking the alpha launch, and what is the onboarding waiver code?`
+      - 真实回复同时返回 shared governed probe 对应的 `QA signoff` blocker 与 semantic probe 对应的 `SEMANTIC-FUSION-PROBE-20260315`
+      - verifier 的 `~/.openfang/workspaces/hybrid-fusion-verifier-20260315/logs/llm.log` 中，第二轮只出现一份 `Relevant recalled memories`，并同时包含：
+        - `Semantic memory [episodic] ... SEMANTIC-FUSION-PROBE-20260315 ...`
+        - `Shared memory [project.alpha.fusion_status] ... ALPHA-FUSION-BLOCKER-20260315 ...`
+      - 同一份 log 中未再出现 `Governed memory candidates` 旧区段，证明 governed candidate 已真实并入统一 recall section
+      - `/api/budget` 中 `daily_spend` 增至 `0.1228381`
+      - 临时 verifier agent、其 workspace、共享 probe 与关联 DB rows 已在验证后清理；daemon 已按流程停止
 
 ## 进行中
 
-- 继续推进 Phase 2：在 semantic hybrid recall 已落地后，补 governed shared memory 与 semantic recall 的融合边界，以及 query-time 消费顺序。
+- 继续推进 Phase 2：在 governed shared memory 与 semantic recall 的 prompt-time fusion 已落地后，补统一 recall 的可观测性与更细的 source-weight / tie-break 策略。
 
 ## 下一步动作
 
-- 评估是否要把现有 `Governed memory candidates` 也提升为 hybrid candidate source，而不只是在 prompt 中与 semantic recall 并列展示。
-- 明确 governed metadata 在 hybrid retrieval 中的消费顺序：query profile / lifecycle / promotion candidate 应该作为 pre-filter、fusion weight 还是 post-rerank tie-break。
-- 评估是否需要为 hybrid recall 增加显式可观测性（例如 trace/log 标记 text rank vs vector rank 命中来源），避免后续 live 验证仍需借助 sqlite 手工探针。
+- 为统一 recall 增加更明确的可观测性：例如在 trace / log 中标记 semantic vs governed vs text-only 命中来源，减少后续 live 验证对手工 probe 的依赖。
+- 继续细化 governed metadata 在统一 recall 中的消费顺序：query profile / lifecycle / promotion candidate 是否需要从当前 pre-filter + governed-internal rank，进一步升级为显式 fusion weight 或 post-rerank tie-break。
+- 评估是否要把当前 prompt-time fusion 下沉成更统一的 retrieval helper / API，而不是只在 runtime prompt 注入阶段做 RRF。
 - 在切换电脑或结束一轮实质性工作前，持续更新本文件。
 
 ## 风险与阻塞
 
 - 当前现有 agent 的 tool-call 路径存在两类既有兼容问题：`assistant` 的 gemini path 仍有 `thought_signature` 错误，`Researcher` 的 MiniMax path 也出现了 tool-result id 不匹配；因此本轮 dashboard cleanup live LLM verification 同样改用临时无工具 MiniMax verifier agent 完成。
-- Phase 2 目前只覆盖 semantic memory 的 hybrid recall；governed shared memory 仍通过单独的 prompt candidate/orchestration helper 进入模型，尚未和 semantic arm 做统一融合排序。
+- Phase 2 虽然已经把 governed shared memory 与 semantic recall 在 prompt-time 合成同一 recall section，但该融合仍停留在 runtime 注入层，尚未下沉成底层统一 retrieval 接口。
 - 如果后续启动工作时不先读取本文件，分支纪律和连续性可能重新漂移。
 
 ## 验证清单

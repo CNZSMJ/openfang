@@ -283,8 +283,9 @@ pub fn build_tools_section(granted_tools: &[String], skills: &[SkillInfo]) -> St
         groups.entry(cat).or_default().push((name.as_str(), hint));
     }
 
-    let mut out =
-        String::from("## Immediate Tools\nThese tools are already visible and can be called directly right now.\n");
+    let mut out = String::from(
+        "## Immediate Tools\nThese tools are already visible and can be called directly right now.\n",
+    );
     let category_order = [
         "Agents",
         "Files",
@@ -343,13 +344,11 @@ pub fn build_memory_context_message(
     recalled_memories: &[String],
     cleanup_maintenance_signals: &[String],
     governed_memory_signals: &[String],
-    governed_memory_candidates: &[String],
     recent_session_summaries: &[String],
 ) -> Option<String> {
     if recalled_memories.is_empty()
         && cleanup_maintenance_signals.is_empty()
         && governed_memory_signals.is_empty()
-        && governed_memory_candidates.is_empty()
         && recent_session_summaries.is_empty()
     {
         return None;
@@ -384,24 +383,10 @@ pub fn build_memory_context_message(
         }
     }
 
-    if !governed_memory_candidates.is_empty() {
-        if !recalled_memories.is_empty()
-            || !cleanup_maintenance_signals.is_empty()
-            || !governed_memory_signals.is_empty()
-        {
-            out.push('\n');
-        }
-        out.push_str("Governed memory candidates:\n");
-        for memory in governed_memory_candidates.iter().take(4) {
-            out.push_str(&format!("- {}\n", cap_str(memory, 320)));
-        }
-    }
-
     if !recent_session_summaries.is_empty() {
         if !recalled_memories.is_empty()
             || !cleanup_maintenance_signals.is_empty()
             || !governed_memory_signals.is_empty()
-            || !governed_memory_candidates.is_empty()
         {
             out.push('\n');
         }
@@ -1465,13 +1450,12 @@ mod tests {
     fn test_memory_context_message_present() {
         let message = build_memory_context_message(
             &[
-                "[project.alpha] Architecture decision: use Axum".to_string(),
-                "User prefers concise summaries".to_string(),
+                "Semantic memory [project.alpha] Architecture decision: use Axum".to_string(),
+                "Shared memory [pref.editor.theme] (kind=preference, freshness=durable, lifecycle=active, tags=profile,ui) solarized dark".to_string(),
             ],
             &["Run memory_cleanup before reuse: migrate legacy key [theme] to [general.theme]"
                 .to_string()],
             &["Review stale memory before reuse: [project.alpha.status] (kind=project_state, review_at=2026-03-10T00:00:00Z, tags=project,alpha)".to_string()],
-            &["[pref.editor.theme] (kind=preference, freshness=durable, lifecycle=active, tags=profile,ui) solarized dark".to_string()],
             &["session_2026-03-11_alpha: Reviewed prompt pipeline".to_string()],
         )
         .unwrap();
@@ -1480,18 +1464,17 @@ mod tests {
         assert!(message.contains("Relevant recalled memories"));
         assert!(message.contains("Governance maintenance signals"));
         assert!(message.contains("Governance attention signals"));
-        assert!(message.contains("Governed memory candidates"));
         assert!(message.contains("Recent session summaries"));
         assert!(message.contains("Architecture decision"));
+        assert!(message.contains("Shared memory [pref.editor.theme]"));
         assert!(message.contains("Run memory_cleanup before reuse"));
         assert!(message.contains("Review stale memory before reuse"));
-        assert!(message.contains("pref.editor.theme"));
         assert!(message.contains("Reviewed prompt pipeline"));
     }
 
     #[test]
     fn test_memory_context_message_omitted_when_empty() {
-        assert!(build_memory_context_message(&[], &[], &[], &[], &[]).is_none());
+        assert!(build_memory_context_message(&[], &[], &[], &[]).is_none());
     }
 
     #[test]
@@ -1553,8 +1536,11 @@ mod tests {
         let prompt = build_system_prompt(&ctx);
         assert!(prompt.contains("## Identity"));
         assert!(prompt.contains("Role: helper"));
-        assert!(prompt
-            .contains("Identity traits: archetype assistant, vibe sharp, greeting style blunt."));
+        assert!(
+            prompt.contains(
+                "Identity traits: archetype assistant, vibe sharp, greeting style blunt."
+            )
+        );
         assert!(!prompt.contains("\n# Identity\n"));
         assert!(!prompt.contains("name: Assistant"));
         assert!(!prompt.contains("archetype: assistant"));

@@ -4,8 +4,8 @@
 //! calling the LLM, executing tool calls, and saving the conversation.
 
 use crate::auth_cooldown::{CooldownVerdict, ProviderCooldown};
-use crate::context_budget::{apply_context_guard, truncate_tool_result_dynamic, ContextBudget};
-use crate::context_overflow::{recover_from_overflow, RecoveryStage};
+use crate::context_budget::{ContextBudget, apply_context_guard, truncate_tool_result_dynamic};
+use crate::context_overflow::{RecoveryStage, recover_from_overflow};
 use crate::embedding::EmbeddingDriver;
 use crate::kernel_handle::KernelHandle;
 use crate::llm_driver::{CompletionRequest, LlmDriver, LlmError, StreamEvent};
@@ -14,16 +14,16 @@ use crate::loop_guard::{LoopGuard, LoopGuardConfig, LoopGuardVerdict};
 use crate::mcp::McpConnection;
 use crate::tool_runner;
 use crate::web_search::WebToolsContext;
-use openfang_memory::session::Session;
 use openfang_memory::MemorySubstrate;
+use openfang_memory::session::Session;
 use openfang_skills::registry::SkillRegistry;
 use openfang_types::agent::AgentId;
 use openfang_types::agent::AgentManifest;
 use openfang_types::error::{OpenFangError, OpenFangResult};
 use openfang_types::memory::{
+    Memory, MemoryFilter, MemoryFreshness, MemoryLifecycleState, MemorySource,
     select_governed_memory_prompt_candidates_for_query,
     summarize_governed_memory_orchestration_for_query, summarize_memory_cleanup_for_orchestration,
-    Memory, MemoryFilter, MemoryFreshness, MemoryLifecycleState, MemorySource,
 };
 use openfang_types::message::{
     ContentBlock, Message, MessageContent, Role, StopReason, TokenUsage,
@@ -71,6 +71,7 @@ const MAX_MESSAGES_LOG_CHARS: usize = 12_000;
 const MAX_MESSAGE_TEXT_LOG_CHARS: usize = 4_000;
 /// Logging: Maximum characters for a single block payload inside an INPUT entry.
 const MAX_BLOCK_TEXT_LOG_CHARS: usize = 1_500;
+const MEMORY_CONTEXT_RRF_K: f32 = 60.0;
 
 /// Strip a provider prefix from a model ID before sending to the API.
 ///
@@ -115,7 +116,10 @@ fn format_recalled_memory_fragments(
                 })
                 .unwrap_or_default();
 
-            let rendered = format!("{label}{}", openfang_types::truncate_str(content, 320));
+            let rendered = format!(
+                "Semantic memory {label}{}",
+                openfang_types::truncate_str(content, 320)
+            );
             if seen.insert(rendered.clone()) {
                 Some(rendered)
             } else {
@@ -123,6 +127,72 @@ fn format_recalled_memory_fragments(
             }
         })
         .take(5)
+        .collect()
+}
+
+#[derive(Debug, Clone)]
+struct RankedMemoryContextCandidate {
+    rendered: String,
+    fused_score: f32,
+    source_rank: usize,
+    source_priority: u8,
+}
+
+fn fuse_memory_context_candidates(
+    user_message: &str,
+    semantic_memories: &[openfang_types::memory::MemoryFragment],
+    governed_entries: &[(String, serde_json::Value)],
+    limit: usize,
+) -> Vec<String> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    let semantic_candidates = format_recalled_memory_fragments(semantic_memories);
+    let governed_candidates =
+        format_governed_memory_candidates(user_message, governed_entries, limit.saturating_mul(2));
+
+    let mut fused_candidates =
+        Vec::with_capacity(semantic_candidates.len() + governed_candidates.len());
+    fused_candidates.extend(
+        semantic_candidates
+            .into_iter()
+            .enumerate()
+            .map(|(rank, rendered)| RankedMemoryContextCandidate {
+                rendered,
+                fused_score: 1.0 / (MEMORY_CONTEXT_RRF_K + rank as f32 + 1.0),
+                source_rank: rank,
+                source_priority: 0,
+            }),
+    );
+    fused_candidates.extend(
+        governed_candidates
+            .into_iter()
+            .enumerate()
+            .map(|(rank, rendered)| RankedMemoryContextCandidate {
+                rendered,
+                fused_score: 1.0 / (MEMORY_CONTEXT_RRF_K + rank as f32 + 1.0),
+                source_rank: rank,
+                source_priority: 1,
+            }),
+    );
+    fused_candidates.sort_by(|a, b| {
+        b.fused_score
+            .partial_cmp(&a.fused_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.source_priority.cmp(&b.source_priority))
+            .then_with(|| a.source_rank.cmp(&b.source_rank))
+            .then_with(|| a.rendered.cmp(&b.rendered))
+    });
+
+    let mut seen = HashSet::new();
+    fused_candidates
+        .into_iter()
+        .filter_map(|candidate| {
+            seen.insert(candidate.rendered.clone())
+                .then_some(candidate.rendered)
+        })
+        .take(limit)
         .collect()
 }
 
@@ -230,7 +300,7 @@ fn format_governed_memory_candidates(
         }
 
         let rendered = format!(
-            "[{}] ({}) {}",
+            "Shared memory [{}] ({}) {}",
             candidate.key,
             qualifiers.join(", "),
             openfang_types::truncate_str(rendered_value, 240)
@@ -540,10 +610,9 @@ pub async fn run_agent_loop_with_session_message(
     let structured_entries = memory.list_kv(session.agent_id).unwrap_or_default();
     let governed_entries = load_governed_memory_entries(memory, kernel.as_ref(), session.agent_id);
     let memory_context_msg = crate::prompt_builder::build_memory_context_message(
-        &format_recalled_memory_fragments(&_memories),
+        &fuse_memory_context_candidates(user_message, &_memories, &governed_entries, 5),
         &format_memory_cleanup_orchestration_signals(&governed_entries, 2),
         &format_governed_memory_orchestration_signals(user_message, &governed_entries, 2),
-        &format_governed_memory_candidates(user_message, &governed_entries, 4),
         &load_recent_session_summaries_from_entries(&structured_entries, 3),
     );
 
@@ -1532,10 +1601,9 @@ pub async fn run_agent_loop_streaming(
     let structured_entries = memory.list_kv(session.agent_id).unwrap_or_default();
     let governed_entries = load_governed_memory_entries(memory, kernel.as_ref(), session.agent_id);
     let memory_context_msg = crate::prompt_builder::build_memory_context_message(
-        &format_recalled_memory_fragments(&_memories),
+        &fuse_memory_context_candidates(user_message, &_memories, &governed_entries, 5),
         &format_memory_cleanup_orchestration_signals(&governed_entries, 2),
         &format_governed_memory_orchestration_signals(user_message, &governed_entries, 2),
-        &format_governed_memory_candidates(user_message, &governed_entries, 4),
         &load_recent_session_summaries_from_entries(&structured_entries, 3),
     );
 
@@ -2890,7 +2958,9 @@ fn format_blocks_for_log(blocks: &[ContentBlock]) -> String {
                 "- block[{idx}] image: media_type={media_type}, base64_chars={}",
                 data.len()
             ),
-            ContentBlock::ToolUse { id, name, input, .. } => format!(
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => format!(
                 "- block[{idx}] tool_use: id={id}, name={name}, input={}",
                 truncate_for_log(&input.to_string(), MAX_BLOCK_TEXT_LOG_CHARS)
             ),
@@ -3266,7 +3336,7 @@ mod tests {
 
     #[test]
     fn test_dynamic_truncate_short_unchanged() {
-        use crate::context_budget::{truncate_tool_result_dynamic, ContextBudget};
+        use crate::context_budget::{ContextBudget, truncate_tool_result_dynamic};
         let budget = ContextBudget::new(200_000);
         let short = "Hello, world!";
         assert_eq!(truncate_tool_result_dynamic(short, &budget), short);
@@ -3274,7 +3344,7 @@ mod tests {
 
     #[test]
     fn test_dynamic_truncate_over_limit() {
-        use crate::context_budget::{truncate_tool_result_dynamic, ContextBudget};
+        use crate::context_budget::{ContextBudget, truncate_tool_result_dynamic};
         let budget = ContextBudget::new(200_000);
         let long = "x".repeat(budget.per_result_cap() + 10_000);
         let result = truncate_tool_result_dynamic(&long, &budget);
@@ -3284,7 +3354,7 @@ mod tests {
 
     #[test]
     fn test_dynamic_truncate_newline_boundary() {
-        use crate::context_budget::{truncate_tool_result_dynamic, ContextBudget};
+        use crate::context_budget::{ContextBudget, truncate_tool_result_dynamic};
         // Small budget to force truncation
         let budget = ContextBudget::new(1_000);
         let content = (0..200)
@@ -3323,8 +3393,62 @@ mod tests {
 
         let rendered = format_recalled_memory_fragments(&[memory.clone(), memory]);
         assert_eq!(rendered.len(), 1);
+        assert!(rendered[0].starts_with("Semantic memory "));
         assert!(rendered[0].contains("[pref.editor]"));
         assert!(rendered[0].contains("rustfmt"));
+    }
+
+    #[test]
+    fn test_fuse_memory_context_candidates_interleaves_semantic_and_shared_memory() {
+        let now = chrono::Utc::now();
+        let agent_id = AgentId::new();
+        let semantic_memory = openfang_types::memory::MemoryFragment {
+            id: openfang_types::memory::MemoryId::new(),
+            agent_id,
+            content: "Use concise summaries first.".to_string(),
+            embedding: None,
+            metadata: HashMap::from([(
+                "key".to_string(),
+                serde_json::Value::String("pref.reply.style".to_string()),
+            )]),
+            source: openfang_types::memory::MemorySource::UserProvided,
+            confidence: 1.0,
+            created_at: now,
+            accessed_at: now,
+            access_count: 0,
+            scope: "preferences".to_string(),
+        };
+        let governed_metadata = openfang_types::memory::MemoryRecordMetadata {
+            schema_version: openfang_types::memory::MEMORY_METADATA_SCHEMA_VERSION,
+            key: "project.alpha.status".to_string(),
+            namespace: "project".to_string(),
+            kind: "project_state".to_string(),
+            tags: vec!["project".to_string(), "alpha".to_string()],
+            freshness: MemoryFreshness::Rolling,
+            source: "memory_store_tool".to_string(),
+            updated_at: now,
+        };
+        let entries = vec![
+            (
+                "project.alpha.status".to_string(),
+                serde_json::json!("Alpha launch is blocked on QA signoff."),
+            ),
+            (
+                openfang_types::memory::memory_metadata_key("project.alpha.status").unwrap(),
+                serde_json::to_value(&governed_metadata).unwrap(),
+            ),
+        ];
+
+        let rendered = fuse_memory_context_candidates(
+            "What is blocking the alpha launch?",
+            &[semantic_memory],
+            &entries,
+            5,
+        );
+
+        assert_eq!(rendered.len(), 2);
+        assert!(rendered[0].starts_with("Semantic memory "));
+        assert!(rendered[1].starts_with("Shared memory [project.alpha.status]"));
     }
 
     #[test]
@@ -3405,6 +3529,7 @@ mod tests {
         );
 
         assert_eq!(rendered.len(), 1);
+        assert!(rendered[0].starts_with("Shared memory "));
         assert!(rendered[0].contains("[pref.editor.theme]"));
         assert!(rendered[0].contains("kind=preference"));
         assert!(rendered[0].contains("freshness=durable"));
@@ -3459,6 +3584,7 @@ mod tests {
             format_governed_memory_candidates("What is the alpha project status?", &entries, 2);
 
         assert_eq!(rendered.len(), 2);
+        assert!(rendered[0].starts_with("Shared memory "));
         assert!(rendered[0].contains("[project.alpha.status]"));
         assert!(rendered[1].contains("[pref.editor.theme]"));
     }
