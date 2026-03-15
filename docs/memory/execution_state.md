@@ -220,16 +220,48 @@
       - 同一份 log 中未再出现 `Governed memory candidates` 旧区段，证明 governed candidate 已真实并入统一 recall section
       - `/api/budget` 中 `daily_spend` 增至 `0.1228381`
       - 临时 verifier agent、其 workspace、共享 probe 与关联 DB rows 已在验证后清理；daemon 已按流程停止
+  - 已完成 Phase 2 第三批 unified recall observability 落地：
+    - `openfang-runtime::agent_loop` 现在会在每轮真正写入 `INPUT` 前，额外向 agent workspace 的 `llm.log` 写一条 `*** MEMORY TRACE`
+    - `MEMORY_TRACE` 当前会显式暴露：
+      - `semantic_mode=hybrid|text_only`
+      - `semantic_candidates`
+      - `shared_candidates`
+      - `maintenance_signals`
+      - `attention_signals`
+      - `session_summaries`
+      - `selected_fused_recall` 明细，包括 `source=semantic|shared`、`source_rank` 与 `fused_score`
+    - 这样后续 live 验证不再只能通过读 prompt 里的 `Relevant recalled memories` 反推来源，而是可以直接从日志判断 unified recall 的命中来源与排序
+    - 新增单测覆盖：
+      - memory trace 会输出 source counts 与 fused recall rank 明细
+      - 空 trace 不会写出无意义日志
+  - 已完成本轮 observability 补充验证：
+    - `cargo build --workspace --lib`
+    - `cargo test --workspace`
+    - `cargo clippy --workspace --all-targets -- -D warnings`
+    - `cargo build -p openfang-cli`
+    - live `MEMORY_TRACE` 验证通过：
+      - 临时创建 `memory-trace-verifier-2-20260315` agent，并通过 memory API 写入 `project.alpha.trace_status` shared governed probe
+      - 第一轮真实消息注入 `TRACE-SEMANTIC-20260315`，第二轮询问 `What is blocking the alpha launch and what is the device unlock phrase?`
+      - verifier 的 `~/.openfang/workspaces/memory-trace-verifier-2-20260315/logs/llm.log` 中出现新的 `*** MEMORY TRACE` 区段，明确包含：
+        - `semantic_mode=hybrid`
+        - `semantic_candidates=1`
+        - `shared_candidates=1`
+        - `selected_fused_recall`
+        - `source=semantic source_rank=1 ... TRACE-SEMANTIC-20260315 ...`
+        - `source=shared source_rank=1 ... TRACE-BLOCKER-20260315 ...`
+      - 同一轮真实回复同时返回 device unlock phrase 与 alpha launch blocker，说明 trace 与真实 recall consumption 对齐
+      - `/api/budget` 中 `daily_spend` 增至 `0.1262184`
+      - 临时 verifier agent、其 workspace、共享 probe 与关联 DB rows 已在验证后清理；daemon 已按流程停止
 
 ## 进行中
 
-- 继续推进 Phase 2：在 governed shared memory 与 semantic recall 的 prompt-time fusion 已落地后，补统一 recall 的可观测性与更细的 source-weight / tie-break 策略。
+- 继续推进 Phase 2：在 unified recall observability 已落地后，补更细的 source-weight / tie-break 策略，并评估是否把 prompt-time fusion 下沉成共享 retrieval helper。
 
 ## 下一步动作
 
-- 为统一 recall 增加更明确的可观测性：例如在 trace / log 中标记 semantic vs governed vs text-only 命中来源，减少后续 live 验证对手工 probe 的依赖。
 - 继续细化 governed metadata 在统一 recall 中的消费顺序：query profile / lifecycle / promotion candidate 是否需要从当前 pre-filter + governed-internal rank，进一步升级为显式 fusion weight 或 post-rerank tie-break。
 - 评估是否要把当前 prompt-time fusion 下沉成更统一的 retrieval helper / API，而不是只在 runtime prompt 注入阶段做 RRF。
+- 评估是否要把 `MEMORY_TRACE` 的 source/fused 信息进一步同步到 structured telemetry / tracing fields，而不只写入 `llm.log` 文本。
 - 在切换电脑或结束一轮实质性工作前，持续更新本文件。
 
 ## 风险与阻塞

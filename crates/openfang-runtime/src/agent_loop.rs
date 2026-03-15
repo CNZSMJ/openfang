@@ -136,6 +136,39 @@ struct RankedMemoryContextCandidate {
     fused_score: f32,
     source_rank: usize,
     source_priority: u8,
+    source_label: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SemanticRecallMode {
+    Hybrid,
+    TextOnly,
+}
+
+impl SemanticRecallMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Hybrid => "hybrid",
+            Self::TextOnly => "text_only",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MemoryRecallTrace {
+    semantic_mode: SemanticRecallMode,
+    semantic_candidates: usize,
+    shared_candidates: usize,
+    fused_candidates: Vec<RankedMemoryContextCandidate>,
+    maintenance_signals: usize,
+    attention_signals: usize,
+    session_summaries: usize,
+}
+
+#[derive(Debug, Clone)]
+struct FusedMemoryContext {
+    recalled_memories: Vec<String>,
+    trace: MemoryRecallTrace,
 }
 
 fn fuse_memory_context_candidates(
@@ -143,14 +176,27 @@ fn fuse_memory_context_candidates(
     semantic_memories: &[openfang_types::memory::MemoryFragment],
     governed_entries: &[(String, serde_json::Value)],
     limit: usize,
-) -> Vec<String> {
+) -> FusedMemoryContext {
     if limit == 0 {
-        return Vec::new();
+        return FusedMemoryContext {
+            recalled_memories: Vec::new(),
+            trace: MemoryRecallTrace {
+                semantic_mode: SemanticRecallMode::TextOnly,
+                semantic_candidates: 0,
+                shared_candidates: 0,
+                fused_candidates: Vec::new(),
+                maintenance_signals: 0,
+                attention_signals: 0,
+                session_summaries: 0,
+            },
+        };
     }
 
     let semantic_candidates = format_recalled_memory_fragments(semantic_memories);
     let governed_candidates =
         format_governed_memory_candidates(user_message, governed_entries, limit.saturating_mul(2));
+    let semantic_candidate_count = semantic_candidates.len();
+    let shared_candidate_count = governed_candidates.len();
 
     let mut fused_candidates =
         Vec::with_capacity(semantic_candidates.len() + governed_candidates.len());
@@ -163,6 +209,7 @@ fn fuse_memory_context_candidates(
                 fused_score: 1.0 / (MEMORY_CONTEXT_RRF_K + rank as f32 + 1.0),
                 source_rank: rank,
                 source_priority: 0,
+                source_label: "semantic",
             }),
     );
     fused_candidates.extend(
@@ -174,6 +221,7 @@ fn fuse_memory_context_candidates(
                 fused_score: 1.0 / (MEMORY_CONTEXT_RRF_K + rank as f32 + 1.0),
                 source_rank: rank,
                 source_priority: 1,
+                source_label: "shared",
             }),
     );
     fused_candidates.sort_by(|a, b| {
@@ -186,14 +234,66 @@ fn fuse_memory_context_candidates(
     });
 
     let mut seen = HashSet::new();
-    fused_candidates
+    let selected_fused_candidates: Vec<RankedMemoryContextCandidate> = fused_candidates
         .into_iter()
-        .filter_map(|candidate| {
-            seen.insert(candidate.rendered.clone())
-                .then_some(candidate.rendered)
-        })
+        .filter(|candidate| seen.insert(candidate.rendered.clone()))
         .take(limit)
-        .collect()
+        .collect();
+    let recalled_memories = selected_fused_candidates
+        .iter()
+        .map(|candidate| candidate.rendered.clone())
+        .collect();
+
+    FusedMemoryContext {
+        recalled_memories,
+        trace: MemoryRecallTrace {
+            semantic_mode: SemanticRecallMode::TextOnly,
+            semantic_candidates: semantic_candidate_count,
+            shared_candidates: shared_candidate_count,
+            fused_candidates: selected_fused_candidates,
+            maintenance_signals: 0,
+            attention_signals: 0,
+            session_summaries: 0,
+        },
+    }
+}
+
+fn format_memory_recall_trace(trace: &MemoryRecallTrace) -> Option<String> {
+    if trace.semantic_candidates == 0
+        && trace.shared_candidates == 0
+        && trace.maintenance_signals == 0
+        && trace.attention_signals == 0
+        && trace.session_summaries == 0
+    {
+        return None;
+    }
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "semantic_mode={}\nsemantic_candidates={}\nshared_candidates={}\nmaintenance_signals={}\nattention_signals={}\nsession_summaries={}\n",
+        trace.semantic_mode.as_str(),
+        trace.semantic_candidates,
+        trace.shared_candidates,
+        trace.maintenance_signals,
+        trace.attention_signals,
+        trace.session_summaries
+    ));
+
+    if !trace.fused_candidates.is_empty() {
+        out.push_str("selected_fused_recall:\n");
+        for (rank, candidate) in trace.fused_candidates.iter().enumerate() {
+            out.push_str(&format!(
+                "{}. source={} source_rank={} fused_score={:.5} {}\n",
+                rank + 1,
+                candidate.source_label,
+                candidate.source_rank + 1,
+                candidate.fused_score,
+                openfang_types::truncate_str(&candidate.rendered, 280)
+            ));
+        }
+    }
+
+    Some(out.trim_end().to_string())
 }
 
 #[cfg(test)]
@@ -562,59 +662,82 @@ pub async fn run_agent_loop_with_session_message(
         .unwrap_or_default();
 
     // Recall relevant memories — prefer hybrid recall when an embedding driver is available
-    let _memories = if let Some(emb) = embedding_driver {
+    let (semantic_recall_mode, _memories) = if let Some(emb) = embedding_driver {
         match emb.embed_one(user_message).await {
             Ok(query_vec) => {
                 debug!("Using hybrid recall (dims={})", query_vec.len());
-                memory
-                    .recall_with_embedding_async(
-                        user_message,
-                        5,
-                        Some(MemoryFilter {
-                            agent_id: Some(session.agent_id),
-                            ..Default::default()
-                        }),
-                        Some(&query_vec),
-                    )
-                    .await
-                    .unwrap_or_default()
+                (
+                    SemanticRecallMode::Hybrid,
+                    memory
+                        .recall_with_embedding_async(
+                            user_message,
+                            5,
+                            Some(MemoryFilter {
+                                agent_id: Some(session.agent_id),
+                                ..Default::default()
+                            }),
+                            Some(&query_vec),
+                        )
+                        .await
+                        .unwrap_or_default(),
+                )
             }
             Err(e) => {
                 warn!("Embedding recall failed, falling back to text-only search: {e}");
-                memory
-                    .recall(
-                        user_message,
-                        5,
-                        Some(MemoryFilter {
-                            agent_id: Some(session.agent_id),
-                            ..Default::default()
-                        }),
-                    )
-                    .await
-                    .unwrap_or_default()
+                (
+                    SemanticRecallMode::TextOnly,
+                    memory
+                        .recall(
+                            user_message,
+                            5,
+                            Some(MemoryFilter {
+                                agent_id: Some(session.agent_id),
+                                ..Default::default()
+                            }),
+                        )
+                        .await
+                        .unwrap_or_default(),
+                )
             }
         }
     } else {
-        memory
-            .recall(
-                user_message,
-                5,
-                Some(MemoryFilter {
-                    agent_id: Some(session.agent_id),
-                    ..Default::default()
-                }),
-            )
-            .await
-            .unwrap_or_default()
+        (
+            SemanticRecallMode::TextOnly,
+            memory
+                .recall(
+                    user_message,
+                    5,
+                    Some(MemoryFilter {
+                        agent_id: Some(session.agent_id),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap_or_default(),
+        )
     };
     let structured_entries = memory.list_kv(session.agent_id).unwrap_or_default();
     let governed_entries = load_governed_memory_entries(memory, kernel.as_ref(), session.agent_id);
+    let cleanup_signals = format_memory_cleanup_orchestration_signals(&governed_entries, 2);
+    let governed_memory_signals =
+        format_governed_memory_orchestration_signals(user_message, &governed_entries, 2);
+    let recent_session_summaries =
+        load_recent_session_summaries_from_entries(&structured_entries, 3);
+    let mut fused_memory_context =
+        fuse_memory_context_candidates(user_message, &_memories, &governed_entries, 5);
+    fused_memory_context.trace.semantic_mode = semantic_recall_mode;
+    fused_memory_context.trace.maintenance_signals = cleanup_signals.len();
+    fused_memory_context.trace.attention_signals = governed_memory_signals.len();
+    fused_memory_context.trace.session_summaries = recent_session_summaries.len();
     let memory_context_msg = crate::prompt_builder::build_memory_context_message(
-        &fuse_memory_context_candidates(user_message, &_memories, &governed_entries, 5),
-        &format_memory_cleanup_orchestration_signals(&governed_entries, 2),
-        &format_governed_memory_orchestration_signals(user_message, &governed_entries, 2),
-        &load_recent_session_summaries_from_entries(&structured_entries, 3),
+        &fused_memory_context.recalled_memories,
+        &cleanup_signals,
+        &governed_memory_signals,
+        &recent_session_summaries,
     );
+    if let Some(memory_trace) = format_memory_recall_trace(&fused_memory_context.trace) {
+        log_llm_event(workspace_root, "MEMORY_TRACE", "", &memory_trace).await;
+    }
 
     // Fire BeforePromptBuild hook
     let agent_id_str = session.agent_id.0.to_string();
@@ -1553,59 +1676,82 @@ pub async fn run_agent_loop_streaming(
         .unwrap_or_default();
 
     // Recall relevant memories — prefer hybrid recall when an embedding driver is available
-    let _memories = if let Some(emb) = embedding_driver {
+    let (semantic_recall_mode, _memories) = if let Some(emb) = embedding_driver {
         match emb.embed_one(user_message).await {
             Ok(query_vec) => {
                 debug!("Using hybrid recall (streaming, dims={})", query_vec.len());
-                memory
-                    .recall_with_embedding_async(
-                        user_message,
-                        5,
-                        Some(MemoryFilter {
-                            agent_id: Some(session.agent_id),
-                            ..Default::default()
-                        }),
-                        Some(&query_vec),
-                    )
-                    .await
-                    .unwrap_or_default()
+                (
+                    SemanticRecallMode::Hybrid,
+                    memory
+                        .recall_with_embedding_async(
+                            user_message,
+                            5,
+                            Some(MemoryFilter {
+                                agent_id: Some(session.agent_id),
+                                ..Default::default()
+                            }),
+                            Some(&query_vec),
+                        )
+                        .await
+                        .unwrap_or_default(),
+                )
             }
             Err(e) => {
                 warn!("Embedding recall failed (streaming), falling back to text-only search: {e}");
-                memory
-                    .recall(
-                        user_message,
-                        5,
-                        Some(MemoryFilter {
-                            agent_id: Some(session.agent_id),
-                            ..Default::default()
-                        }),
-                    )
-                    .await
-                    .unwrap_or_default()
+                (
+                    SemanticRecallMode::TextOnly,
+                    memory
+                        .recall(
+                            user_message,
+                            5,
+                            Some(MemoryFilter {
+                                agent_id: Some(session.agent_id),
+                                ..Default::default()
+                            }),
+                        )
+                        .await
+                        .unwrap_or_default(),
+                )
             }
         }
     } else {
-        memory
-            .recall(
-                user_message,
-                5,
-                Some(MemoryFilter {
-                    agent_id: Some(session.agent_id),
-                    ..Default::default()
-                }),
-            )
-            .await
-            .unwrap_or_default()
+        (
+            SemanticRecallMode::TextOnly,
+            memory
+                .recall(
+                    user_message,
+                    5,
+                    Some(MemoryFilter {
+                        agent_id: Some(session.agent_id),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap_or_default(),
+        )
     };
     let structured_entries = memory.list_kv(session.agent_id).unwrap_or_default();
     let governed_entries = load_governed_memory_entries(memory, kernel.as_ref(), session.agent_id);
+    let cleanup_signals = format_memory_cleanup_orchestration_signals(&governed_entries, 2);
+    let governed_memory_signals =
+        format_governed_memory_orchestration_signals(user_message, &governed_entries, 2);
+    let recent_session_summaries =
+        load_recent_session_summaries_from_entries(&structured_entries, 3);
+    let mut fused_memory_context =
+        fuse_memory_context_candidates(user_message, &_memories, &governed_entries, 5);
+    fused_memory_context.trace.semantic_mode = semantic_recall_mode;
+    fused_memory_context.trace.maintenance_signals = cleanup_signals.len();
+    fused_memory_context.trace.attention_signals = governed_memory_signals.len();
+    fused_memory_context.trace.session_summaries = recent_session_summaries.len();
     let memory_context_msg = crate::prompt_builder::build_memory_context_message(
-        &fuse_memory_context_candidates(user_message, &_memories, &governed_entries, 5),
-        &format_memory_cleanup_orchestration_signals(&governed_entries, 2),
-        &format_governed_memory_orchestration_signals(user_message, &governed_entries, 2),
-        &load_recent_session_summaries_from_entries(&structured_entries, 3),
+        &fused_memory_context.recalled_memories,
+        &cleanup_signals,
+        &governed_memory_signals,
+        &recent_session_summaries,
     );
+    if let Some(memory_trace) = format_memory_recall_trace(&fused_memory_context.trace) {
+        log_llm_event(workspace_root, "MEMORY_TRACE", "", &memory_trace).await;
+    }
 
     // Fire BeforePromptBuild hook
     let agent_id_str = session.agent_id.0.to_string();
@@ -3056,6 +3202,7 @@ async fn log_llm_event(
             "\n{}\n[{}] >>> INPUT (Model: {})\n{}\n",
             separator, timestamp, model, sub_separator
         ),
+        "MEMORY_TRACE" => format!("\n[{}] *** MEMORY TRACE\n{}\n", timestamp, sub_separator),
         "OUTPUT" => format!("\n[{}] <<< OUTPUT\n{}\n", timestamp, sub_separator),
         "TOOL_RESULT" => format!("\n[{}] === TOOL RESULT\n{}\n", timestamp, sub_separator),
         _ => format!(
@@ -3446,9 +3593,68 @@ mod tests {
             5,
         );
 
-        assert_eq!(rendered.len(), 2);
-        assert!(rendered[0].starts_with("Semantic memory "));
-        assert!(rendered[1].starts_with("Shared memory [project.alpha.status]"));
+        assert_eq!(rendered.recalled_memories.len(), 2);
+        assert!(rendered.recalled_memories[0].starts_with("Semantic memory "));
+        assert!(rendered.recalled_memories[1].starts_with("Shared memory [project.alpha.status]"));
+        assert_eq!(rendered.trace.semantic_candidates, 1);
+        assert_eq!(rendered.trace.shared_candidates, 1);
+        assert_eq!(rendered.trace.fused_candidates.len(), 2);
+        assert_eq!(rendered.trace.fused_candidates[0].source_label, "semantic");
+        assert_eq!(rendered.trace.fused_candidates[1].source_label, "shared");
+    }
+
+    #[test]
+    fn test_format_memory_recall_trace_includes_source_counts_and_selected_ranks() {
+        let trace = MemoryRecallTrace {
+            semantic_mode: SemanticRecallMode::Hybrid,
+            semantic_candidates: 2,
+            shared_candidates: 1,
+            fused_candidates: vec![
+                RankedMemoryContextCandidate {
+                    rendered: "Semantic memory [episodic] waiver code".to_string(),
+                    fused_score: 0.01639,
+                    source_rank: 0,
+                    source_priority: 0,
+                    source_label: "semantic",
+                },
+                RankedMemoryContextCandidate {
+                    rendered: "Shared memory [project.alpha.status] qa signoff".to_string(),
+                    fused_score: 0.01613,
+                    source_rank: 0,
+                    source_priority: 1,
+                    source_label: "shared",
+                },
+            ],
+            maintenance_signals: 2,
+            attention_signals: 1,
+            session_summaries: 1,
+        };
+
+        let rendered = format_memory_recall_trace(&trace).unwrap();
+
+        assert!(rendered.contains("semantic_mode=hybrid"));
+        assert!(rendered.contains("semantic_candidates=2"));
+        assert!(rendered.contains("shared_candidates=1"));
+        assert!(rendered.contains("maintenance_signals=2"));
+        assert!(rendered.contains("attention_signals=1"));
+        assert!(rendered.contains("session_summaries=1"));
+        assert!(rendered.contains("1. source=semantic source_rank=1"));
+        assert!(rendered.contains("2. source=shared source_rank=1"));
+    }
+
+    #[test]
+    fn test_format_memory_recall_trace_omitted_when_all_sources_empty() {
+        let trace = MemoryRecallTrace {
+            semantic_mode: SemanticRecallMode::TextOnly,
+            semantic_candidates: 0,
+            shared_candidates: 0,
+            fused_candidates: Vec::new(),
+            maintenance_signals: 0,
+            attention_signals: 0,
+            session_summaries: 0,
+        };
+
+        assert!(format_memory_recall_trace(&trace).is_none());
     }
 
     #[test]
