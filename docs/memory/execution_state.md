@@ -17,11 +17,11 @@
 
 ## 当前工作分支
 
-- `memory-governance`
+- `phase2-embedding-hybrid-retrieval`
 
 ## 当前 worktree 路径
 
-- `/Users/huangjiahao/workspace/openfang-0.1.0/memory-governance`
+- `/Users/huangjiahao/workspace/openfang-0.1.0/phase2-embedding-hybrid-retrieval`
 
 ## 设计文档
 
@@ -30,7 +30,7 @@
 
 ## 当前目标
 
-- 在 `memory-governance` 分支上开始 Phase 2，围绕 governed shared memory 设计并落地 embedding / hybrid retrieval 的接线顺序与验证路径。
+- 在 `phase2-embedding-hybrid-retrieval` 分支上开始 Phase 2，围绕 governed shared memory 设计并落地 embedding / hybrid retrieval 的接线顺序与验证路径。
 
 ## 已完成
 
