@@ -368,6 +368,69 @@ pub struct MemoryContextFusionResult {
     pub fused_candidates: Vec<FusedMemoryContextCandidate>,
 }
 
+/// Which recall mode produced the semantic branch of prompt-time memory context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryContextRecallMode {
+    Hybrid,
+    TextOnly,
+}
+
+impl MemoryContextRecallMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Hybrid => "hybrid",
+            Self::TextOnly => "text_only",
+        }
+    }
+}
+
+/// Tunable limits for prompt-time memory context assembly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptMemoryContextBuildOptions {
+    pub semantic_limit: usize,
+    pub shared_limit: usize,
+    pub fused_limit: usize,
+    pub maintenance_signal_limit: usize,
+    pub attention_signal_limit: usize,
+    pub session_summary_limit: usize,
+}
+
+impl Default for PromptMemoryContextBuildOptions {
+    fn default() -> Self {
+        Self {
+            semantic_limit: 5,
+            shared_limit: 10,
+            fused_limit: 5,
+            maintenance_signal_limit: 2,
+            attention_signal_limit: 2,
+            session_summary_limit: 3,
+        }
+    }
+}
+
+/// Structured trace payload for prompt-time memory context.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PromptMemoryContextTrace {
+    pub semantic_mode: MemoryContextRecallMode,
+    pub semantic_candidates: usize,
+    pub shared_candidates: usize,
+    pub fused_candidates: Vec<FusedMemoryContextCandidate>,
+    pub maintenance_signals: usize,
+    pub attention_signals: usize,
+    pub session_summaries: usize,
+}
+
+/// Shared prompt-time memory context payload consumed by runtime prompt injection.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PromptMemoryContext {
+    pub recalled_memories: Vec<String>,
+    pub cleanup_maintenance_signals: Vec<String>,
+    pub governance_attention_signals: Vec<String>,
+    pub recent_session_summaries: Vec<String>,
+    pub trace: PromptMemoryContextTrace,
+}
+
 /// Governed prompt candidate plus fusion metadata for cross-source reranking.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GovernedMemoryPromptSelection {
@@ -1482,6 +1545,320 @@ pub fn build_fused_memory_context_for_query(
         shared_candidates: shared_candidate_count,
         fused_candidates,
     }
+}
+
+fn cap_prompt_memory_context_text(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        let end = s
+            .char_indices()
+            .nth(max_chars)
+            .map(|(i, _)| i)
+            .unwrap_or(s.len());
+        format!("{}...", &s[..end])
+    }
+}
+
+/// Render recent `session_*` summaries for prompt-time memory context.
+pub fn render_recent_session_summaries_from_entries(
+    entries: &[(String, serde_json::Value)],
+    limit: usize,
+) -> Vec<String> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    let mut summaries: Vec<(String, String)> = entries
+        .iter()
+        .filter_map(|(key, value)| {
+            if !key.starts_with("session_") {
+                return None;
+            }
+
+            let rendered = match value {
+                serde_json::Value::String(text) => text.clone(),
+                other => serde_json::to_string(other).ok()?,
+            };
+
+            let rendered = rendered.trim();
+            if rendered.is_empty() {
+                return None;
+            }
+
+            Some((
+                key.clone(),
+                format!("{}: {}", key, crate::truncate_str(rendered, 320)),
+            ))
+        })
+        .collect();
+
+    summaries.sort_by(|a, b| b.0.cmp(&a.0));
+    summaries
+        .into_iter()
+        .take(limit)
+        .map(|(_, summary)| summary)
+        .collect()
+}
+
+/// Render governed attention signals for stale review and promotion hints.
+pub fn render_governed_memory_orchestration_signals_for_query(
+    entries: &[(String, serde_json::Value)],
+    now: DateTime<Utc>,
+    limit_per_bucket: usize,
+    query: Option<&str>,
+) -> Vec<String> {
+    let snapshot =
+        summarize_governed_memory_orchestration_for_query(entries, now, limit_per_bucket, query);
+    let mut rendered = Vec::new();
+
+    for signal in snapshot.stale_review {
+        let mut qualifiers = vec![
+            format!("kind={}", signal.metadata.kind),
+            format!("review_at={}", signal.lifecycle.review_at.to_rfc3339()),
+        ];
+        if let Some(expires_at) = signal.lifecycle.expires_at {
+            qualifiers.push(format!("expires_at={}", expires_at.to_rfc3339()));
+        }
+        if !signal.metadata.tags.is_empty() {
+            qualifiers.push(format!("tags={}", signal.metadata.tags.join(",")));
+        }
+        rendered.push(format!(
+            "Review stale memory before reuse: [{}] ({})",
+            signal.key,
+            qualifiers.join(", ")
+        ));
+    }
+
+    for signal in snapshot.promotion_candidates {
+        let mut qualifiers = vec![
+            format!("kind={}", signal.metadata.kind),
+            format!(
+                "freshness={}",
+                render_memory_freshness(&signal.metadata.freshness)
+            ),
+            format!(
+                "lifecycle={}",
+                render_memory_lifecycle_state(signal.lifecycle.state)
+            ),
+        ];
+        if !signal.metadata.tags.is_empty() {
+            qualifiers.push(format!("tags={}", signal.metadata.tags.join(",")));
+        }
+        rendered.push(format!(
+            "Consider promoting to MEMORY.md: [{}] ({})",
+            signal.key,
+            qualifiers.join(", ")
+        ));
+    }
+
+    rendered
+}
+
+/// Render governance maintenance actions for prompt-time memory context.
+pub fn render_memory_cleanup_orchestration_signals(
+    entries: &[(String, serde_json::Value)],
+    limit_per_bucket: usize,
+) -> Vec<String> {
+    let snapshot = summarize_memory_cleanup_for_orchestration(entries, limit_per_bucket);
+    let mut rendered = Vec::new();
+
+    for signal in snapshot.legacy_repairs {
+        match signal.action {
+            MemoryCleanupAction::MigrateLegacyKey => rendered.push(format!(
+                "Run memory_cleanup before reuse: migrate legacy key [{}] to [{}]",
+                signal.key,
+                signal
+                    .canonical_key
+                    .unwrap_or_else(|| "unknown".to_string())
+            )),
+            MemoryCleanupAction::DeleteLegacyKey => rendered.push(format!(
+                "Run memory_cleanup before reuse: delete duplicate legacy key [{}]",
+                signal.key
+            )),
+            _ => {}
+        }
+    }
+
+    for signal in snapshot.metadata_repairs {
+        rendered.push(format!(
+            "Run memory_cleanup to backfill governed metadata for [{}]",
+            signal.key
+        ));
+    }
+
+    for signal in snapshot.orphan_metadata {
+        rendered.push(format!(
+            "Run memory_cleanup to remove orphan metadata sidecar [{}]",
+            signal.metadata_key.unwrap_or(signal.key)
+        ));
+    }
+
+    rendered
+}
+
+/// Build a shared prompt-time memory context payload from semantic/shared/session sources.
+pub fn build_prompt_memory_context(
+    query: &str,
+    semantic_mode: MemoryContextRecallMode,
+    semantic_memories: &[MemoryFragment],
+    governed_entries: &[(String, serde_json::Value)],
+    structured_entries: &[(String, serde_json::Value)],
+    options: &PromptMemoryContextBuildOptions,
+    now: DateTime<Utc>,
+) -> PromptMemoryContext {
+    let fused_result = build_fused_memory_context_for_query(
+        query,
+        semantic_memories,
+        governed_entries,
+        options.semantic_limit,
+        options.shared_limit,
+        options.fused_limit,
+        now,
+    );
+    let cleanup_maintenance_signals =
+        render_memory_cleanup_orchestration_signals(governed_entries, options.maintenance_signal_limit);
+    let governance_attention_signals = render_governed_memory_orchestration_signals_for_query(
+        governed_entries,
+        now,
+        options.attention_signal_limit,
+        Some(query),
+    );
+    let recent_session_summaries =
+        render_recent_session_summaries_from_entries(structured_entries, options.session_summary_limit);
+    let maintenance_signal_count = cleanup_maintenance_signals.len();
+    let attention_signal_count = governance_attention_signals.len();
+    let session_summary_count = recent_session_summaries.len();
+    let recalled_memories = fused_result
+        .fused_candidates
+        .iter()
+        .map(|candidate| candidate.rendered.clone())
+        .collect();
+
+    PromptMemoryContext {
+        recalled_memories,
+        cleanup_maintenance_signals,
+        governance_attention_signals,
+        recent_session_summaries,
+        trace: PromptMemoryContextTrace {
+            semantic_mode,
+            semantic_candidates: fused_result.semantic_candidates,
+            shared_candidates: fused_result.shared_candidates,
+            fused_candidates: fused_result.fused_candidates,
+            maintenance_signals: maintenance_signal_count,
+            attention_signals: attention_signal_count,
+            session_summaries: session_summary_count,
+        },
+    }
+}
+
+/// Render prompt-time memory context into the standalone user-message block used by runtime.
+pub fn render_prompt_memory_context_message(context: &PromptMemoryContext) -> Option<String> {
+    if context.recalled_memories.is_empty()
+        && context.cleanup_maintenance_signals.is_empty()
+        && context.governance_attention_signals.is_empty()
+        && context.recent_session_summaries.is_empty()
+    {
+        return None;
+    }
+
+    let mut out = String::from("[Memory context]\n");
+
+    if !context.recalled_memories.is_empty() {
+        out.push_str("Relevant recalled memories:\n");
+        for memory in context.recalled_memories.iter().take(5) {
+            out.push_str(&format!(
+                "- {}\n",
+                cap_prompt_memory_context_text(memory, 320)
+            ));
+        }
+    }
+
+    if !context.cleanup_maintenance_signals.is_empty() {
+        if !context.recalled_memories.is_empty() {
+            out.push('\n');
+        }
+        out.push_str("Governance maintenance signals:\n");
+        for signal in context.cleanup_maintenance_signals.iter().take(4) {
+            out.push_str(&format!(
+                "- {}\n",
+                cap_prompt_memory_context_text(signal, 320)
+            ));
+        }
+    }
+
+    if !context.governance_attention_signals.is_empty() {
+        if !context.recalled_memories.is_empty() || !context.cleanup_maintenance_signals.is_empty()
+        {
+            out.push('\n');
+        }
+        out.push_str("Governance attention signals:\n");
+        for signal in context.governance_attention_signals.iter().take(4) {
+            out.push_str(&format!(
+                "- {}\n",
+                cap_prompt_memory_context_text(signal, 320)
+            ));
+        }
+    }
+
+    if !context.recent_session_summaries.is_empty() {
+        if !context.recalled_memories.is_empty()
+            || !context.cleanup_maintenance_signals.is_empty()
+            || !context.governance_attention_signals.is_empty()
+        {
+            out.push('\n');
+        }
+        out.push_str("Recent session summaries:\n");
+        for summary in context.recent_session_summaries.iter().take(3) {
+            out.push_str(&format!(
+                "- {}\n",
+                cap_prompt_memory_context_text(summary, 320)
+            ));
+        }
+    }
+
+    Some(out.trim_end().to_string())
+}
+
+/// Render the shared prompt-time memory trace payload used by `llm.log`.
+pub fn render_prompt_memory_context_trace(trace: &PromptMemoryContextTrace) -> Option<String> {
+    if trace.semantic_candidates == 0
+        && trace.shared_candidates == 0
+        && trace.maintenance_signals == 0
+        && trace.attention_signals == 0
+        && trace.session_summaries == 0
+    {
+        return None;
+    }
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "semantic_mode={}\nsemantic_candidates={}\nshared_candidates={}\nmaintenance_signals={}\nattention_signals={}\nsession_summaries={}\n",
+        trace.semantic_mode.as_str(),
+        trace.semantic_candidates,
+        trace.shared_candidates,
+        trace.maintenance_signals,
+        trace.attention_signals,
+        trace.session_summaries
+    ));
+
+    if !trace.fused_candidates.is_empty() {
+        out.push_str("selected_fused_recall:\n");
+        for (rank, candidate) in trace.fused_candidates.iter().enumerate() {
+            out.push_str(&format!(
+                "{}. source={} source_rank={} source_weight={:.3} tie_break_priority={} fused_score={:.5} {}\n",
+                rank + 1,
+                candidate.source.as_str(),
+                candidate.source_rank + 1,
+                candidate.source_weight,
+                candidate.tie_break_priority,
+                candidate.fused_score,
+                crate::truncate_str(&candidate.rendered, 280)
+            ));
+        }
+    }
+
+    Some(out.trim_end().to_string())
 }
 
 /// An entity in the knowledge graph.

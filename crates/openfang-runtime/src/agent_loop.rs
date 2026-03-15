@@ -21,10 +21,8 @@ use openfang_types::agent::AgentId;
 use openfang_types::agent::AgentManifest;
 use openfang_types::error::{OpenFangError, OpenFangResult};
 use openfang_types::memory::{
-    FusedMemoryContextCandidate, Memory, MemoryFilter, MemorySource,
-    build_fused_memory_context_for_query, render_memory_freshness,
-    render_memory_lifecycle_state,
-    summarize_governed_memory_orchestration_for_query, summarize_memory_cleanup_for_orchestration,
+    Memory, MemoryContextRecallMode, MemoryFilter, MemorySource, PromptMemoryContextBuildOptions,
+    build_prompt_memory_context, render_prompt_memory_context_trace,
 };
 use openfang_types::message::{
     ContentBlock, Message, MessageContent, Role, StopReason, TokenUsage,
@@ -91,272 +89,6 @@ pub fn strip_provider_prefix(model: &str, provider: &str) -> String {
 
 /// Default context window size (tokens) for token-based trimming.
 const DEFAULT_CONTEXT_WINDOW: usize = 200_000;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SemanticRecallMode {
-    Hybrid,
-    TextOnly,
-}
-
-impl SemanticRecallMode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Hybrid => "hybrid",
-            Self::TextOnly => "text_only",
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct MemoryRecallTrace {
-    semantic_mode: SemanticRecallMode,
-    semantic_candidates: usize,
-    shared_candidates: usize,
-    fused_candidates: Vec<FusedMemoryContextCandidate>,
-    maintenance_signals: usize,
-    attention_signals: usize,
-    session_summaries: usize,
-}
-
-#[derive(Debug, Clone)]
-struct FusedMemoryContext {
-    recalled_memories: Vec<String>,
-    trace: MemoryRecallTrace,
-}
-
-fn fuse_memory_context_candidates(
-    user_message: &str,
-    semantic_memories: &[openfang_types::memory::MemoryFragment],
-    governed_entries: &[(String, serde_json::Value)],
-    limit: usize,
-) -> FusedMemoryContext {
-    if limit == 0 {
-        return FusedMemoryContext {
-            recalled_memories: Vec::new(),
-            trace: MemoryRecallTrace {
-                semantic_mode: SemanticRecallMode::TextOnly,
-                semantic_candidates: 0,
-                shared_candidates: 0,
-                fused_candidates: Vec::new(),
-                maintenance_signals: 0,
-                attention_signals: 0,
-                session_summaries: 0,
-            },
-        };
-    }
-
-    let fused_result = build_fused_memory_context_for_query(
-        user_message,
-        semantic_memories,
-        governed_entries,
-        5,
-        limit.saturating_mul(2),
-        limit,
-        chrono::Utc::now(),
-    );
-    let recalled_memories = fused_result
-        .fused_candidates
-        .iter()
-        .map(|candidate| candidate.rendered.clone())
-        .collect();
-
-    FusedMemoryContext {
-        recalled_memories,
-        trace: MemoryRecallTrace {
-            semantic_mode: SemanticRecallMode::TextOnly,
-            semantic_candidates: fused_result.semantic_candidates,
-            shared_candidates: fused_result.shared_candidates,
-            fused_candidates: fused_result.fused_candidates,
-            maintenance_signals: 0,
-            attention_signals: 0,
-            session_summaries: 0,
-        },
-    }
-}
-
-fn format_memory_recall_trace(trace: &MemoryRecallTrace) -> Option<String> {
-    if trace.semantic_candidates == 0
-        && trace.shared_candidates == 0
-        && trace.maintenance_signals == 0
-        && trace.attention_signals == 0
-        && trace.session_summaries == 0
-    {
-        return None;
-    }
-
-    let mut out = String::new();
-    out.push_str(&format!(
-        "semantic_mode={}\nsemantic_candidates={}\nshared_candidates={}\nmaintenance_signals={}\nattention_signals={}\nsession_summaries={}\n",
-        trace.semantic_mode.as_str(),
-        trace.semantic_candidates,
-        trace.shared_candidates,
-        trace.maintenance_signals,
-        trace.attention_signals,
-        trace.session_summaries
-    ));
-
-    if !trace.fused_candidates.is_empty() {
-        out.push_str("selected_fused_recall:\n");
-        for (rank, candidate) in trace.fused_candidates.iter().enumerate() {
-            out.push_str(&format!(
-                "{}. source={} source_rank={} source_weight={:.3} tie_break_priority={} fused_score={:.5} {}\n",
-                rank + 1,
-                candidate.source.as_str(),
-                candidate.source_rank + 1,
-                candidate.source_weight,
-                candidate.tie_break_priority,
-                candidate.fused_score,
-                openfang_types::truncate_str(&candidate.rendered, 280)
-            ));
-        }
-    }
-
-    Some(out.trim_end().to_string())
-}
-
-#[cfg(test)]
-fn load_recent_session_summaries(
-    memory: &MemorySubstrate,
-    agent_id: AgentId,
-    limit: usize,
-) -> Vec<String> {
-    load_recent_session_summaries_from_entries(&memory.list_kv(agent_id).unwrap_or_default(), limit)
-}
-
-fn load_recent_session_summaries_from_entries(
-    entries: &[(String, serde_json::Value)],
-    limit: usize,
-) -> Vec<String> {
-    let mut summaries: Vec<(String, String)> = entries
-        .iter()
-        .filter_map(|(key, value)| {
-            if !key.starts_with("session_") {
-                return None;
-            }
-
-            let rendered = match value {
-                serde_json::Value::String(text) => text.clone(),
-                other => serde_json::to_string(&other).ok()?,
-            };
-
-            let rendered = rendered.trim();
-            if rendered.is_empty() {
-                return None;
-            }
-
-            Some((
-                key.clone(),
-                format!("{}: {}", key, openfang_types::truncate_str(rendered, 320)),
-            ))
-        })
-        .collect();
-
-    summaries.sort_by(|a, b| b.0.cmp(&a.0));
-    summaries
-        .into_iter()
-        .take(limit)
-        .map(|(_, summary)| summary)
-        .collect()
-}
-
-fn format_governed_memory_orchestration_signals(
-    user_message: &str,
-    entries: &[(String, serde_json::Value)],
-    limit_per_bucket: usize,
-) -> Vec<String> {
-    let snapshot = summarize_governed_memory_orchestration_for_query(
-        entries,
-        chrono::Utc::now(),
-        limit_per_bucket,
-        Some(user_message),
-    );
-    let mut rendered = Vec::new();
-
-    for signal in snapshot.stale_review {
-        let mut qualifiers = vec![
-            format!("kind={}", signal.metadata.kind),
-            format!("review_at={}", signal.lifecycle.review_at.to_rfc3339()),
-        ];
-        if let Some(expires_at) = signal.lifecycle.expires_at {
-            qualifiers.push(format!("expires_at={}", expires_at.to_rfc3339()));
-        }
-        if !signal.metadata.tags.is_empty() {
-            qualifiers.push(format!("tags={}", signal.metadata.tags.join(",")));
-        }
-        rendered.push(format!(
-            "Review stale memory before reuse: [{}] ({})",
-            signal.key,
-            qualifiers.join(", ")
-        ));
-    }
-
-    for signal in snapshot.promotion_candidates {
-        let mut qualifiers = vec![
-            format!("kind={}", signal.metadata.kind),
-            format!(
-                "freshness={}",
-                render_memory_freshness(&signal.metadata.freshness)
-            ),
-            format!(
-                "lifecycle={}",
-                render_memory_lifecycle_state(signal.lifecycle.state)
-            ),
-        ];
-        if !signal.metadata.tags.is_empty() {
-            qualifiers.push(format!("tags={}", signal.metadata.tags.join(",")));
-        }
-        rendered.push(format!(
-            "Consider promoting to MEMORY.md: [{}] ({})",
-            signal.key,
-            qualifiers.join(", ")
-        ));
-    }
-
-    rendered
-}
-
-fn format_memory_cleanup_orchestration_signals(
-    entries: &[(String, serde_json::Value)],
-    limit_per_bucket: usize,
-) -> Vec<String> {
-    let snapshot = summarize_memory_cleanup_for_orchestration(entries, limit_per_bucket);
-    let mut rendered = Vec::new();
-
-    for signal in snapshot.legacy_repairs {
-        match signal.action {
-            openfang_types::memory::MemoryCleanupAction::MigrateLegacyKey => {
-                rendered.push(format!(
-                    "Run memory_cleanup before reuse: migrate legacy key [{}] to [{}]",
-                    signal.key,
-                    signal
-                        .canonical_key
-                        .unwrap_or_else(|| "unknown".to_string())
-                ))
-            }
-            openfang_types::memory::MemoryCleanupAction::DeleteLegacyKey => rendered.push(format!(
-                "Run memory_cleanup before reuse: delete duplicate legacy key [{}]",
-                signal.key
-            )),
-            _ => {}
-        }
-    }
-
-    for signal in snapshot.metadata_repairs {
-        rendered.push(format!(
-            "Run memory_cleanup to backfill governed metadata for [{}]",
-            signal.key
-        ));
-    }
-
-    for signal in snapshot.orphan_metadata {
-        rendered.push(format!(
-            "Run memory_cleanup to remove orphan metadata sidecar [{}]",
-            signal.metadata_key.unwrap_or(signal.key)
-        ));
-    }
-
-    rendered
-}
 
 fn load_governed_memory_entries(
     memory: &MemorySubstrate,
@@ -511,7 +243,7 @@ pub async fn run_agent_loop_with_session_message(
             Ok(query_vec) => {
                 debug!("Using hybrid recall (dims={})", query_vec.len());
                 (
-                    SemanticRecallMode::Hybrid,
+                    MemoryContextRecallMode::Hybrid,
                     memory
                         .recall_with_embedding_async(
                             user_message,
@@ -529,7 +261,7 @@ pub async fn run_agent_loop_with_session_message(
             Err(e) => {
                 warn!("Embedding recall failed, falling back to text-only search: {e}");
                 (
-                    SemanticRecallMode::TextOnly,
+                    MemoryContextRecallMode::TextOnly,
                     memory
                         .recall(
                             user_message,
@@ -546,7 +278,7 @@ pub async fn run_agent_loop_with_session_message(
         }
     } else {
         (
-            SemanticRecallMode::TextOnly,
+            MemoryContextRecallMode::TextOnly,
             memory
                 .recall(
                     user_message,
@@ -562,24 +294,18 @@ pub async fn run_agent_loop_with_session_message(
     };
     let structured_entries = memory.list_kv(session.agent_id).unwrap_or_default();
     let governed_entries = load_governed_memory_entries(memory, kernel.as_ref(), session.agent_id);
-    let cleanup_signals = format_memory_cleanup_orchestration_signals(&governed_entries, 2);
-    let governed_memory_signals =
-        format_governed_memory_orchestration_signals(user_message, &governed_entries, 2);
-    let recent_session_summaries =
-        load_recent_session_summaries_from_entries(&structured_entries, 3);
-    let mut fused_memory_context =
-        fuse_memory_context_candidates(user_message, &_memories, &governed_entries, 5);
-    fused_memory_context.trace.semantic_mode = semantic_recall_mode;
-    fused_memory_context.trace.maintenance_signals = cleanup_signals.len();
-    fused_memory_context.trace.attention_signals = governed_memory_signals.len();
-    fused_memory_context.trace.session_summaries = recent_session_summaries.len();
-    let memory_context_msg = crate::prompt_builder::build_memory_context_message(
-        &fused_memory_context.recalled_memories,
-        &cleanup_signals,
-        &governed_memory_signals,
-        &recent_session_summaries,
+    let memory_context = build_prompt_memory_context(
+        user_message,
+        semantic_recall_mode,
+        &_memories,
+        &governed_entries,
+        &structured_entries,
+        &PromptMemoryContextBuildOptions::default(),
+        chrono::Utc::now(),
     );
-    if let Some(memory_trace) = format_memory_recall_trace(&fused_memory_context.trace) {
+    let memory_context_msg =
+        crate::prompt_builder::build_memory_context_message(&memory_context);
+    if let Some(memory_trace) = render_prompt_memory_context_trace(&memory_context.trace) {
         log_llm_event(workspace_root, "MEMORY_TRACE", "", &memory_trace).await;
     }
 
@@ -1525,7 +1251,7 @@ pub async fn run_agent_loop_streaming(
             Ok(query_vec) => {
                 debug!("Using hybrid recall (streaming, dims={})", query_vec.len());
                 (
-                    SemanticRecallMode::Hybrid,
+                    MemoryContextRecallMode::Hybrid,
                     memory
                         .recall_with_embedding_async(
                             user_message,
@@ -1543,7 +1269,7 @@ pub async fn run_agent_loop_streaming(
             Err(e) => {
                 warn!("Embedding recall failed (streaming), falling back to text-only search: {e}");
                 (
-                    SemanticRecallMode::TextOnly,
+                    MemoryContextRecallMode::TextOnly,
                     memory
                         .recall(
                             user_message,
@@ -1560,7 +1286,7 @@ pub async fn run_agent_loop_streaming(
         }
     } else {
         (
-            SemanticRecallMode::TextOnly,
+            MemoryContextRecallMode::TextOnly,
             memory
                 .recall(
                     user_message,
@@ -1576,24 +1302,18 @@ pub async fn run_agent_loop_streaming(
     };
     let structured_entries = memory.list_kv(session.agent_id).unwrap_or_default();
     let governed_entries = load_governed_memory_entries(memory, kernel.as_ref(), session.agent_id);
-    let cleanup_signals = format_memory_cleanup_orchestration_signals(&governed_entries, 2);
-    let governed_memory_signals =
-        format_governed_memory_orchestration_signals(user_message, &governed_entries, 2);
-    let recent_session_summaries =
-        load_recent_session_summaries_from_entries(&structured_entries, 3);
-    let mut fused_memory_context =
-        fuse_memory_context_candidates(user_message, &_memories, &governed_entries, 5);
-    fused_memory_context.trace.semantic_mode = semantic_recall_mode;
-    fused_memory_context.trace.maintenance_signals = cleanup_signals.len();
-    fused_memory_context.trace.attention_signals = governed_memory_signals.len();
-    fused_memory_context.trace.session_summaries = recent_session_summaries.len();
-    let memory_context_msg = crate::prompt_builder::build_memory_context_message(
-        &fused_memory_context.recalled_memories,
-        &cleanup_signals,
-        &governed_memory_signals,
-        &recent_session_summaries,
+    let memory_context = build_prompt_memory_context(
+        user_message,
+        semantic_recall_mode,
+        &_memories,
+        &governed_entries,
+        &structured_entries,
+        &PromptMemoryContextBuildOptions::default(),
+        chrono::Utc::now(),
     );
-    if let Some(memory_trace) = format_memory_recall_trace(&fused_memory_context.trace) {
+    let memory_context_msg =
+        crate::prompt_builder::build_memory_context_message(&memory_context);
+    if let Some(memory_trace) = render_prompt_memory_context_trace(&memory_context.trace) {
         log_llm_event(workspace_root, "MEMORY_TRACE", "", &memory_trace).await;
     }
 
@@ -3312,8 +3032,12 @@ mod tests {
     use crate::llm_driver::{CompletionResponse, LlmError};
     use async_trait::async_trait;
     use openfang_types::memory::{
-        MemoryContextSource, MemoryFreshness, rank_governed_memory_context_candidates_for_query,
-        rank_semantic_memory_context_candidates,
+        MemoryContextRecallMode, MemoryContextSource, MemoryFreshness, PromptMemoryContextBuildOptions,
+        PromptMemoryContextTrace, build_prompt_memory_context,
+        rank_governed_memory_context_candidates_for_query,
+        rank_semantic_memory_context_candidates, render_governed_memory_orchestration_signals_for_query,
+        render_memory_cleanup_orchestration_signals, render_prompt_memory_context_trace,
+        render_recent_session_summaries_from_entries,
     };
     use openfang_types::tool::ToolCall;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -3394,7 +3118,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fuse_memory_context_candidates_interleaves_semantic_and_shared_memory() {
+    fn test_build_prompt_memory_context_interleaves_semantic_and_shared_memory() {
         let now = chrono::Utc::now();
         let agent_id = AgentId::new();
         let semantic_memory = openfang_types::memory::MemoryFragment {
@@ -3434,11 +3158,14 @@ mod tests {
             ),
         ];
 
-        let rendered = fuse_memory_context_candidates(
+        let rendered = build_prompt_memory_context(
             "What is blocking the alpha launch?",
+            MemoryContextRecallMode::Hybrid,
             &[semantic_memory],
             &entries,
-            5,
+            &[],
+            &PromptMemoryContextBuildOptions::default(),
+            now,
         );
 
         assert_eq!(rendered.recalled_memories.len(), 2);
@@ -3459,13 +3186,13 @@ mod tests {
     }
 
     #[test]
-    fn test_format_memory_recall_trace_includes_source_counts_and_selected_ranks() {
-        let trace = MemoryRecallTrace {
-            semantic_mode: SemanticRecallMode::Hybrid,
+    fn test_render_prompt_memory_context_trace_includes_source_counts_and_selected_ranks() {
+        let trace = PromptMemoryContextTrace {
+            semantic_mode: MemoryContextRecallMode::Hybrid,
             semantic_candidates: 2,
             shared_candidates: 1,
             fused_candidates: vec![
-                FusedMemoryContextCandidate {
+                openfang_types::memory::FusedMemoryContextCandidate {
                     rendered: "Semantic memory [episodic] waiver code".to_string(),
                     source: MemoryContextSource::Semantic,
                     source_weight: 1.0,
@@ -3473,7 +3200,7 @@ mod tests {
                     source_rank: 0,
                     tie_break_priority: 3,
                 },
-                FusedMemoryContextCandidate {
+                openfang_types::memory::FusedMemoryContextCandidate {
                     rendered: "Shared memory [project.alpha.status] qa signoff".to_string(),
                     source: MemoryContextSource::Shared,
                     source_weight: 1.32,
@@ -3487,7 +3214,7 @@ mod tests {
             session_summaries: 1,
         };
 
-        let rendered = format_memory_recall_trace(&trace).unwrap();
+        let rendered = render_prompt_memory_context_trace(&trace).unwrap();
 
         assert!(rendered.contains("semantic_mode=hybrid"));
         assert!(rendered.contains("semantic_candidates=2"));
@@ -3502,9 +3229,9 @@ mod tests {
     }
 
     #[test]
-    fn test_format_memory_recall_trace_omitted_when_all_sources_empty() {
-        let trace = MemoryRecallTrace {
-            semantic_mode: SemanticRecallMode::TextOnly,
+    fn test_render_prompt_memory_context_trace_omitted_when_all_sources_empty() {
+        let trace = PromptMemoryContextTrace {
+            semantic_mode: MemoryContextRecallMode::TextOnly,
             semantic_candidates: 0,
             shared_candidates: 0,
             fused_candidates: Vec::new(),
@@ -3513,11 +3240,11 @@ mod tests {
             session_summaries: 0,
         };
 
-        assert!(format_memory_recall_trace(&trace).is_none());
+        assert!(render_prompt_memory_context_trace(&trace).is_none());
     }
 
     #[test]
-    fn test_load_recent_session_summaries_prefers_latest_keys() {
+    fn test_render_recent_session_summaries_prefers_latest_keys() {
         let memory = openfang_memory::MemorySubstrate::open_in_memory(0.01).unwrap();
         let agent_id = AgentId::new();
         memory
@@ -3542,7 +3269,8 @@ mod tests {
             )
             .unwrap();
 
-        let summaries = load_recent_session_summaries(&memory, agent_id, 1);
+        let summaries =
+            render_recent_session_summaries_from_entries(&memory.list_kv(agent_id).unwrap(), 1);
         assert_eq!(summaries.len(), 1);
         assert!(summaries[0].contains("session_2026-03-12_beta"));
         assert!(summaries[0].contains("Newest summary"));
@@ -3662,7 +3390,7 @@ mod tests {
     }
 
     #[test]
-    fn test_format_governed_memory_orchestration_signals_surfaces_review_and_promotion() {
+    fn test_render_governed_memory_orchestration_signals_surfaces_review_and_promotion() {
         let now = chrono::Utc::now();
         let stale_project = openfang_types::memory::MemoryRecordMetadata {
             schema_version: openfang_types::memory::MEMORY_METADATA_SCHEMA_VERSION,
@@ -3703,10 +3431,11 @@ mod tests {
             ),
         ];
 
-        let rendered = format_governed_memory_orchestration_signals(
-            "What is the alpha project status and ui preference?",
+        let rendered = render_governed_memory_orchestration_signals_for_query(
             &entries,
+            now,
             2,
+            Some("What is the alpha project status and ui preference?"),
         );
 
         assert_eq!(rendered.len(), 2);
@@ -3717,7 +3446,7 @@ mod tests {
     }
 
     #[test]
-    fn test_format_memory_cleanup_orchestration_signals_surfaces_maintenance_actions() {
+    fn test_render_memory_cleanup_orchestration_signals_surfaces_maintenance_actions() {
         let entries = vec![
             ("legacy_theme".to_string(), serde_json::json!("solarized")),
             (
@@ -3739,7 +3468,7 @@ mod tests {
             ),
         ];
 
-        let rendered = format_memory_cleanup_orchestration_signals(&entries, 2);
+        let rendered = render_memory_cleanup_orchestration_signals(&entries, 2);
 
         assert_eq!(rendered.len(), 3);
         assert!(rendered[0].contains("Run memory_cleanup before reuse"));

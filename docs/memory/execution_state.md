@@ -312,26 +312,65 @@
       - 第二轮真实回复同时返回 shared probe 对应的 `QA signoff` blocker 与 semantic probe 对应的 `HELPER-DOWNSHIFT-SEMANTIC-20260315-171345`
       - verifier 的 `~/.openfang/workspaces/memory-context-helper-verifier-20260315-171345/logs/llm.log` 中，第二轮 `*** MEMORY TRACE` 明确包含：
         - `1. source=shared source_rank=1 source_weight=1.559 tie_break_priority=0 fused_score=0.02556 ... HELPER-DOWNSHIFT-SHARED-20260315-171345 ...`
-        - `2. source=semantic source_rank=1 source_weight=1.000 tie_break_priority=3 fused_score=0.01639 ... HELPER-DOWNSHIFT-SEMANTIC-20260315-171345 ...`
+      - `2. source=semantic source_rank=1 source_weight=1.000 tie_break_priority=3 fused_score=0.01639 ... HELPER-DOWNSHIFT-SEMANTIC-20260315-171345 ...`
       - 同一轮 `Relevant recalled memories` 也同时出现 shared / semantic 两条条目，说明 helper 下沉后真实 prompt 注入没有断线
       - `/api/budget` 中 `daily_spend` 从 `0.11647460000000001` 增到 `0.12204940000000002`，`/api/budget/agents` 中 verifier agent 花费为 `0.0055748`
       - 临时 verifier agent、其 workspace、共享 probe 与关联 DB rows 已在验证后清理；daemon 已按流程停止
+  - 已完成 Phase 2 第六批 prompt memory context contract 收口：
+    - `openfang-types::memory` 现在新增统一的 prompt-time memory payload / trace contract：
+      - `MemoryContextRecallMode`
+      - `PromptMemoryContextBuildOptions`
+      - `PromptMemoryContextTrace`
+      - `PromptMemoryContext`
+    - 共享层现在会直接负责：
+      - semantic/shared fused recall 选择
+      - `Governance maintenance signals` 文本渲染
+      - `Governance attention signals` 文本渲染
+      - `Recent session summaries` 文本渲染
+      - `Relevant recalled memories` message block 组装
+      - `*** MEMORY TRACE` payload 渲染
+    - `openfang-runtime::agent_loop` 不再本地维护 recall trace schema、memory context message 文本、attention/maintenance signal 文本或 session summary 格式化，而是直接消费 `build_prompt_memory_context` 与 `render_prompt_memory_context_trace`
+    - `openfang-runtime::prompt_builder` 的 `build_memory_context_message` 现在退化成对共享 helper 的薄封装，不再自己持有 memory section 编排语义
+    - 新增/更新单测覆盖：
+      - runtime 侧 shared payload 集成仍能保持 shared-first 的 fused recall
+      - trace 渲染改为覆盖共享 trace contract
+      - session summary / attention signal / maintenance signal 渲染改为覆盖共享 helper
+  - 已完成本轮 prompt memory context contract 验证：
+    - `cargo build --workspace --lib`
+    - `cargo test --workspace`
+    - `cargo clippy --workspace --all-targets -- -D warnings`
+    - `cargo build -p openfang-cli`
+    - live shared payload smoke 验证通过：
+      - 临时创建 `memory-shared-smoke-20260315-182011` agent，查询 `What is the debug contract alpha status?`
+      - verifier 的 `llm.log` 中同时出现：
+        - `*** MEMORY TRACE`
+        - `Relevant recalled memories`
+        - `Shared memory [project.alpha.debug_contract_status] ... debug alpha status`
+      - trace 明确记录 `source=shared source_rank=1 source_weight=1.485 tie_break_priority=1 fused_score=0.02434 ...`
+      - 真实回复直接基于记忆上下文复述 `project.alpha.debug_contract_status`
+    - live semantic reset smoke 验证通过：
+      - 临时创建 `memory-contract-verifier-20260315-181753` agent，先写入语义 probe `CONTRACT-SEM-20260315-181753`，再 `POST /api/agents/{id}/session/reset`
+      - reset 后第二轮真实回复仍返回 `CONTRACT-SEM-20260315-181753`
+      - verifier 的 `llm.log` 中第二轮 `*** MEMORY TRACE` 与 `Relevant recalled memories` 都明确包含该 semantic probe
+    - live 验证期间 `/api/budget` 的 `daily_spend` 从 `0.11647460000000001` 增到 `0.1223772`
+    - 临时 smoke verifier、其 workspace 与关联 DB rows 已在验证后清理；daemon 已按流程停止
 
 ## 进行中
 
-- 继续推进 Phase 2：shared retrieval helper 已覆盖 semantic/shared candidate 组装与 fused recall 选择，下一步评估是否把最终 memory context message composition / trace payload 也进一步收口到共享 retrieval contract。
+- 继续推进 Phase 2：shared retrieval helper 已覆盖 semantic/shared candidate、memory context message 与 trace contract，下一步评估是否把这套 payload 同步成更结构化的 telemetry / inspection 输出。
 
 ## 下一步动作
 
-- 评估是否要把最终 `Relevant recalled memories` 文本组装与 trace payload schema 一起下沉成统一 retrieval output，而不是由 runtime 保留最后一层 prompt/message composition。
 - 继续观察 governed metadata 的显式 `source_weight` / `tie_break_priority` 是否需要引入更多 lifecycle bucket 或 namespace/kind-specific weight，而不只是当前 query/lifecycle/promotion 三元组合。
 - 评估是否要把 `MEMORY_TRACE` 的 source/fused 信息进一步同步到 structured telemetry / tracing fields，而不只写入 `llm.log` 文本。
+- 评估是否要把 `prompt_builder` 中残留的 memory-context wrapper 也进一步裁薄，避免共享 contract 之上再保留一层重复命名。
 - 在切换电脑或结束一轮实质性工作前，持续更新本文件。
 
 ## 风险与阻塞
 
 - 当前现有 agent 的 tool-call 路径存在两类既有兼容问题：`assistant` 的 gemini path 仍有 `thought_signature` 错误，`Researcher` 的 MiniMax path 也出现了 tool-result id 不匹配；因此本轮 dashboard cleanup live LLM verification 同样改用临时无工具 MiniMax verifier agent 完成。
-- Phase 2 虽然已经把 semantic/shared candidate 渲染与 fused recall 选择下沉到了 `openfang-types::memory`，但最终 prompt 注入文本与 trace payload 仍在 runtime；距离“底层统一 retrieval contract”还有最后一层没有收口。
+- Phase 2 已经把 semantic/shared candidate、memory context message 与 trace payload 下沉到了 `openfang-types::memory`，但 `MEMORY_TRACE` 目前仍只写文本日志，尚未同步成更结构化的 telemetry。
+- 需要避免在 daemon 运行中直接用 sqlite 修改 shared memory sidecar 做复杂 live probe；这类验证更稳妥的做法仍然是 daemon 停止后做 DB 注入，或改造成 API/tool 可达路径。
 - 如果后续启动工作时不先读取本文件，分支纪律和连续性可能重新漂移。
 
 ## 验证清单

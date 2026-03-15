@@ -4,6 +4,8 @@
 //! Replaces the scattered `push_str` prompt injection throughout the codebase
 //! with a single, testable, ordered prompt builder.
 
+use openfang_types::memory::PromptMemoryContext;
+
 /// Metadata for an immediately visible skill, used for prompt injection.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SkillInfo {
@@ -341,62 +343,9 @@ pub fn build_canonical_context_message(ctx: &PromptContext) -> Option<String> {
 /// This keeps the system prompt stable while still surfacing relevant memories
 /// and recent session summaries for the current turn.
 pub fn build_memory_context_message(
-    recalled_memories: &[String],
-    cleanup_maintenance_signals: &[String],
-    governed_memory_signals: &[String],
-    recent_session_summaries: &[String],
+    context: &PromptMemoryContext,
 ) -> Option<String> {
-    if recalled_memories.is_empty()
-        && cleanup_maintenance_signals.is_empty()
-        && governed_memory_signals.is_empty()
-        && recent_session_summaries.is_empty()
-    {
-        return None;
-    }
-
-    let mut out = String::from("[Memory context]\n");
-
-    if !recalled_memories.is_empty() {
-        out.push_str("Relevant recalled memories:\n");
-        for memory in recalled_memories.iter().take(5) {
-            out.push_str(&format!("- {}\n", cap_str(memory, 320)));
-        }
-    }
-
-    if !cleanup_maintenance_signals.is_empty() {
-        if !recalled_memories.is_empty() {
-            out.push('\n');
-        }
-        out.push_str("Governance maintenance signals:\n");
-        for signal in cleanup_maintenance_signals.iter().take(4) {
-            out.push_str(&format!("- {}\n", cap_str(signal, 320)));
-        }
-    }
-
-    if !governed_memory_signals.is_empty() {
-        if !recalled_memories.is_empty() || !cleanup_maintenance_signals.is_empty() {
-            out.push('\n');
-        }
-        out.push_str("Governance attention signals:\n");
-        for signal in governed_memory_signals.iter().take(4) {
-            out.push_str(&format!("- {}\n", cap_str(signal, 320)));
-        }
-    }
-
-    if !recent_session_summaries.is_empty() {
-        if !recalled_memories.is_empty()
-            || !cleanup_maintenance_signals.is_empty()
-            || !governed_memory_signals.is_empty()
-        {
-            out.push('\n');
-        }
-        out.push_str("Recent session summaries:\n");
-        for summary in recent_session_summaries.iter().take(3) {
-            out.push_str(&format!("- {}\n", cap_str(summary, 320)));
-        }
-    }
-
-    Some(out.trim_end().to_string())
+    openfang_types::memory::render_prompt_memory_context_message(context)
 }
 
 /// Build the memory recall section.
@@ -1448,16 +1397,31 @@ mod tests {
 
     #[test]
     fn test_memory_context_message_present() {
-        let message = build_memory_context_message(
-            &[
+        let message = build_memory_context_message(&PromptMemoryContext {
+            recalled_memories: vec![
                 "Semantic memory [project.alpha] Architecture decision: use Axum".to_string(),
                 "Shared memory [pref.editor.theme] (kind=preference, freshness=durable, lifecycle=active, tags=profile,ui) solarized dark".to_string(),
             ],
-            &["Run memory_cleanup before reuse: migrate legacy key [theme] to [general.theme]"
-                .to_string()],
-            &["Review stale memory before reuse: [project.alpha.status] (kind=project_state, review_at=2026-03-10T00:00:00Z, tags=project,alpha)".to_string()],
-            &["session_2026-03-11_alpha: Reviewed prompt pipeline".to_string()],
-        )
+            cleanup_maintenance_signals: vec![
+                "Run memory_cleanup before reuse: migrate legacy key [theme] to [general.theme]"
+                    .to_string(),
+            ],
+            governance_attention_signals: vec![
+                "Review stale memory before reuse: [project.alpha.status] (kind=project_state, review_at=2026-03-10T00:00:00Z, tags=project,alpha)".to_string(),
+            ],
+            recent_session_summaries: vec![
+                "session_2026-03-11_alpha: Reviewed prompt pipeline".to_string(),
+            ],
+            trace: openfang_types::memory::PromptMemoryContextTrace {
+                semantic_mode: openfang_types::memory::MemoryContextRecallMode::Hybrid,
+                semantic_candidates: 2,
+                shared_candidates: 1,
+                fused_candidates: Vec::new(),
+                maintenance_signals: 1,
+                attention_signals: 1,
+                session_summaries: 1,
+            },
+        })
         .unwrap();
 
         assert!(message.contains("[Memory context]"));
@@ -1474,7 +1438,22 @@ mod tests {
 
     #[test]
     fn test_memory_context_message_omitted_when_empty() {
-        assert!(build_memory_context_message(&[], &[], &[], &[]).is_none());
+        assert!(build_memory_context_message(&PromptMemoryContext {
+            recalled_memories: Vec::new(),
+            cleanup_maintenance_signals: Vec::new(),
+            governance_attention_signals: Vec::new(),
+            recent_session_summaries: Vec::new(),
+            trace: openfang_types::memory::PromptMemoryContextTrace {
+                semantic_mode: openfang_types::memory::MemoryContextRecallMode::TextOnly,
+                semantic_candidates: 0,
+                shared_candidates: 0,
+                fused_candidates: Vec::new(),
+                maintenance_signals: 0,
+                attention_signals: 0,
+                session_summaries: 0,
+            },
+        })
+        .is_none());
     }
 
     #[test]
