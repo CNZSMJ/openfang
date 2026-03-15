@@ -21,8 +21,10 @@ use openfang_types::agent::AgentId;
 use openfang_types::agent::AgentManifest;
 use openfang_types::error::{OpenFangError, OpenFangResult};
 use openfang_types::memory::{
-    Memory, MemoryFilter, MemoryFreshness, MemoryLifecycleState, MemorySource,
-    select_governed_memory_prompt_candidates_for_query,
+    FusedMemoryContextCandidate, Memory, MemoryContextSource, MemoryFilter,
+    MemoryFreshness, MemoryLifecycleState, MemorySource, RankedMemoryContextCandidate,
+    fuse_ranked_memory_context_candidates,
+    select_governed_memory_prompt_candidates_for_query_with_fusion,
     summarize_governed_memory_orchestration_for_query, summarize_memory_cleanup_for_orchestration,
 };
 use openfang_types::message::{
@@ -71,7 +73,6 @@ const MAX_MESSAGES_LOG_CHARS: usize = 12_000;
 const MAX_MESSAGE_TEXT_LOG_CHARS: usize = 4_000;
 /// Logging: Maximum characters for a single block payload inside an INPUT entry.
 const MAX_BLOCK_TEXT_LOG_CHARS: usize = 1_500;
-const MEMORY_CONTEXT_RRF_K: f32 = 60.0;
 
 /// Strip a provider prefix from a model ID before sending to the API.
 ///
@@ -130,15 +131,6 @@ fn format_recalled_memory_fragments(
         .collect()
 }
 
-#[derive(Debug, Clone)]
-struct RankedMemoryContextCandidate {
-    rendered: String,
-    fused_score: f32,
-    source_rank: usize,
-    source_priority: u8,
-    source_label: &'static str,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SemanticRecallMode {
     Hybrid,
@@ -159,7 +151,7 @@ struct MemoryRecallTrace {
     semantic_mode: SemanticRecallMode,
     semantic_candidates: usize,
     shared_candidates: usize,
-    fused_candidates: Vec<RankedMemoryContextCandidate>,
+    fused_candidates: Vec<FusedMemoryContextCandidate>,
     maintenance_signals: usize,
     attention_signals: usize,
     session_summaries: usize,
@@ -192,53 +184,32 @@ fn fuse_memory_context_candidates(
         };
     }
 
-    let semantic_candidates = format_recalled_memory_fragments(semantic_memories);
-    let governed_candidates =
-        format_governed_memory_candidates(user_message, governed_entries, limit.saturating_mul(2));
+    let semantic_candidates = format_recalled_memory_fragments(semantic_memories)
+        .into_iter()
+        .enumerate()
+        .map(|(rank, rendered)| RankedMemoryContextCandidate {
+            rendered,
+            source: MemoryContextSource::Semantic,
+            source_rank: rank,
+            source_weight: 1.0,
+            tie_break_priority: 3,
+        })
+        .collect::<Vec<_>>();
     let semantic_candidate_count = semantic_candidates.len();
+    let governed_candidates = format_governed_memory_candidates(
+        user_message,
+        governed_entries,
+        limit.saturating_mul(2),
+    );
     let shared_candidate_count = governed_candidates.len();
 
-    let mut fused_candidates =
-        Vec::with_capacity(semantic_candidates.len() + governed_candidates.len());
-    fused_candidates.extend(
+    let selected_fused_candidates = fuse_ranked_memory_context_candidates(
         semantic_candidates
             .into_iter()
-            .enumerate()
-            .map(|(rank, rendered)| RankedMemoryContextCandidate {
-                rendered,
-                fused_score: 1.0 / (MEMORY_CONTEXT_RRF_K + rank as f32 + 1.0),
-                source_rank: rank,
-                source_priority: 0,
-                source_label: "semantic",
-            }),
+            .chain(governed_candidates)
+            .collect(),
+        limit,
     );
-    fused_candidates.extend(
-        governed_candidates
-            .into_iter()
-            .enumerate()
-            .map(|(rank, rendered)| RankedMemoryContextCandidate {
-                rendered,
-                fused_score: 1.0 / (MEMORY_CONTEXT_RRF_K + rank as f32 + 1.0),
-                source_rank: rank,
-                source_priority: 1,
-                source_label: "shared",
-            }),
-    );
-    fused_candidates.sort_by(|a, b| {
-        b.fused_score
-            .partial_cmp(&a.fused_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.source_priority.cmp(&b.source_priority))
-            .then_with(|| a.source_rank.cmp(&b.source_rank))
-            .then_with(|| a.rendered.cmp(&b.rendered))
-    });
-
-    let mut seen = HashSet::new();
-    let selected_fused_candidates: Vec<RankedMemoryContextCandidate> = fused_candidates
-        .into_iter()
-        .filter(|candidate| seen.insert(candidate.rendered.clone()))
-        .take(limit)
-        .collect();
     let recalled_memories = selected_fused_candidates
         .iter()
         .map(|candidate| candidate.rendered.clone())
@@ -283,10 +254,12 @@ fn format_memory_recall_trace(trace: &MemoryRecallTrace) -> Option<String> {
         out.push_str("selected_fused_recall:\n");
         for (rank, candidate) in trace.fused_candidates.iter().enumerate() {
             out.push_str(&format!(
-                "{}. source={} source_rank={} fused_score={:.5} {}\n",
+                "{}. source={} source_rank={} source_weight={:.3} tie_break_priority={} fused_score={:.5} {}\n",
                 rank + 1,
-                candidate.source_label,
+                candidate.source.as_str(),
                 candidate.source_rank + 1,
+                candidate.source_weight,
+                candidate.tie_break_priority,
                 candidate.fused_score,
                 openfang_types::truncate_str(&candidate.rendered, 280)
             ));
@@ -361,19 +334,20 @@ fn format_governed_memory_candidates(
     user_message: &str,
     entries: &[(String, serde_json::Value)],
     limit: usize,
-) -> Vec<String> {
+) -> Vec<RankedMemoryContextCandidate> {
     let mut seen = HashSet::new();
 
-    select_governed_memory_prompt_candidates_for_query(
+    select_governed_memory_prompt_candidates_for_query_with_fusion(
         entries,
         chrono::Utc::now(),
         limit,
         Some(user_message),
     )
     .into_iter()
-    .filter_map(|candidate| {
-        let rendered_value = match candidate.value {
-            serde_json::Value::String(text) => text,
+    .enumerate()
+    .filter_map(|(rank, selection)| {
+        let rendered_value = match &selection.candidate.value {
+            serde_json::Value::String(text) => text.clone(),
             other => serde_json::to_string(&other).ok()?,
         };
         let rendered_value = rendered_value.trim();
@@ -382,32 +356,41 @@ fn format_governed_memory_candidates(
         }
 
         let mut qualifiers = vec![
-            format!("kind={}", candidate.metadata.kind),
+            format!("kind={}", selection.candidate.metadata.kind),
             format!(
                 "freshness={}",
-                render_memory_freshness(&candidate.metadata.freshness)
+                render_memory_freshness(&selection.candidate.metadata.freshness)
             ),
             format!(
                 "lifecycle={}",
-                render_memory_lifecycle_state(candidate.lifecycle.state)
+                render_memory_lifecycle_state(selection.candidate.lifecycle.state)
             ),
         ];
-        if !candidate.metadata.tags.is_empty() {
-            qualifiers.push(format!("tags={}", candidate.metadata.tags.join(",")));
+        if !selection.candidate.metadata.tags.is_empty() {
+            qualifiers.push(format!(
+                "tags={}",
+                selection.candidate.metadata.tags.join(",")
+            ));
         }
-        if candidate.lifecycle.promotion_candidate {
+        if selection.candidate.lifecycle.promotion_candidate {
             qualifiers.push("promotion_candidate".to_string());
         }
 
         let rendered = format!(
             "Shared memory [{}] ({}) {}",
-            candidate.key,
+            selection.candidate.key,
             qualifiers.join(", "),
             openfang_types::truncate_str(rendered_value, 240)
         );
 
         if seen.insert(rendered.clone()) {
-            Some(rendered)
+            Some(RankedMemoryContextCandidate {
+                rendered,
+                source: MemoryContextSource::Shared,
+                source_rank: rank,
+                source_weight: selection.source_weight,
+                tie_break_priority: selection.tie_break_priority,
+            })
         } else {
             None
         }
@@ -3594,13 +3577,20 @@ mod tests {
         );
 
         assert_eq!(rendered.recalled_memories.len(), 2);
-        assert!(rendered.recalled_memories[0].starts_with("Semantic memory "));
-        assert!(rendered.recalled_memories[1].starts_with("Shared memory [project.alpha.status]"));
+        assert!(rendered.recalled_memories[0].starts_with("Shared memory [project.alpha.status]"));
+        assert!(rendered.recalled_memories[1].starts_with("Semantic memory "));
         assert_eq!(rendered.trace.semantic_candidates, 1);
         assert_eq!(rendered.trace.shared_candidates, 1);
         assert_eq!(rendered.trace.fused_candidates.len(), 2);
-        assert_eq!(rendered.trace.fused_candidates[0].source_label, "semantic");
-        assert_eq!(rendered.trace.fused_candidates[1].source_label, "shared");
+        assert_eq!(
+            rendered.trace.fused_candidates[0].source,
+            MemoryContextSource::Shared
+        );
+        assert!(rendered.trace.fused_candidates[0].source_weight > 1.0);
+        assert_eq!(
+            rendered.trace.fused_candidates[1].source,
+            MemoryContextSource::Semantic
+        );
     }
 
     #[test]
@@ -3610,19 +3600,21 @@ mod tests {
             semantic_candidates: 2,
             shared_candidates: 1,
             fused_candidates: vec![
-                RankedMemoryContextCandidate {
+                FusedMemoryContextCandidate {
                     rendered: "Semantic memory [episodic] waiver code".to_string(),
+                    source: MemoryContextSource::Semantic,
+                    source_weight: 1.0,
                     fused_score: 0.01639,
                     source_rank: 0,
-                    source_priority: 0,
-                    source_label: "semantic",
+                    tie_break_priority: 3,
                 },
-                RankedMemoryContextCandidate {
+                FusedMemoryContextCandidate {
                     rendered: "Shared memory [project.alpha.status] qa signoff".to_string(),
+                    source: MemoryContextSource::Shared,
+                    source_weight: 1.32,
                     fused_score: 0.01613,
                     source_rank: 0,
-                    source_priority: 1,
-                    source_label: "shared",
+                    tie_break_priority: 0,
                 },
             ],
             maintenance_signals: 2,
@@ -3638,8 +3630,10 @@ mod tests {
         assert!(rendered.contains("maintenance_signals=2"));
         assert!(rendered.contains("attention_signals=1"));
         assert!(rendered.contains("session_summaries=1"));
-        assert!(rendered.contains("1. source=semantic source_rank=1"));
-        assert!(rendered.contains("2. source=shared source_rank=1"));
+        assert!(rendered.contains("1. source=semantic source_rank=1 source_weight=1.000"));
+        assert!(rendered.contains("tie_break_priority=3"));
+        assert!(rendered.contains("2. source=shared source_rank=1 source_weight=1.320"));
+        assert!(rendered.contains("tie_break_priority=0"));
     }
 
     #[test]
@@ -3735,13 +3729,14 @@ mod tests {
         );
 
         assert_eq!(rendered.len(), 1);
-        assert!(rendered[0].starts_with("Shared memory "));
-        assert!(rendered[0].contains("[pref.editor.theme]"));
-        assert!(rendered[0].contains("kind=preference"));
-        assert!(rendered[0].contains("freshness=durable"));
-        assert!(rendered[0].contains("lifecycle=active"));
-        assert!(rendered[0].contains("tags=profile,ui"));
-        assert!(rendered[0].contains("promotion_candidate"));
+        assert!(rendered[0].rendered.starts_with("Shared memory "));
+        assert!(rendered[0].rendered.contains("[pref.editor.theme]"));
+        assert!(rendered[0].rendered.contains("kind=preference"));
+        assert!(rendered[0].rendered.contains("freshness=durable"));
+        assert!(rendered[0].rendered.contains("lifecycle=active"));
+        assert!(rendered[0].rendered.contains("tags=profile,ui"));
+        assert!(rendered[0].rendered.contains("promotion_candidate"));
+        assert!(rendered[0].source_weight > 1.0);
     }
 
     #[test]
@@ -3790,9 +3785,10 @@ mod tests {
             format_governed_memory_candidates("What is the alpha project status?", &entries, 2);
 
         assert_eq!(rendered.len(), 2);
-        assert!(rendered[0].starts_with("Shared memory "));
-        assert!(rendered[0].contains("[project.alpha.status]"));
-        assert!(rendered[1].contains("[pref.editor.theme]"));
+        assert!(rendered[0].rendered.starts_with("Shared memory "));
+        assert!(rendered[0].rendered.contains("[project.alpha.status]"));
+        assert!(rendered[0].source_weight > rendered[1].source_weight);
+        assert!(rendered[1].rendered.contains("[pref.editor.theme]"));
     }
 
     #[test]

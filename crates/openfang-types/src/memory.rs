@@ -321,6 +321,57 @@ pub struct GovernedMemoryOrchestrationSnapshot {
     pub promotion_candidates: Vec<GovernedMemoryOrchestrationSignal>,
 }
 
+/// Source types that can participate in prompt-time memory fusion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryContextSource {
+    Semantic,
+    Shared,
+}
+
+impl MemoryContextSource {
+    /// Stable string label used for logging and prompt trace output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Semantic => "semantic",
+            Self::Shared => "shared",
+        }
+    }
+}
+
+/// Ranked prompt-time recall candidate before cross-source fusion.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RankedMemoryContextCandidate {
+    pub rendered: String,
+    pub source: MemoryContextSource,
+    pub source_rank: usize,
+    pub source_weight: f32,
+    pub tie_break_priority: u8,
+}
+
+/// Ranked prompt-time recall candidate after cross-source fusion.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FusedMemoryContextCandidate {
+    pub rendered: String,
+    pub source: MemoryContextSource,
+    pub source_rank: usize,
+    pub source_weight: f32,
+    pub fused_score: f32,
+    pub tie_break_priority: u8,
+}
+
+/// Governed prompt candidate plus fusion metadata for cross-source reranking.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GovernedMemoryPromptSelection {
+    pub candidate: GovernedMemoryPromptCandidate,
+    pub query_match_score: usize,
+    pub source_weight: f32,
+    pub tie_break_priority: u8,
+}
+
+/// Base RRF constant used when fusing prompt-time recall candidates.
+pub const MEMORY_CONTEXT_RRF_K: f32 = 60.0;
+
 fn is_valid_memory_meta_token(token: &str) -> bool {
     !token.is_empty()
         && token
@@ -714,8 +765,7 @@ impl MemoryQueryProfile {
 fn is_memory_query_stopword(term: &str) -> bool {
     matches!(
         term,
-        "a"
-            | "an"
+        "a" | "an"
             | "and"
             | "are"
             | "at"
@@ -852,8 +902,8 @@ fn memory_query_profile(query: &str) -> MemoryQueryProfile {
             "decide" | "decided" | "decision" | "choice" | "chosen" => {
                 push_unique_hint(&mut kind_hints, "decision");
             }
-            "prefer" | "preference" | "preferences" | "preferred" | "style" | "theme"
-            | "tone" | "format" | "formatting" | "ux" | "ui" => {
+            "prefer" | "preference" | "preferences" | "preferred" | "style" | "theme" | "tone"
+            | "format" | "formatting" | "ux" | "ui" => {
                 push_unique_hint(&mut namespace_hints, "pref");
                 push_unique_hint(&mut kind_hints, "preference");
             }
@@ -1000,29 +1050,143 @@ fn collect_governed_memory_prompt_candidates(
         .collect()
 }
 
-fn compare_governed_memory_candidates(
-    a: &GovernedMemoryPromptCandidate,
-    b: &GovernedMemoryPromptCandidate,
+#[derive(Debug, Clone)]
+struct ScoredGovernedMemoryPromptCandidate {
+    candidate: GovernedMemoryPromptCandidate,
+    query_match_score: usize,
+}
+
+fn collect_scored_governed_memory_prompt_candidates(
+    entries: &[(String, serde_json::Value)],
+    now: DateTime<Utc>,
     query_profile: &MemoryQueryProfile,
-) -> std::cmp::Ordering {
-    memory_query_match_score(b, query_profile)
-        .cmp(&memory_query_match_score(a, query_profile))
-        .then_with(|| {
-            memory_lifecycle_sort_rank(a.lifecycle.state).cmp(&memory_lifecycle_sort_rank(b.lifecycle.state))
+) -> Vec<ScoredGovernedMemoryPromptCandidate> {
+    collect_governed_memory_prompt_candidates(entries, now)
+        .into_iter()
+        .map(|candidate| ScoredGovernedMemoryPromptCandidate {
+            query_match_score: memory_query_match_score(&candidate, query_profile),
+            candidate,
         })
-        .then_with(|| (!a.lifecycle.promotion_candidate).cmp(&(!b.lifecycle.promotion_candidate)))
-        .then_with(|| a.metadata.tags.is_empty().cmp(&b.metadata.tags.is_empty()))
+        .collect()
+}
+
+fn compare_scored_governed_memory_candidates(
+    a: &ScoredGovernedMemoryPromptCandidate,
+    b: &ScoredGovernedMemoryPromptCandidate,
+) -> std::cmp::Ordering {
+    b.query_match_score
+        .cmp(&a.query_match_score)
         .then_with(|| {
-            is_priority_memory_kind(&a.metadata.kind)
-                .cmp(&is_priority_memory_kind(&b.metadata.kind))
+            memory_lifecycle_sort_rank(a.candidate.lifecycle.state)
+                .cmp(&memory_lifecycle_sort_rank(b.candidate.lifecycle.state))
+        })
+        .then_with(|| {
+            (!a.candidate.lifecycle.promotion_candidate)
+                .cmp(&(!b.candidate.lifecycle.promotion_candidate))
+        })
+        .then_with(|| {
+            a.candidate
+                .metadata
+                .tags
+                .is_empty()
+                .cmp(&b.candidate.metadata.tags.is_empty())
+        })
+        .then_with(|| {
+            is_priority_memory_kind(&a.candidate.metadata.kind)
+                .cmp(&is_priority_memory_kind(&b.candidate.metadata.kind))
                 .reverse()
         })
         .then_with(|| {
-            memory_freshness_sort_rank(&a.metadata.freshness)
-                .cmp(&memory_freshness_sort_rank(&b.metadata.freshness))
+            memory_freshness_sort_rank(&a.candidate.metadata.freshness)
+                .cmp(&memory_freshness_sort_rank(&b.candidate.metadata.freshness))
         })
-        .then_with(|| b.metadata.updated_at.cmp(&a.metadata.updated_at))
-        .then_with(|| a.key.cmp(&b.key))
+        .then_with(|| b.candidate.metadata.updated_at.cmp(&a.candidate.metadata.updated_at))
+        .then_with(|| a.candidate.key.cmp(&b.candidate.key))
+}
+
+fn governed_memory_source_weight(
+    candidate: &GovernedMemoryPromptCandidate,
+    query_match_score: usize,
+) -> f32 {
+    let query_weight = match query_match_score {
+        24.. => 1.35,
+        8..=23 => 1.20,
+        1..=7 => 1.10,
+        _ => 1.00,
+    };
+    let lifecycle_weight = match candidate.lifecycle.state {
+        MemoryLifecycleState::Active => 1.10,
+        MemoryLifecycleState::Stale => 1.00,
+        MemoryLifecycleState::Expired => 0.90,
+    };
+    let promotion_weight = if candidate.lifecycle.promotion_candidate {
+        1.05
+    } else {
+        1.00
+    };
+
+    query_weight * lifecycle_weight * promotion_weight
+}
+
+fn governed_memory_tie_break_priority(
+    candidate: &GovernedMemoryPromptCandidate,
+    query_match_score: usize,
+) -> u8 {
+    let query_bucket = if query_match_score > 0 { 0 } else { 1 };
+    let lifecycle_bucket = match candidate.lifecycle.state {
+        MemoryLifecycleState::Active => 0,
+        MemoryLifecycleState::Stale => 1,
+        MemoryLifecycleState::Expired => 2,
+    };
+    let promotion_bucket = if candidate.lifecycle.promotion_candidate {
+        0
+    } else {
+        1
+    };
+
+    query_bucket * 6 + lifecycle_bucket * 2 + promotion_bucket
+}
+
+fn select_scored_governed_memory_prompt_candidates_for_query(
+    entries: &[(String, serde_json::Value)],
+    now: DateTime<Utc>,
+    limit: usize,
+    query: Option<&str>,
+) -> Vec<ScoredGovernedMemoryPromptCandidate> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    let query_profile = query.map(memory_query_profile).unwrap_or_default();
+    let mut candidates =
+        collect_scored_governed_memory_prompt_candidates(entries, now, &query_profile);
+    candidates.sort_by(compare_scored_governed_memory_candidates);
+    candidates.truncate(limit);
+    candidates
+}
+
+/// Select governed user-memory candidates and expose fusion weights / tie-break metadata.
+pub fn select_governed_memory_prompt_candidates_for_query_with_fusion(
+    entries: &[(String, serde_json::Value)],
+    now: DateTime<Utc>,
+    limit: usize,
+    query: Option<&str>,
+) -> Vec<GovernedMemoryPromptSelection> {
+    select_scored_governed_memory_prompt_candidates_for_query(entries, now, limit, query)
+        .into_iter()
+        .map(|selection| GovernedMemoryPromptSelection {
+            source_weight: governed_memory_source_weight(
+                &selection.candidate,
+                selection.query_match_score,
+            ),
+            tie_break_priority: governed_memory_tie_break_priority(
+                &selection.candidate,
+                selection.query_match_score,
+            ),
+            query_match_score: selection.query_match_score,
+            candidate: selection.candidate,
+        })
+        .collect()
 }
 
 /// Select governed user-memory candidates suitable for prompt-level retrieval.
@@ -1045,15 +1209,10 @@ pub fn select_governed_memory_prompt_candidates_for_query(
     limit: usize,
     query: Option<&str>,
 ) -> Vec<GovernedMemoryPromptCandidate> {
-    if limit == 0 {
-        return Vec::new();
-    }
-
-    let query_profile = query.map(memory_query_profile).unwrap_or_default();
-    let mut candidates = collect_governed_memory_prompt_candidates(entries, now);
-    candidates.sort_by(|a, b| compare_governed_memory_candidates(a, b, &query_profile));
-    candidates.truncate(limit);
-    candidates
+    select_governed_memory_prompt_candidates_for_query_with_fusion(entries, now, limit, query)
+        .into_iter()
+        .map(|selection| selection.candidate)
+        .collect()
 }
 
 /// Summarize governed memory review/promotion actions for higher-level prompt orchestration.
@@ -1067,43 +1226,83 @@ pub fn summarize_governed_memory_orchestration_for_query(
         return GovernedMemoryOrchestrationSnapshot::default();
     }
 
-    let query_profile = query.map(memory_query_profile).unwrap_or_default();
-    let candidates = collect_governed_memory_prompt_candidates(entries, now);
+    let candidates = select_scored_governed_memory_prompt_candidates_for_query(
+        entries,
+        now,
+        usize::MAX,
+        query,
+    );
 
-    let mut stale_review: Vec<GovernedMemoryPromptCandidate> = candidates
+    let mut stale_review: Vec<ScoredGovernedMemoryPromptCandidate> = candidates
         .iter()
-        .filter(|candidate| candidate.lifecycle.state == MemoryLifecycleState::Stale)
+        .filter(|candidate| candidate.candidate.lifecycle.state == MemoryLifecycleState::Stale)
         .cloned()
         .collect();
-    stale_review.sort_by(|a, b| compare_governed_memory_candidates(a, b, &query_profile));
     stale_review.truncate(limit_per_bucket);
 
-    let mut promotion_candidates: Vec<GovernedMemoryPromptCandidate> = candidates
+    let mut promotion_candidates: Vec<ScoredGovernedMemoryPromptCandidate> = candidates
         .iter()
-        .filter(|candidate| candidate.lifecycle.promotion_candidate)
+        .filter(|candidate| candidate.candidate.lifecycle.promotion_candidate)
         .cloned()
         .collect();
-    promotion_candidates.sort_by(|a, b| compare_governed_memory_candidates(a, b, &query_profile));
     promotion_candidates.truncate(limit_per_bucket);
 
     GovernedMemoryOrchestrationSnapshot {
         stale_review: stale_review
             .into_iter()
             .map(|candidate| GovernedMemoryOrchestrationSignal {
-                key: candidate.key,
-                metadata: candidate.metadata,
-                lifecycle: candidate.lifecycle,
+                key: candidate.candidate.key,
+                metadata: candidate.candidate.metadata,
+                lifecycle: candidate.candidate.lifecycle,
             })
             .collect(),
         promotion_candidates: promotion_candidates
             .into_iter()
             .map(|candidate| GovernedMemoryOrchestrationSignal {
-                key: candidate.key,
-                metadata: candidate.metadata,
-                lifecycle: candidate.lifecycle,
+                key: candidate.candidate.key,
+                metadata: candidate.candidate.metadata,
+                lifecycle: candidate.candidate.lifecycle,
             })
             .collect(),
     }
+}
+
+/// Fuse ranked prompt-time memory candidates from multiple sources using weighted RRF.
+pub fn fuse_ranked_memory_context_candidates(
+    candidates: Vec<RankedMemoryContextCandidate>,
+    limit: usize,
+) -> Vec<FusedMemoryContextCandidate> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    let mut fused: Vec<FusedMemoryContextCandidate> = candidates
+        .into_iter()
+        .map(|candidate| FusedMemoryContextCandidate {
+            fused_score: candidate.source_weight
+                * (1.0 / (MEMORY_CONTEXT_RRF_K + candidate.source_rank as f32 + 1.0)),
+            rendered: candidate.rendered,
+            source: candidate.source,
+            source_rank: candidate.source_rank,
+            source_weight: candidate.source_weight,
+            tie_break_priority: candidate.tie_break_priority,
+        })
+        .collect();
+
+    fused.sort_by(|a, b| {
+        b.fused_score
+            .partial_cmp(&a.fused_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.tie_break_priority.cmp(&b.tie_break_priority))
+            .then_with(|| a.source_rank.cmp(&b.source_rank))
+            .then_with(|| a.rendered.cmp(&b.rendered))
+    });
+
+    let mut seen = HashSet::new();
+    fused.into_iter()
+        .filter(|candidate| seen.insert(candidate.rendered.clone()))
+        .take(limit)
+        .collect()
 }
 
 /// An entity in the knowledge graph.
@@ -1568,14 +1767,20 @@ mod tests {
         let snapshot = summarize_memory_cleanup_for_orchestration(&entries, 2);
 
         assert_eq!(snapshot.legacy_repairs.len(), 1);
-        assert_eq!(snapshot.legacy_repairs[0].action, MemoryCleanupAction::MigrateLegacyKey);
+        assert_eq!(
+            snapshot.legacy_repairs[0].action,
+            MemoryCleanupAction::MigrateLegacyKey
+        );
         assert_eq!(snapshot.legacy_repairs[0].key, "legacy_theme");
         assert_eq!(
             snapshot.legacy_repairs[0].canonical_key.as_deref(),
             Some("general.legacy_theme")
         );
         assert_eq!(snapshot.metadata_repairs.len(), 1);
-        assert_eq!(snapshot.metadata_repairs[0].action, MemoryCleanupAction::BackfillMetadata);
+        assert_eq!(
+            snapshot.metadata_repairs[0].action,
+            MemoryCleanupAction::BackfillMetadata
+        );
         assert_eq!(snapshot.metadata_repairs[0].key, "project.alpha.note");
         assert_eq!(snapshot.orphan_metadata.len(), 1);
         assert_eq!(
@@ -1714,7 +1919,8 @@ mod tests {
     }
 
     #[test]
-    fn test_select_governed_memory_prompt_candidates_for_query_prioritizes_matching_tags_and_keys() {
+    fn test_select_governed_memory_prompt_candidates_for_query_prioritizes_matching_tags_and_keys()
+    {
         let now = Utc::now();
         let preference_metadata = MemoryRecordMetadata {
             schema_version: MEMORY_METADATA_SCHEMA_VERSION,
@@ -1832,6 +2038,92 @@ mod tests {
         assert_eq!(candidates.len(), 2);
         assert_eq!(candidates[0].key, "pref.reply.style");
         assert_eq!(candidates[1].key, "project.alpha.status");
+    }
+
+    #[test]
+    fn test_select_governed_memory_prompt_candidates_for_query_with_fusion_boosts_matching_active_record()
+    {
+        let now = Utc::now();
+        let preference_metadata = MemoryRecordMetadata {
+            schema_version: MEMORY_METADATA_SCHEMA_VERSION,
+            key: "pref.reply.style".to_string(),
+            namespace: "pref".to_string(),
+            kind: "preference".to_string(),
+            tags: vec!["profile".to_string()],
+            freshness: MemoryFreshness::Durable,
+            source: "memory_store_tool".to_string(),
+            updated_at: now - Duration::days(3),
+        };
+        let project_metadata = MemoryRecordMetadata {
+            schema_version: MEMORY_METADATA_SCHEMA_VERSION,
+            key: "project.alpha.status".to_string(),
+            namespace: "project".to_string(),
+            kind: "project_state".to_string(),
+            tags: vec!["project".to_string(), "alpha".to_string()],
+            freshness: MemoryFreshness::Rolling,
+            source: "memory_store_tool".to_string(),
+            updated_at: now,
+        };
+        let entries = vec![
+            (
+                "pref.reply.style".to_string(),
+                serde_json::json!("Use compact bullet lists with a short summary first."),
+            ),
+            (
+                memory_metadata_key("pref.reply.style").unwrap(),
+                serde_json::to_value(&preference_metadata).unwrap(),
+            ),
+            (
+                "project.alpha.status".to_string(),
+                serde_json::json!("Alpha launch is blocked on QA signoff."),
+            ),
+            (
+                memory_metadata_key("project.alpha.status").unwrap(),
+                serde_json::to_value(&project_metadata).unwrap(),
+            ),
+        ];
+
+        let candidates = select_governed_memory_prompt_candidates_for_query_with_fusion(
+            &entries,
+            now,
+            5,
+            Some("What is the alpha project status right now?"),
+        );
+
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].candidate.key, "project.alpha.status");
+        assert!(candidates[0].query_match_score > 0);
+        assert!(candidates[0].source_weight > 1.0);
+        assert_eq!(candidates[0].tie_break_priority, 1);
+        assert_eq!(candidates[1].candidate.key, "pref.reply.style");
+    }
+
+    #[test]
+    fn test_fuse_ranked_memory_context_candidates_prefers_weighted_shared_candidate() {
+        let fused = fuse_ranked_memory_context_candidates(
+            vec![
+                RankedMemoryContextCandidate {
+                    rendered: "Semantic memory [episodic] unlock code".to_string(),
+                    source: MemoryContextSource::Semantic,
+                    source_rank: 0,
+                    source_weight: 1.0,
+                    tie_break_priority: 3,
+                },
+                RankedMemoryContextCandidate {
+                    rendered: "Shared memory [project.alpha.status] QA blocker".to_string(),
+                    source: MemoryContextSource::Shared,
+                    source_rank: 0,
+                    source_weight: 1.32,
+                    tie_break_priority: 0,
+                },
+            ],
+            5,
+        );
+
+        assert_eq!(fused.len(), 2);
+        assert_eq!(fused[0].source, MemoryContextSource::Shared);
+        assert!(fused[0].fused_score > fused[1].fused_score);
+        assert_eq!(fused[1].source, MemoryContextSource::Semantic);
     }
 
     #[test]
