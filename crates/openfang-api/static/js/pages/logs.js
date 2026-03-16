@@ -37,6 +37,67 @@ function logsPage() {
     memoryTraceCompareSeqs: [],
     copiedMemoryTraceToken: '',
     _copiedMemoryTraceTimer: null,
+    _popStateHandler: null,
+
+    initLogsPage: function() {
+      this.applyLogsUrlState();
+      this._popStateHandler = function() {
+        this.applyLogsUrlState();
+      }.bind(this);
+      window.addEventListener('popstate', this._popStateHandler);
+      this.startStreaming();
+    },
+
+    applyLogsUrlState: function() {
+      var params = new URLSearchParams(window.location.search || '');
+      var logsTab = params.get('logs_tab');
+      if (logsTab === 'live' || logsTab === 'memory' || logsTab === 'audit') {
+        this.tab = logsTab;
+      }
+      this.memoryTraceAgentFilter = params.get('mt_agent') || '';
+      this.memoryTraceModeFilter = params.get('mt_mode') || '';
+      this.memoryTraceSourceFilter = params.get('mt_source') || '';
+      this.memoryTraceTextFilter = params.get('mt_q') || '';
+      this.memoryTraceCompareSeqs = this.parseMemoryTraceCompareSeqs(params.get('mt_compare'));
+    },
+
+    parseMemoryTraceCompareSeqs: function(raw) {
+      if (!raw) return [];
+      return raw
+        .split(',')
+        .map(function(part) { return Number(String(part).trim()); })
+        .filter(function(seq) { return Number.isFinite(seq) && seq > 0; })
+        .slice(0, 2);
+    },
+
+    buildLogsUrl: function() {
+      var url = new URL(window.location.href);
+      url.hash = 'logs';
+      url.searchParams.set('logs_tab', this.tab);
+      if (this.memoryTraceAgentFilter) url.searchParams.set('mt_agent', this.memoryTraceAgentFilter);
+      else url.searchParams.delete('mt_agent');
+      if (this.memoryTraceModeFilter) url.searchParams.set('mt_mode', this.memoryTraceModeFilter);
+      else url.searchParams.delete('mt_mode');
+      if (this.memoryTraceSourceFilter) url.searchParams.set('mt_source', this.memoryTraceSourceFilter);
+      else url.searchParams.delete('mt_source');
+      if (this.memoryTraceTextFilter) url.searchParams.set('mt_q', this.memoryTraceTextFilter);
+      else url.searchParams.delete('mt_q');
+      if (this.memoryTraceCompareSeqs.length) url.searchParams.set('mt_compare', this.memoryTraceCompareSeqs.join(','));
+      else url.searchParams.delete('mt_compare');
+      return url;
+    },
+
+    syncLogsUrlState: function() {
+      window.history.replaceState({}, '', this.buildLogsUrl().toString());
+    },
+
+    setLogsTab: function(tab) {
+      this.tab = tab;
+      if (tab === 'audit' && !this.auditEntries.length && !this.auditLoading) {
+        this.loadAudit();
+      }
+      this.syncLogsUrlState();
+    },
 
     startStreaming: function() {
       var self = this;
@@ -322,6 +383,7 @@ function logsPage() {
       this.memoryTraceModeFilter = '';
       this.memoryTraceSourceFilter = '';
       this.memoryTraceTextFilter = '';
+      this.syncLogsUrlState();
     },
 
     copyMemoryTraceText: async function(text, token) {
@@ -377,6 +439,10 @@ function logsPage() {
       URL.revokeObjectURL(url);
     },
 
+    copyMemoryTraceLink: function() {
+      return this.copyMemoryTraceText(this.buildLogsUrl().toString(), 'memory-link');
+    },
+
     memoryTraceCompareSlot: function(entry) {
       if (!entry) return 0;
       var index = this.memoryTraceCompareSeqs.indexOf(entry.seq);
@@ -401,10 +467,12 @@ function logsPage() {
         seqs.push(entry.seq);
       }
       this.memoryTraceCompareSeqs = seqs;
+      this.syncLogsUrlState();
     },
 
     clearMemoryTraceCompare: function() {
       this.memoryTraceCompareSeqs = [];
+      this.syncLogsUrlState();
     },
 
     get memoryTraceCompareEntries() {
@@ -554,6 +622,10 @@ function logsPage() {
     },
 
     destroy: function() {
+      if (this._popStateHandler) {
+        window.removeEventListener('popstate', this._popStateHandler);
+        this._popStateHandler = null;
+      }
       if (this._eventSource) { this._eventSource.close(); this._eventSource = null; }
       if (this._pollTimer) { clearInterval(this._pollTimer); this._pollTimer = null; }
       if (this._copiedMemoryTraceTimer) { clearTimeout(this._copiedMemoryTraceTimer); this._copiedMemoryTraceTimer = null; }

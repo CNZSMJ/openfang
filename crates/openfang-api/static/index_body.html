@@ -4498,33 +4498,34 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
               <span class="live-dot"></span>
               <span x-text="connectionLabel"></span>
             </span>
-            <select class="form-select" style="width:180px" x-model="memoryTraceAgentFilter">
+            <select class="form-select" style="width:180px" x-model="memoryTraceAgentFilter" @change="syncLogsUrlState()">
               <option value="">All Agents</option>
               <template x-for="option in memoryTraceAgentOptions()" :key="'memory-agent-' + option.id">
                 <option :value="option.id" x-text="auditAgentName(option.id)"></option>
               </template>
             </select>
-            <select class="form-select" style="width:120px" x-model="memoryTraceModeFilter">
+            <select class="form-select" style="width:120px" x-model="memoryTraceModeFilter" @change="syncLogsUrlState()">
               <option value="">All Modes</option>
               <option value="hybrid">hybrid</option>
               <option value="text_only">text_only</option>
             </select>
-            <select class="form-select" style="width:130px" x-model="memoryTraceSourceFilter">
+            <select class="form-select" style="width:130px" x-model="memoryTraceSourceFilter" @change="syncLogsUrlState()">
               <option value="">All Sources</option>
               <option value="shared">shared</option>
               <option value="semantic">semantic</option>
             </select>
-            <input class="form-input" style="width:180px" placeholder="Search trace..." x-model="memoryTraceTextFilter">
+            <input class="form-input" style="width:180px" placeholder="Search trace..." x-model="memoryTraceTextFilter" @input.debounce.250ms="syncLogsUrlState()">
             <button class="btn btn-ghost btn-sm" @click="clearMemoryTraceFilters()">Reset</button>
+            <button class="btn btn-ghost btn-sm" @click="copyMemoryTraceLink()" x-text="copiedMemoryTraceToken === 'memory-link' ? 'Copied Link' : 'Copy Link'"></button>
             <button class="btn btn-ghost btn-sm" @click="exportMemoryTraces()">Export JSON</button>
           </div>
         </div>
         <div class="tabs">
-          <div class="tab" :class="{ active: tab === 'live' }" @click="tab = 'live'">Live</div>
-          <div class="tab" :class="{ active: tab === 'memory' }" @click="tab = 'memory'">Memory Trace</div>
-          <div class="tab" :class="{ active: tab === 'audit' }" @click="tab = 'audit'; if (!auditEntries.length && !auditLoading) loadAudit()">Audit Trail</div>
+          <div class="tab" :class="{ active: tab === 'live' }" @click="setLogsTab('live')">Live</div>
+          <div class="tab" :class="{ active: tab === 'memory' }" @click="setLogsTab('memory')">Memory Trace</div>
+          <div class="tab" :class="{ active: tab === 'audit' }" @click="setLogsTab('audit')">Audit Trail</div>
         </div>
-        <div class="page-body" x-init="startStreaming()">
+        <div class="page-body" x-init="initLogsPage()">
           <!-- Live logs tab -->
           <div x-show="tab === 'live'">
             <div x-show="loading" class="loading-state"><div class="spinner"></div><span>Connecting to log stream...</span></div>

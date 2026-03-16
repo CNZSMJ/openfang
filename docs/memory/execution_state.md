@@ -556,18 +556,69 @@
         证明 compare/raw-payload inspection UI 已真实进入服务端静态资源输出
       - 隔离 daemon 的 `/api/budget` 中 `daily_spend = 0.006620900000000001`，`/api/budget/agents` 中 `assistant` 的 `daily_cost_usd = 0.006620900000000001`
       - 验证完成后，隔离 daemon 与整个 `/tmp/openfang-memory-trace-compare-live` home 已清理
+  - 已完成 Phase 2 第十二批 memory trace deep-link / shareable inspection URL 接线：
+    - `Logs -> Memory Trace` tab 现在会把当前 inspection state 写回 URL，而不再是纯内存态：
+      - `logs_tab=memory`
+      - `mt_agent=<agent-id>`
+      - `mt_mode=hybrid|text_only`
+      - `mt_source=shared|semantic`
+      - `mt_q=<trace search text>`
+      - `mt_compare=<seqA>,<seqB>`
+    - Logs 页切 tab 现在统一走 `setLogsTab()`，`Memory Trace` 的 filter / compare selection 变化会立即 `replaceState()` 回当前 URL；浏览器前进/后退也会通过 `popstate` 恢复相同的 trace inspection 状态
+    - `Memory Trace` controls 新增 `Copy Link`，可直接复制当前 tab/filter/compare 选择对应的 shareable inspection URL，便于在 dashboard 内复现同一组 trace 视图
+    - URL restore 逻辑当前有显式约束，避免把非法 compare 选择写进页面状态：
+      - `mt_compare` 最多只恢复两条正整数 `seq`
+      - 空 filter 不会污染 URL
+      - 非 `memory/audit/live` 的 tab 值会回退到默认 `live`
+  - 已完成本轮 deep-link / shareable URL 验证：
+    - `node` 级 URL-state smoke 通过：
+      - 直接加载 `static/js/pages/logs.js`
+      - 以 `?logs_tab=memory&mt_agent=agent-1&mt_mode=hybrid&mt_source=shared&mt_q=launch+blocker&mt_compare=12,34` 初始化 Logs page state
+      - `applyLogsUrlState()` 后 state 正确恢复：
+        - `tab = memory`
+        - `memoryTraceAgentFilter = agent-1`
+        - `memoryTraceModeFilter = hybrid`
+        - `memoryTraceSourceFilter = shared`
+        - `memoryTraceTextFilter = launch blocker`
+        - `memoryTraceCompareSeqs = [12, 34]`
+      - `syncLogsUrlState()` 生成的 URL 与当前 state 一致，包含 `#logs` 与全部 memory-trace query params
+    - `cargo build --workspace --lib`
+    - `cargo test --workspace`
+    - `cargo clippy --workspace --all-targets -- -D warnings`
+    - `cargo build -p openfang-cli`
+    - live deep-link/shareable-URL verification 通过：
+      - 在隔离的 `OPENFANG_HOME=/tmp/openfang-memory-trace-link-live` 上，以 `127.0.0.1:4215` 启动临时 daemon
+      - 使用隔离 daemon 自带 `assistant` agent，通过 memory API 写入 shared probe `project.alpha.link_status = { summary = "QA signoff pending", blocker = "dashboard memory trace link verification", owner = "release" }`
+      - 第一轮真实询问 `What is blocking the alpha launch?`，回复命中 shared blocker `dashboard memory trace link verification`
+      - 第二轮真实消息写入 semantic phrase `LINK-SEM-20260317-021903`，随后执行 `POST /api/agents/{id}/session/reset`
+      - 第三轮真实询问 `What is blocking the alpha launch, and what is the device unlock phrase you were told to remember?`，回复同时返回：
+        - shared blocker `dashboard memory trace link verification`
+        - semantic phrase `LINK-SEM-20260317-021903`
+      - `GET /api/audit/recent?n=30` 中真实返回了三条 `MemoryTrace` entry，且其中：
+        - `seq = 1` 为 `semantic_candidates=0 shared_candidates=1 selected_fused_recall_count=1`
+        - `seq = 3` 为 `semantic_candidates=1 shared_candidates=1 selected_fused_recall_count=2`
+        - `seq = 5` 为 `semantic_candidates=2 shared_candidates=1 session_summaries=1 selected_fused_recall_count=3`
+      - `GET /api/logs/stream?filter=memorytrace` 的 SSE backfill 也真实返回了相同的 parsed `payload`，包含 shared recall 与 `LINK-SEM-20260317-021903` semantic recall
+      - `curl http://127.0.0.1:4215/` 的 dashboard HTML 中已出现：
+        - `Copy Link`
+        - `Prompt-Time Memory Trace`
+        - `syncLogsUrlState()`
+        - `initLogsPage()`
+        - `mt_compare`
+        证明 deep-link / shareable URL wiring 已真实进入服务端静态资源输出
+      - 隔离 daemon 的 `/api/budget` 中 `daily_spend = 0.006100600000000001`，`/api/budget/agents` 中 `assistant` 的 `daily_cost_usd = 0.006100600000000001`
+      - 验证完成后，隔离 daemon 与整个 `/tmp/openfang-memory-trace-link-live` home 已清理
 
 ## 进行中
 
-- 继续推进 Phase 2：shared retrieval helper 现在已经覆盖 semantic/shared candidate、memory context message、文本 trace、structured tracing telemetry，以及 audit/API/dashboard inspection；dashboard 侧的 `Memory Trace` 也已有 dedicated tab、compare 和 raw payload。下一步继续评估是否需要把它上提成独立的 memory-debug workspace，而不再挂在通用 Logs 页下。
+- 继续推进 Phase 2：shared retrieval helper 现在已经覆盖 semantic/shared candidate、memory context message、文本 trace、structured tracing telemetry，以及 audit/API/dashboard inspection；dashboard 侧的 `Memory Trace` 也已有 dedicated tab、compare、raw payload 和 shareable inspection URL。下一步继续评估是否需要把它上提成独立的 memory-debug workspace，而不再挂在通用 Logs 页下。
 
 ## 下一步动作
 
 - 继续观察 governed metadata 的显式 `source_weight` / `tie_break_priority` 是否需要引入更多 lifecycle bucket 或 namespace/kind-specific weight，而不只是当前 query/lifecycle/promotion 三元组合。
 - 评估是否要把当前 `Logs -> Memory Trace` tab 再上提成独立 memory-debug workspace，例如：
-  - 直接按 agent / semantic mode / recall source 深链接
   - 对同一 agent 的连续 `MemoryTrace` 做 timeline / diff 视图
-  - 在 compare 之上补充 trace pinning、跨页面持久化 selection 或 shareable inspection URL
+  - 在 compare 之上补充 trace pinning、批量 bookmark 或跨会话持久化 selection
 - 评估是否要把 `prompt_builder` 中残留的 memory-context wrapper 也进一步裁薄，避免共享 contract 之上再保留一层重复命名。
 - 在切换电脑或结束一轮实质性工作前，持续更新本文件。
 
