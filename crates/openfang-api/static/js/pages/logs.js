@@ -32,6 +32,8 @@ function logsPage() {
     memoryTraceModeFilter: '',
     memoryTraceSourceFilter: '',
     memoryTraceTextFilter: '',
+    memoryTracePinnedOnly: false,
+    memoryTracePins: [],
     expandedMemoryTraceSeqs: {},
     expandedMemoryTracePayloadSeqs: {},
     memoryTraceCompareSeqs: [],
@@ -40,6 +42,7 @@ function logsPage() {
     _popStateHandler: null,
 
     initLogsPage: function() {
+      this.loadPersistedMemoryTracePins();
       this.applyLogsUrlState();
       this._popStateHandler = function() {
         this.applyLogsUrlState();
@@ -58,6 +61,7 @@ function logsPage() {
       this.memoryTraceModeFilter = params.get('mt_mode') || '';
       this.memoryTraceSourceFilter = params.get('mt_source') || '';
       this.memoryTraceTextFilter = params.get('mt_q') || '';
+      this.memoryTracePinnedOnly = params.get('mt_pinned') === '1';
       this.memoryTraceCompareSeqs = this.parseMemoryTraceCompareSeqs(params.get('mt_compare'));
     },
 
@@ -82,6 +86,8 @@ function logsPage() {
       else url.searchParams.delete('mt_source');
       if (this.memoryTraceTextFilter) url.searchParams.set('mt_q', this.memoryTraceTextFilter);
       else url.searchParams.delete('mt_q');
+      if (this.memoryTracePinnedOnly) url.searchParams.set('mt_pinned', '1');
+      else url.searchParams.delete('mt_pinned');
       if (this.memoryTraceCompareSeqs.length) url.searchParams.set('mt_compare', this.memoryTraceCompareSeqs.join(','));
       else url.searchParams.delete('mt_compare');
       return url;
@@ -291,6 +297,102 @@ function logsPage() {
       return recall.source === 'shared' ? 'memory-trace-source-shared' : 'memory-trace-source-semantic';
     },
 
+    memoryTracePinStorageKey: function() {
+      return 'openfang.memoryTracePins.v1';
+    },
+
+    normalizeMemoryTraceSnapshot: function(entry) {
+      if (!this.isMemoryTrace(entry)) return null;
+      return {
+        action: 'MemoryTrace',
+        seq: Number(entry.seq) || 0,
+        timestamp: entry.timestamp || '',
+        agent_id: entry.agent_id || '',
+        detail: entry.detail || '',
+        payload: entry.payload || {}
+      };
+    },
+
+    loadPersistedMemoryTracePins: function() {
+      try {
+        var raw = window.localStorage ? window.localStorage.getItem(this.memoryTracePinStorageKey()) : '';
+        if (!raw) {
+          this.memoryTracePins = [];
+          return;
+        }
+        var parsed = JSON.parse(raw);
+        if (!Array.isArray(parsed)) {
+          this.memoryTracePins = [];
+          return;
+        }
+        this.memoryTracePins = parsed
+          .map(function(entry) { return this.normalizeMemoryTraceSnapshot(entry); }.bind(this))
+          .filter(Boolean)
+          .slice(0, 24);
+      } catch (e) {
+        this.memoryTracePins = [];
+      }
+    },
+
+    persistMemoryTracePins: function() {
+      try {
+        if (!window.localStorage) return;
+        window.localStorage.setItem(this.memoryTracePinStorageKey(), JSON.stringify(this.memoryTracePins.slice(0, 24)));
+      } catch (e) {
+        // Ignore localStorage failures.
+      }
+    },
+
+    memoryTraceEntryBySeq: function(seq) {
+      if (!seq) return null;
+      var live = this.entries.find(function(entry) { return entry && entry.seq === seq; }) || null;
+      if (live) return live;
+      return this.memoryTracePins.find(function(entry) { return entry && entry.seq === seq; }) || null;
+    },
+
+    isMemoryTracePinned: function(entry) {
+      return !!(entry && this.memoryTracePins.some(function(pin) { return pin && pin.seq === entry.seq; }));
+    },
+
+    toggleMemoryTracePinned: function(entry) {
+      var snapshot = this.normalizeMemoryTraceSnapshot(entry);
+      var pins;
+      if (!snapshot) return;
+      if (this.isMemoryTracePinned(snapshot)) {
+        pins = this.memoryTracePins.filter(function(pin) { return pin && pin.seq !== snapshot.seq; });
+      } else {
+        pins = [snapshot].concat(this.memoryTracePins.filter(function(pin) { return pin && pin.seq !== snapshot.seq; }));
+      }
+      this.memoryTracePins = pins.slice(0, 24);
+      this.persistMemoryTracePins();
+      if (this.memoryTracePinnedOnly) this.syncLogsUrlState();
+    },
+
+    clearMemoryTracePins: function() {
+      this.memoryTracePins = [];
+      this.persistMemoryTracePins();
+      if (this.memoryTracePinnedOnly) this.syncLogsUrlState();
+    },
+
+    toggleMemoryTracePinnedOnly: function() {
+      this.memoryTracePinnedOnly = !this.memoryTracePinnedOnly;
+      this.syncLogsUrlState();
+    },
+
+    get memoryTracePinnedEntries() {
+      var self = this;
+      return this.memoryTracePins
+        .map(function(pin) { return self.memoryTraceEntryBySeq(pin.seq) || pin; })
+        .filter(Boolean)
+        .sort(function(a, b) {
+          return String(b.timestamp || '').localeCompare(String(a.timestamp || ''));
+        });
+    },
+
+    get memoryTracePinnedCountLabel() {
+      return this.memoryTracePinnedEntries.length + ' pinned traces';
+    },
+
     memoryTraceAgentOptions: function() {
       var seen = {};
       var options = [];
@@ -323,6 +425,7 @@ function logsPage() {
         ).toLowerCase();
         if (haystack.indexOf(this.memoryTraceTextFilter.toLowerCase()) === -1) return false;
       }
+      if (this.memoryTracePinnedOnly && !this.isMemoryTracePinned(entry)) return false;
       return true;
     },
 
@@ -383,6 +486,7 @@ function logsPage() {
       this.memoryTraceModeFilter = '';
       this.memoryTraceSourceFilter = '';
       this.memoryTraceTextFilter = '';
+      this.memoryTracePinnedOnly = false;
       this.syncLogsUrlState();
     },
 
@@ -479,7 +583,7 @@ function logsPage() {
       var self = this;
       return this.memoryTraceCompareSeqs
         .map(function(seq) {
-          return self.entries.find(function(entry) { return entry && entry.seq === seq; }) || null;
+          return self.memoryTraceEntryBySeq(seq);
         })
         .filter(Boolean);
     },

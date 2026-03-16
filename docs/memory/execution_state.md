@@ -608,17 +608,68 @@
         证明 deep-link / shareable URL wiring 已真实进入服务端静态资源输出
       - 隔离 daemon 的 `/api/budget` 中 `daily_spend = 0.006100600000000001`，`/api/budget/agents` 中 `assistant` 的 `daily_cost_usd = 0.006100600000000001`
       - 验证完成后，隔离 daemon 与整个 `/tmp/openfang-memory-trace-link-live` home 已清理
+  - 已完成 Phase 2 第十三批 memory trace pinning / persistent inspection workspace 接线：
+    - `Logs -> Memory Trace` 现在新增 pinned trace workspace，不再只能依赖当前 live buffer 做 inspection：
+      - 每条 trace card 新增 `Pin trace` / `Unpin trace`
+      - 顶部新增 `Pinned Traces` 面板，固定展示已持久化的 trace snapshot
+      - pinned traces 仍可直接加入 compare selection，不要求对应 trace 还留在当前流式窗口里
+    - pinned traces 当前会持久化到浏览器 `localStorage`：
+      - storage key = `openfang.memoryTracePins.v1`
+      - 保存字段为 `seq` / `timestamp` / `agent_id` / `detail` / `payload`
+      - 最多保留最近 24 条 pinned trace snapshot
+    - compare lookup 现在会优先取 live `entries`，缺失时回退到 persisted pin snapshot；这样 compare 不再严格依赖 `/api/audit/recent?n=200` 当前还能覆盖那条 trace
+    - `Memory Trace` controls 新增 pinned-only 视图切换与 pin cleanup：
+      - `Pinned only` / `All traces`
+      - `Clear pins (N)`
+      - pinned-only 状态会写回 URL 为 `mt_pinned=1`
+  - 已完成本轮 pinning / persistence 验证：
+    - `node` 级 pinned-persistence smoke 通过：
+      - 直接加载 `static/js/pages/logs.js`
+      - 构造一条 mock `MemoryTrace` 后执行 `toggleMemoryTracePinned()`
+      - fake `localStorage` 中成功写入 `openfang.memoryTracePins.v1`
+      - 第二个 `logsPage()` 实例在 `?logs_tab=memory&mt_pinned=1` 下成功恢复：
+        - `memoryTracePinnedOnly = true`
+        - `memoryTracePinnedEntries.length = 1`
+        - `memoryTraceCompareEntries[0].seq = 42`
+      - 说明 pinned snapshot restore 与 compare fallback 不依赖 live `entries`
+    - `cargo build --workspace --lib`
+    - `cargo test --workspace`
+    - `cargo clippy --workspace --all-targets -- -D warnings`
+    - `cargo build -p openfang-cli`
+    - live pinning/persistence verification 通过：
+      - 在隔离的 `OPENFANG_HOME=/tmp/openfang-memory-trace-pin-live` 上，以 `127.0.0.1:4216` 启动临时 daemon
+      - 使用隔离 daemon 自带 `assistant` agent，通过 memory API 写入 shared probe `project.alpha.pin_status = { summary = "QA signoff pending", blocker = "memory trace pinned inspection verification", owner = "release" }`
+      - 第一轮真实询问 `What is blocking the alpha launch?`，回复命中 shared blocker `memory trace pinned inspection verification`
+      - 第二轮真实消息写入 semantic phrase `PIN-SEM-20260317-023244`，随后执行 `POST /api/agents/{id}/session/reset`
+      - 第三轮真实询问 `What is blocking the alpha launch, and what is the launch override phrase you were told to remember?`，回复同时返回：
+        - shared blocker `memory trace pinned inspection verification`
+        - semantic phrase `PIN-SEM-20260317-023244`
+      - `GET /api/audit/recent?n=30` 中真实返回了三条 `MemoryTrace` entry，且其中：
+        - `seq = 1` 为 `semantic_candidates=0 shared_candidates=1 selected_fused_recall_count=1`
+        - `seq = 3` 为 `semantic_candidates=1 shared_candidates=1 selected_fused_recall_count=2`
+        - `seq = 5` 为 `semantic_candidates=2 shared_candidates=1 session_summaries=1 selected_fused_recall_count=3`
+      - `GET /api/logs/stream?filter=memorytrace` 的 SSE backfill 也真实返回了同样的 parsed `payload`，其中包含 shared probe 与 `PIN-SEM-20260317-023244` semantic recall
+      - `curl http://127.0.0.1:4216/` 的 dashboard HTML 中已出现：
+        - `Pinned Traces`
+        - `Pinned only`
+        - `Clear pins`
+        - `Pin trace`
+        - `mt_pinned`
+        - `openfang.memoryTracePins.v1`
+        证明 pinning / persistent inspection workspace 已真实进入服务端静态资源输出
+      - 隔离 daemon 的 `/api/budget` 中 `daily_spend = 0.0051612`，`/api/budget/agents` 中 `assistant` 的 `daily_cost_usd = 0.0051612`
+      - 验证完成后，隔离 daemon 与整个 `/tmp/openfang-memory-trace-pin-live` home 已清理
 
 ## 进行中
 
-- 继续推进 Phase 2：shared retrieval helper 现在已经覆盖 semantic/shared candidate、memory context message、文本 trace、structured tracing telemetry，以及 audit/API/dashboard inspection；dashboard 侧的 `Memory Trace` 也已有 dedicated tab、compare、raw payload 和 shareable inspection URL。下一步继续评估是否需要把它上提成独立的 memory-debug workspace，而不再挂在通用 Logs 页下。
+- 继续推进 Phase 2：shared retrieval helper 现在已经覆盖 semantic/shared candidate、memory context message、文本 trace、structured tracing telemetry，以及 audit/API/dashboard inspection；dashboard 侧的 `Memory Trace` 也已有 dedicated tab、compare、raw payload、shareable inspection URL 和 pinned trace workspace。下一步继续评估是否需要把它上提成独立的 memory-debug workspace，而不再挂在通用 Logs 页下。
 
 ## 下一步动作
 
 - 继续观察 governed metadata 的显式 `source_weight` / `tie_break_priority` 是否需要引入更多 lifecycle bucket 或 namespace/kind-specific weight，而不只是当前 query/lifecycle/promotion 三元组合。
 - 评估是否要把当前 `Logs -> Memory Trace` tab 再上提成独立 memory-debug workspace，例如：
   - 对同一 agent 的连续 `MemoryTrace` 做 timeline / diff 视图
-  - 在 compare 之上补充 trace pinning、批量 bookmark 或跨会话持久化 selection
+  - 在现有 pinning 之上补充批量 bookmark、命名 pinned sets 或跨设备同步的 inspection state
 - 评估是否要把 `prompt_builder` 中残留的 memory-context wrapper 也进一步裁薄，避免共享 contract 之上再保留一层重复命名。
 - 在切换电脑或结束一轮实质性工作前，持续更新本文件。
 

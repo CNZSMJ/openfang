@@ -4515,7 +4515,9 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
               <option value="semantic">semantic</option>
             </select>
             <input class="form-input" style="width:180px" placeholder="Search trace..." x-model="memoryTraceTextFilter" @input.debounce.250ms="syncLogsUrlState()">
+            <button class="btn btn-ghost btn-sm" @click="toggleMemoryTracePinnedOnly()" x-text="memoryTracePinnedOnly ? 'Pinned only' : 'All traces'"></button>
             <button class="btn btn-ghost btn-sm" @click="clearMemoryTraceFilters()">Reset</button>
+            <button class="btn btn-ghost btn-sm" x-show="memoryTracePinnedEntries.length" @click="clearMemoryTracePins()" x-text="'Clear pins (' + memoryTracePinnedEntries.length + ')'"></button>
             <button class="btn btn-ghost btn-sm" @click="copyMemoryTraceLink()" x-text="copiedMemoryTraceToken === 'memory-link' ? 'Copied Link' : 'Copy Link'"></button>
             <button class="btn btn-ghost btn-sm" @click="exportMemoryTraces()">Export JSON</button>
           </div>
@@ -4590,6 +4592,42 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                 </div>
                 <div class="memory-trace-hero-stats">
                   <span class="badge badge-created" x-text="memoryTraceCountLabel"></span>
+                </div>
+              </div>
+              <div class="card mb-4 memory-trace-pinned" x-show="memoryTracePinnedEntries.length">
+                <div class="memory-trace-compare-header">
+                  <div>
+                    <div class="font-bold" style="font-size:13px;margin-bottom:4px">Pinned Traces</div>
+                    <div class="text-sm text-dim" style="line-height:1.6">
+                      Persist high-signal trace snapshots across reloads so compare and inspection do not depend on the current live buffer.
+                    </div>
+                  </div>
+                  <div class="memory-trace-card-actions">
+                    <span class="badge badge-created" x-text="memoryTracePinnedCountLabel"></span>
+                  </div>
+                </div>
+                <div class="memory-trace-pinned-list">
+                  <template x-for="entry in memoryTracePinnedEntries" :key="'memory-trace-pinned-' + entry.seq">
+                    <div class="memory-trace-pinned-item">
+                      <div class="memory-trace-card-title">
+                        <span class="memory-trace-card-time" x-text="new Date(entry.timestamp).toLocaleString()"></span>
+                        <span class="badge badge-dim" x-text="auditAgentName(entry.agent_id)"></span>
+                        <template x-if="memoryTracePayload(entry)">
+                          <span class="badge badge-created" x-text="memoryTracePayload(entry).semantic_mode || 'unknown'"></span>
+                        </template>
+                      </div>
+                      <div class="memory-trace-card-detail" x-text="entry.detail"></div>
+                      <div class="memory-trace-summary">
+                        <template x-for="(item, index) in memoryTraceSummary(entry)" :key="'memory-trace-pinned-summary-' + entry.seq + '-' + index">
+                          <span class="memory-trace-pill" x-text="item"></span>
+                        </template>
+                      </div>
+                      <div class="memory-trace-card-actions">
+                        <button class="btn btn-ghost btn-sm" @click="toggleMemoryTraceCompare(entry)" x-text="memoryTraceCompareButtonLabel(entry)"></button>
+                        <button class="btn btn-ghost btn-sm" @click="toggleMemoryTracePinned(entry)">Unpin trace</button>
+                      </div>
+                    </div>
+                  </template>
                 </div>
               </div>
               <div class="card mb-4 memory-trace-compare" x-show="memoryTraceCompareEntries.length">
@@ -4690,6 +4728,7 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                         </template>
                       </div>
                       <div class="memory-trace-card-actions">
+                        <button class="btn btn-ghost btn-sm" @click="toggleMemoryTracePinned(entry)" x-text="isMemoryTracePinned(entry) ? 'Unpin trace' : 'Pin trace'"></button>
                         <button class="btn btn-ghost btn-sm" @click="toggleMemoryTraceCompare(entry)" x-text="memoryTraceCompareButtonLabel(entry)"></button>
                         <button class="btn btn-ghost btn-sm" @click="copyMemoryTraceAllRecalls(entry)" x-text="copiedMemoryTraceToken === 'all-recall-' + entry.seq ? 'Copied recall' : 'Copy all recall'"></button>
                         <button class="btn btn-ghost btn-sm" @click="copyMemoryTracePayload(entry)" x-text="copiedMemoryTraceToken === 'payload-' + entry.seq ? 'Copied JSON' : 'Copy JSON'"></button>
