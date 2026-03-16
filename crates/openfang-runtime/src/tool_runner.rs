@@ -8,12 +8,13 @@ use crate::mcp;
 use crate::web_search::{parse_ddg_results, WebToolsContext};
 use openfang_skills::registry::SkillRegistry;
 use openfang_types::memory::{
-    build_memory_record_metadata, canonicalize_memory_namespace, canonicalize_memory_tag_filters,
-    canonicalize_user_memory_key, collect_memory_metadata, is_internal_memory_key,
-    is_memory_metadata_key, memory_key_matches_prefix, memory_key_namespace,
-    memory_lifecycle_snapshot, memory_lookup_candidates, memory_metadata_key, memory_tags_match,
-    plan_memory_cleanup, MemoryCleanupAction, MemoryConflictPolicy, MemoryFreshness,
-    MemoryLifecycleState, MEMORY_CLEANUP_SOURCE,
+    build_memory_autoconverge_plan, build_memory_record_metadata,
+    canonicalize_memory_namespace, canonicalize_memory_tag_filters, canonicalize_user_memory_key,
+    collect_memory_metadata, is_internal_memory_key, is_memory_metadata_key,
+    memory_key_matches_prefix, memory_key_namespace, memory_lifecycle_snapshot,
+    memory_lookup_candidates, memory_metadata_key, memory_tags_match, plan_memory_cleanup,
+    MemoryCleanupAction, MemoryConflictPolicy, MemoryFreshness, MemoryLifecycleState,
+    MEMORY_CLEANUP_SOURCE,
 };
 use openfang_types::taint::{TaintLabel, TaintSink, TaintedValue};
 use openfang_types::tool::{ToolDefinition, ToolResult};
@@ -661,6 +662,9 @@ pub async fn execute_tool(
         "memory_recall" => tool_memory_recall(input, kernel),
         "memory_list" => tool_memory_list(input, kernel),
         "memory_cleanup" => tool_memory_cleanup(input, kernel),
+        "memory_autoconverge" => {
+            tool_memory_autoconverge(input, kernel, caller_agent_id, workspace_root)
+        }
 
         // Collaboration tools
         "agent_find" => tool_agent_find(input, kernel),
@@ -1171,6 +1175,17 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "properties": {
                     "apply": { "type": "boolean", "description": "Whether to apply the cleanup plan. Default false returns audit findings only." },
                     "limit": { "type": "integer", "description": "Maximum number of findings to inspect or apply (default 200, max 200)." }
+                }
+            }),
+        },
+        tool_definition! {
+            name: "memory_autoconverge".to_string(),
+            description: "Audit or apply the managed MEMORY.md snapshot generated from governed shared memory promotion candidates. Use this to review what should be written into the agent workspace MEMORY.md before applying it.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "apply": { "type": "boolean", "description": "Whether to write the managed snapshot into MEMORY.md. Default false returns the review plan only." },
+                    "limit": { "type": "integer", "description": "Maximum number of governed promotion candidates to include in the review (default 24, max 64)." }
                 }
             }),
         },
@@ -2597,6 +2612,89 @@ fn tool_memory_cleanup(
     });
 
     serde_json::to_string_pretty(&result).map_err(|e| format!("Failed to serialize cleanup result: {e}"))
+}
+
+fn tool_memory_autoconverge(
+    input: &serde_json::Value,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
+    workspace_root: Option<&Path>,
+) -> Result<String, String> {
+    let kh = require_kernel(kernel)?;
+    let workspace_root = workspace_root.ok_or("memory_autoconverge requires a workspace root")?;
+    let apply = input.get("apply").and_then(|v| v.as_bool()).unwrap_or(false);
+    let limit = input
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|v| v.min(64) as usize)
+        .unwrap_or(24);
+    let memory_path = workspace_root.join("MEMORY.md");
+    let current_content = std::fs::read_to_string(&memory_path).unwrap_or_default();
+    let plan = build_memory_autoconverge_plan(
+        &current_content,
+        &kh.memory_list(None, Some(500))?,
+        chrono::Utc::now(),
+        limit,
+    );
+
+    if apply && !plan.summary.can_apply {
+        let result = serde_json::json!({
+            "status": "blocked",
+            "error": "Autoconverge is blocked until shared memory governance cleanup issues are repaired",
+            "path": memory_path.display().to_string(),
+            "summary": plan.summary,
+            "candidates": plan.candidates,
+            "stale_review": plan.stale_review,
+            "cleanup_blockers": plan.cleanup_blockers,
+            "current_content": plan.current_content,
+            "proposed_content": plan.proposed_content,
+        });
+        return serde_json::to_string_pretty(&result)
+            .map_err(|e| format!("Failed to serialize autoconverge result: {e}"));
+    }
+
+    if apply && plan.summary.changed {
+        const MAX_FILE_SIZE: usize = 32_768;
+        if plan.proposed_content.len() > MAX_FILE_SIZE {
+            return Err("Autoconverged MEMORY.md would exceed 32KB".to_string());
+        }
+
+        let tmp_path = workspace_root.join(".MEMORY.md.tmp");
+        std::fs::write(&tmp_path, &plan.proposed_content)
+            .map_err(|e| format!("Write failed: {e}"))?;
+        if let Err(e) = std::fs::rename(&tmp_path, &memory_path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(format!("Rename failed: {e}"));
+        }
+
+        if let Some(agent_id) = caller_agent_id {
+            kh.record_audit_event(
+                agent_id,
+                crate::audit::AuditAction::ConfigChange,
+                "memory autoconverge apply",
+                &format!(
+                    "managed_entries={} cleanup_blockers={} stale_review={}",
+                    plan.summary.managed_entries,
+                    plan.summary.cleanup_blockers,
+                    plan.summary.stale_review
+                ),
+            )?;
+        }
+    }
+
+    let result = serde_json::json!({
+        "status": if apply { "applied" } else { "audit" },
+        "path": memory_path.display().to_string(),
+        "summary": plan.summary,
+        "candidates": plan.candidates,
+        "stale_review": plan.stale_review,
+        "cleanup_blockers": plan.cleanup_blockers,
+        "current_content": plan.current_content,
+        "proposed_content": plan.proposed_content,
+    });
+
+    serde_json::to_string_pretty(&result)
+        .map_err(|e| format!("Failed to serialize autoconverge result: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -4354,6 +4452,7 @@ input_schema = { type = "object", properties = { issue = { type = "string" } } }
         assert!(names.contains(&"memory_recall"));
         assert!(names.contains(&"memory_list"));
         assert!(names.contains(&"memory_cleanup"));
+        assert!(names.contains(&"memory_autoconverge"));
         // 6 collaboration tools
         assert!(names.contains(&"agent_find"));
         assert!(names.contains(&"task_post"));
@@ -4413,6 +4512,11 @@ input_schema = { type = "object", properties = { issue = { type = "string" } } }
             .find(|tool| tool.name == "memory_cleanup")
             .expect("memory_cleanup tool should exist");
         assert!(memory_cleanup.input_schema["properties"]["apply"].is_object());
+        let memory_autoconverge = tools
+            .iter()
+            .find(|tool| tool.name == "memory_autoconverge")
+            .expect("memory_autoconverge tool should exist");
+        assert!(memory_autoconverge.input_schema["properties"]["limit"].is_object());
         assert!(
             tools.iter().all(|tool| !tool.defer_loading),
             "builtin tools should remain visible by default; defer_loading is reserved for skill/MCP rollout"
@@ -4600,6 +4704,142 @@ input_schema = { type = "object", properties = { issue = { type = "string" } } }
         assert!(memory.contains_key("__openfang_memory_meta.general.legacy_pref"));
         assert!(memory.contains_key("__openfang_memory_meta.project.alpha.status"));
         assert!(!memory.contains_key("__openfang_memory_meta.pref.orphan"));
+    }
+
+    #[tokio::test]
+    async fn test_memory_autoconverge_returns_blocked_when_cleanup_is_required() {
+        let workspace = tempdir().unwrap();
+        fs::write(
+            workspace.path().join("MEMORY.md"),
+            "# Long-Term Memory\n\n## Durable User Context\n- Existing note\n",
+        )
+        .unwrap();
+
+        let metadata = build_memory_record_metadata(
+            "pref.reply.style",
+            Some("preference"),
+            &["profile".to_string()],
+            Some(MemoryFreshness::Durable),
+            "memory_store_tool",
+        )
+        .unwrap();
+        let kernel: Arc<dyn KernelHandle> = Arc::new(TestKernel::with_memory(vec![
+            ("legacy_pref".to_string(), serde_json::json!("dark")),
+            (
+                "pref.reply.style".to_string(),
+                serde_json::json!("Use concise bullet points."),
+            ),
+            (
+                memory_metadata_key("pref.reply.style").unwrap(),
+                serde_json::to_value(metadata).unwrap(),
+            ),
+        ]));
+
+        let result = execute_tool(
+            "test-id",
+            "memory_autoconverge",
+            &serde_json::json!({"apply": true}),
+            Some(&kernel),
+            None,
+            Some("assistant-test"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(workspace.path()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(!result.is_error, "{}", result.content);
+        let payload: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+        assert_eq!(payload["status"], "blocked");
+        assert_eq!(payload["summary"]["can_apply"], false);
+        assert_eq!(payload["summary"]["cleanup_blockers"], 1);
+        let memory_md = fs::read_to_string(workspace.path().join("MEMORY.md")).unwrap();
+        assert!(!memory_md.contains("OPENFANG_AUTOCONVERGE_BEGIN"));
+    }
+
+    #[tokio::test]
+    async fn test_memory_autoconverge_apply_writes_managed_memory_block() {
+        let workspace = tempdir().unwrap();
+        fs::write(
+            workspace.path().join("MEMORY.md"),
+            "# Long-Term Memory\n\n## Durable User Context\n- Preferences worth reusing:\n",
+        )
+        .unwrap();
+
+        let pref_metadata = build_memory_record_metadata(
+            "pref.reply.style",
+            Some("preference"),
+            &["profile".to_string(), "ui".to_string()],
+            Some(MemoryFreshness::Durable),
+            "memory_store_tool",
+        )
+        .unwrap();
+        let project_metadata = build_memory_record_metadata(
+            "project.alpha.status",
+            Some("project_state"),
+            &["project".to_string(), "alpha".to_string()],
+            Some(MemoryFreshness::Durable),
+            "memory_store_tool",
+        )
+        .unwrap();
+        let kernel: Arc<dyn KernelHandle> = Arc::new(TestKernel::with_memory(vec![
+            (
+                "pref.reply.style".to_string(),
+                serde_json::json!("Use concise bullet points."),
+            ),
+            (
+                memory_metadata_key("pref.reply.style").unwrap(),
+                serde_json::to_value(pref_metadata).unwrap(),
+            ),
+            (
+                "project.alpha.status".to_string(),
+                serde_json::json!("Alpha launch is blocked on QA signoff."),
+            ),
+            (
+                memory_metadata_key("project.alpha.status").unwrap(),
+                serde_json::to_value(project_metadata).unwrap(),
+            ),
+        ]));
+
+        let result = execute_tool(
+            "test-id",
+            "memory_autoconverge",
+            &serde_json::json!({"apply": true, "limit": 8}),
+            Some(&kernel),
+            None,
+            Some("assistant-test"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(workspace.path()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(!result.is_error, "{}", result.content);
+        let payload: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+        assert_eq!(payload["status"], "applied");
+        assert_eq!(payload["summary"]["managed_entries"], 2);
+
+        let memory_md = fs::read_to_string(workspace.path().join("MEMORY.md")).unwrap();
+        assert!(memory_md.contains("<!-- OPENFANG_AUTOCONVERGE_BEGIN -->"));
+        assert!(memory_md.contains("## Autoconverged Memory Snapshot"));
+        assert!(memory_md.contains("[pref.reply.style] Use concise bullet points."));
+        assert!(memory_md.contains("[project.alpha.status] Alpha launch is blocked on QA signoff."));
     }
 
     #[test]

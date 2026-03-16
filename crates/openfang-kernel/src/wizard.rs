@@ -85,6 +85,7 @@ impl SetupWizard {
                         "memory_recall",
                         "memory_list",
                         "memory_cleanup",
+                        "memory_autoconverge",
                     ] {
                         let s = t.to_string();
                         if !caps.tools.contains(&s) {
@@ -256,6 +257,11 @@ impl SetupWizard {
                     "- If shared memory contains legacy bare keys or broken governance metadata, use memory_cleanup with `apply=false` to audit before applying repairs.",
                 );
             }
+            if has("memory_autoconverge") {
+                hints.push(
+                    "- Use memory_autoconverge to review the managed MEMORY.md snapshot derived from governed promotion candidates, then apply it only after cleanup blockers are cleared.",
+                );
+            }
         }
 
         if hints.is_empty() {
@@ -414,6 +420,11 @@ mod tests {
             .capabilities
             .tools
             .contains(&"memory_cleanup".to_string()));
+        assert!(plan
+            .manifest
+            .capabilities
+            .tools
+            .contains(&"memory_autoconverge".to_string()));
     }
 
     #[test]
@@ -468,6 +479,11 @@ mod tests {
         };
         let plan = SetupWizard::build_plan(intent);
         assert!(plan.manifest.model.system_prompt.contains("memory_cleanup"));
+        assert!(plan
+            .manifest
+            .model
+            .system_prompt
+            .contains("memory_autoconverge"));
         assert!(plan
             .manifest
             .model

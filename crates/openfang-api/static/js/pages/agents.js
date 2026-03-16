@@ -224,6 +224,13 @@ function agentsPage() {
     fileContent: '',
     fileSaving: false,
     filesLoading: false,
+    memoryAutoconvergeLimit: 24,
+    memoryAutoconvergeLoading: false,
+    memoryAutoconvergeApplying: false,
+    memoryAutoconvergeError: '',
+    memoryAutoconvergePlan: null,
+    memoryAutoconvergeRanAt: '',
+    memoryAutoconvergePreviewing: false,
     configForm: {},
     configSaving: false,
     // -- Tool filters --
@@ -498,6 +505,10 @@ function agentsPage() {
       this.agentFiles = [];
       this.editingFile = null;
       this.fileContent = '';
+      this.memoryAutoconvergeError = '';
+      this.memoryAutoconvergePlan = null;
+      this.memoryAutoconvergeRanAt = '';
+      this.memoryAutoconvergePreviewing = false;
       this.editingFallback = false;
       this.newFallbackValue = '';
       this.configForm = {
@@ -691,24 +702,113 @@ function agentsPage() {
       this.filesLoading = false;
     },
 
+    async loadMemoryAutoconvergePlan() {
+      if (!this.detailAgent || this.memoryAutoconvergeLoading) return;
+      this.memoryAutoconvergeLoading = true;
+      this.memoryAutoconvergeError = '';
+      try {
+        var limit = Number(this.memoryAutoconvergeLimit);
+        if (!Number.isFinite(limit) || limit <= 0) limit = 24;
+        limit = Math.min(Math.floor(limit), 64);
+        this.memoryAutoconvergeLimit = limit;
+        var data = await OpenFangAPI.get(
+          '/api/agents/' + this.detailAgent.id + '/memory/autoconverge?limit=' + limit
+        );
+        this.memoryAutoconvergePlan = data;
+        this.memoryAutoconvergeRanAt = new Date().toISOString();
+        if (this.memoryAutoconvergePreviewing && this.editingFile === 'MEMORY.md') {
+          this.fileContent = data.proposed_content || '';
+        }
+      } catch(e) {
+        this.memoryAutoconvergePlan = null;
+        this.memoryAutoconvergeError = e.message || 'Could not audit MEMORY.md autoconverge.';
+        OpenFangToast.error('Failed to audit MEMORY.md: ' + this.memoryAutoconvergeError);
+      }
+      this.memoryAutoconvergeLoading = false;
+    },
+
     async openFile(file) {
       if (!file.exists) {
         // Create with empty content
         this.editingFile = file.name;
         this.fileContent = '';
+        this.memoryAutoconvergePreviewing = false;
         return;
       }
       try {
         var data = await OpenFangAPI.get('/api/agents/' + this.detailAgent.id + '/files/' + encodeURIComponent(file.name));
         this.editingFile = file.name;
         this.fileContent = data.content || '';
+        this.memoryAutoconvergePreviewing = false;
       } catch(e) {
         OpenFangToast.error('Failed to read file: ' + e.message);
       }
     },
 
+    openMemoryAutoconvergePreview() {
+      if (!this.memoryAutoconvergePlan) return;
+      this.editingFile = 'MEMORY.md';
+      this.fileContent = this.memoryAutoconvergePlan.proposed_content || '';
+      this.memoryAutoconvergePreviewing = true;
+    },
+
+    async runMemoryAutoconverge(apply) {
+      if (!this.detailAgent) return;
+      if (apply) {
+        if (this.memoryAutoconvergeApplying) return;
+        this.memoryAutoconvergeApplying = true;
+      } else {
+        if (this.memoryAutoconvergeLoading) return;
+        this.memoryAutoconvergeLoading = true;
+      }
+      this.memoryAutoconvergeError = '';
+      try {
+        var limit = Number(this.memoryAutoconvergeLimit);
+        if (!Number.isFinite(limit) || limit <= 0) limit = 24;
+        limit = Math.min(Math.floor(limit), 64);
+        this.memoryAutoconvergeLimit = limit;
+        var result = await OpenFangAPI.post(
+          '/api/agents/' + this.detailAgent.id + '/memory/autoconverge',
+          { apply: apply, limit: limit }
+        );
+        this.memoryAutoconvergePlan = result;
+        this.memoryAutoconvergeRanAt = new Date().toISOString();
+        if (this.memoryAutoconvergePreviewing && this.editingFile === 'MEMORY.md') {
+          this.fileContent = result.proposed_content || '';
+          this.memoryAutoconvergePreviewing = !apply;
+        }
+        if (apply) {
+          OpenFangToast.success('Managed MEMORY.md snapshot applied');
+          await this.loadAgentFiles();
+        } else {
+          OpenFangToast.success('Managed MEMORY.md audit complete');
+        }
+      } catch(e) {
+        this.memoryAutoconvergeError = e.message || 'Could not run MEMORY.md autoconverge.';
+        OpenFangToast.error('MEMORY.md autoconverge failed: ' + this.memoryAutoconvergeError);
+      }
+      this.memoryAutoconvergeLoading = false;
+      this.memoryAutoconvergeApplying = false;
+    },
+
+    applyMemoryAutoconverge() {
+      var self = this;
+      if (!this.memoryAutoconvergePlan || !this.memoryAutoconvergePlan.summary || !this.memoryAutoconvergePlan.summary.can_apply) return;
+      OpenFangToast.confirm(
+        'Apply MEMORY.md Snapshot',
+        'Write the managed autoconverged snapshot into this agent workspace MEMORY.md now?',
+        async function() {
+          await self.runMemoryAutoconverge(true);
+        }
+      );
+    },
+
     async saveFile() {
       if (!this.editingFile || !this.detailAgent) return;
+      if (this.memoryAutoconvergePreviewing) {
+        OpenFangToast.warn('This editor is showing a managed preview. Use Apply Managed Snapshot instead of saving manually.');
+        return;
+      }
       this.fileSaving = true;
       try {
         await OpenFangAPI.put('/api/agents/' + this.detailAgent.id + '/files/' + encodeURIComponent(this.editingFile), { content: this.fileContent });
@@ -723,6 +823,7 @@ function agentsPage() {
     closeFileEditor() {
       this.editingFile = null;
       this.fileContent = '';
+      this.memoryAutoconvergePreviewing = false;
     },
 
     // ── Detail modal: Config tab ──

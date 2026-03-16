@@ -393,6 +393,7 @@ pub fn build_memory_section(memories: &[(String, String)]) -> String {
          - Bare memory keys are normalized into the `general.` namespace; reserve internal keys such as `session_*` for system-managed state.\n\
          - Use memory_list lifecycle fields (`lifecycle_state`, `review_at`, `expires_at`, `promotion_candidate`) when deciding whether a memory is stale or should graduate into `MEMORY.md`.\n\
          - If memory_list reveals legacy bare keys, orphan metadata, or missing governed metadata, use memory_cleanup to audit first and apply repairs deliberately.\n\
+         - Use memory_autoconverge to audit or apply the managed `MEMORY.md` snapshot generated from active governed promotion candidates. Review cleanup blockers and stale-review signals before applying.\n\
          - Treat injected memory context as historical guidance, not as a replacement for checking current state.",
     );
     if !memories.is_empty() {
@@ -1076,7 +1077,8 @@ pub fn tool_category(name: &str) -> &'static str {
 
         "shell_exec" | "shell_background" => "Shell",
 
-        "memory_store" | "memory_recall" | "memory_delete" | "memory_list" | "memory_cleanup" => {
+        "memory_store" | "memory_recall" | "memory_delete" | "memory_list"
+        | "memory_cleanup" | "memory_autoconverge" => {
             "Memory"
         }
 
@@ -1145,6 +1147,7 @@ pub fn tool_hint(name: &str) -> &'static str {
         "memory_delete" => "delete a memory entry",
         "memory_list" => "list stored memory keys",
         "memory_cleanup" => "audit or repair governed memory metadata",
+        "memory_autoconverge" => "review or apply the managed MEMORY.md snapshot",
 
         // Agents
         "agent_send" => "send a message to another agent",
@@ -1474,6 +1477,7 @@ mod tests {
         assert_eq!(tool_category("shell_exec"), "Shell");
         assert_eq!(tool_category("memory_store"), "Memory");
         assert_eq!(tool_category("memory_cleanup"), "Memory");
+        assert_eq!(tool_category("memory_autoconverge"), "Memory");
         assert_eq!(tool_category("agent_send"), "Agents");
         assert_eq!(tool_category("mcp_minimax_web_search"), "Web");
         assert_eq!(tool_category("mcp_minimax_understand_image"), "Media");
@@ -1493,6 +1497,10 @@ mod tests {
             tool_hint("memory_cleanup"),
             "audit or repair governed memory metadata"
         );
+        assert_eq!(
+            tool_hint("memory_autoconverge"),
+            "review or apply the managed MEMORY.md snapshot"
+        );
         assert!(tool_hint("some_unknown_tool").is_empty());
     }
 
@@ -1503,6 +1511,7 @@ mod tests {
         assert!(section.contains("memory_recall"));
         assert!(section.contains("memory_list"));
         assert!(section.contains("memory_cleanup"));
+        assert!(section.contains("memory_autoconverge"));
         assert!(!section.contains("Recalled memories"));
     }
 
@@ -1536,7 +1545,7 @@ mod tests {
         let section = build_memory_section(&memories);
         // Should be capped at 500 + "..."
         assert!(section.contains("..."));
-        assert!(section.len() < 1800);
+        assert!(section.len() < 2100);
     }
 
     #[test]
