@@ -33,6 +33,8 @@ function logsPage() {
     memoryTraceSourceFilter: '',
     memoryTraceTextFilter: '',
     expandedMemoryTraceSeqs: {},
+    expandedMemoryTracePayloadSeqs: {},
+    memoryTraceCompareSeqs: [],
     copiedMemoryTraceToken: '',
     _copiedMemoryTraceTimer: null,
 
@@ -201,6 +203,16 @@ function logsPage() {
       return '#' + recall.selected_rank + ' ' + recall.source + ' r' + recall.source_rank + ' · w=' + weight + ' · t=' + recall.tie_break_priority + ' · score=' + score;
     },
 
+    memoryTraceAllRecall: function(entry) {
+      var payload = this.memoryTracePayload(entry);
+      return payload && Array.isArray(payload.selected_fused_recall) ? payload.selected_fused_recall : [];
+    },
+
+    memoryTracePayloadJson: function(entry) {
+      if (!this.isMemoryTrace(entry)) return '';
+      return JSON.stringify(entry.payload || {}, null, 2);
+    },
+
     previewText: function(value, limit) {
       if (!value) return '';
       var text = String(value);
@@ -279,6 +291,20 @@ function logsPage() {
       this.expandedMemoryTraceSeqs = Object.assign({}, this.expandedMemoryTraceSeqs);
     },
 
+    isMemoryTracePayloadExpanded: function(entry) {
+      return !!(entry && this.expandedMemoryTracePayloadSeqs[entry.seq]);
+    },
+
+    toggleMemoryTracePayload: function(entry) {
+      if (!entry) return;
+      if (this.expandedMemoryTracePayloadSeqs[entry.seq]) {
+        delete this.expandedMemoryTracePayloadSeqs[entry.seq];
+      } else {
+        this.expandedMemoryTracePayloadSeqs[entry.seq] = true;
+      }
+      this.expandedMemoryTracePayloadSeqs = Object.assign({}, this.expandedMemoryTracePayloadSeqs);
+    },
+
     memoryTraceVisibleRecall: function(entry) {
       var payload = this.memoryTracePayload(entry);
       var recalls = payload && Array.isArray(payload.selected_fused_recall) ? payload.selected_fused_recall : [];
@@ -324,6 +350,14 @@ function logsPage() {
       return this.copyMemoryTraceText(recall.rendered || '', 'recall-' + entry.seq + '-' + recall.selected_rank);
     },
 
+    copyMemoryTraceAllRecalls: function(entry) {
+      var text = this.memoryTraceAllRecall(entry)
+        .map(function(recall) { return recall && recall.rendered ? recall.rendered : ''; })
+        .filter(Boolean)
+        .join('\n\n');
+      return this.copyMemoryTraceText(text, 'all-recall-' + entry.seq);
+    },
+
     exportMemoryTraces: function() {
       var traces = this.filteredMemoryTraceEntries.map(function(entry) {
         return {
@@ -341,6 +375,85 @@ function logsPage() {
       a.download = 'openfang-memory-traces-' + new Date().toISOString().slice(0, 10) + '.json';
       a.click();
       URL.revokeObjectURL(url);
+    },
+
+    memoryTraceCompareSlot: function(entry) {
+      if (!entry) return 0;
+      var index = this.memoryTraceCompareSeqs.indexOf(entry.seq);
+      return index >= 0 ? index + 1 : 0;
+    },
+
+    memoryTraceCompareButtonLabel: function(entry) {
+      var slot = this.memoryTraceCompareSlot(entry);
+      if (slot === 1) return 'Compared A';
+      if (slot === 2) return 'Compared B';
+      return this.memoryTraceCompareSeqs.length < 2 ? 'Add Compare' : 'Replace Compare';
+    },
+
+    toggleMemoryTraceCompare: function(entry) {
+      if (!entry) return;
+      var seqs = this.memoryTraceCompareSeqs.slice();
+      var index = seqs.indexOf(entry.seq);
+      if (index >= 0) {
+        seqs.splice(index, 1);
+      } else {
+        if (seqs.length >= 2) seqs.shift();
+        seqs.push(entry.seq);
+      }
+      this.memoryTraceCompareSeqs = seqs;
+    },
+
+    clearMemoryTraceCompare: function() {
+      this.memoryTraceCompareSeqs = [];
+    },
+
+    get memoryTraceCompareEntries() {
+      var self = this;
+      return this.memoryTraceCompareSeqs
+        .map(function(seq) {
+          return self.entries.find(function(entry) { return entry && entry.seq === seq; }) || null;
+        })
+        .filter(Boolean);
+    },
+
+    memoryTraceRecallIdentity: function(recall) {
+      if (!recall) return '';
+      return String(recall.source || 'unknown') + '|' + String(recall.rendered || '');
+    },
+
+    memoryTraceCompareRecalls: function(fromEntry, toEntry) {
+      var target = {};
+      this.memoryTraceAllRecall(toEntry).forEach(function(recall) {
+        target[this.memoryTraceRecallIdentity(recall)] = true;
+      }.bind(this));
+      return this.memoryTraceAllRecall(fromEntry).filter(function(recall) {
+        return !!target[this.memoryTraceRecallIdentity(recall)];
+      }.bind(this));
+    },
+
+    memoryTraceCompareOnlyRecalls: function(fromEntry, otherEntry) {
+      var other = {};
+      this.memoryTraceAllRecall(otherEntry).forEach(function(recall) {
+        other[this.memoryTraceRecallIdentity(recall)] = true;
+      }.bind(this));
+      return this.memoryTraceAllRecall(fromEntry).filter(function(recall) {
+        return !other[this.memoryTraceRecallIdentity(recall)];
+      }.bind(this));
+    },
+
+    memoryTraceCompareSharedRecalls: function() {
+      if (this.memoryTraceCompareEntries.length < 2) return [];
+      return this.memoryTraceCompareRecalls(this.memoryTraceCompareEntries[0], this.memoryTraceCompareEntries[1]);
+    },
+
+    memoryTraceCompareOnlyARecalls: function() {
+      if (this.memoryTraceCompareEntries.length < 2) return [];
+      return this.memoryTraceCompareOnlyRecalls(this.memoryTraceCompareEntries[0], this.memoryTraceCompareEntries[1]);
+    },
+
+    memoryTraceCompareOnlyBRecalls: function() {
+      if (this.memoryTraceCompareEntries.length < 2) return [];
+      return this.memoryTraceCompareOnlyRecalls(this.memoryTraceCompareEntries[1], this.memoryTraceCompareEntries[0]);
     },
 
     get filteredEntries() {

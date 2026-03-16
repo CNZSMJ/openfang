@@ -508,18 +508,66 @@
         证明 dedicated tab 与其 controls 已真实进入服务端静态资源输出
       - 隔离 daemon 的 `/api/budget` 中 `daily_spend = 0.0038511000000000005`，`/api/budget/agents` 中 `assistant` 的 `daily_cost_usd = 0.0038511000000000005`
       - 验证完成后，隔离 daemon 与整个 `/tmp/openfang-memory-trace-tab-live` home 已清理
+  - 已完成 Phase 2 第十一批 memory trace compare / raw payload inspection 接线：
+    - `Logs -> Memory Trace` tab 现在支持把两条 trace 放入 compare selection，不再只能逐条目测：
+      - 每条 trace card 新增 `Add Compare` / `Compared A` / `Compared B`
+      - compare panel 会在顶部固定展示 `Trace A` / `Trace B` 的时间、agent、semantic mode 与 summary pills
+      - compare panel 会直接分桶展示：
+        - `Shared Recall`
+        - `Only In Trace A`
+        - `Only In Trace B`
+    - 每条 trace card 现在还新增：
+      - `Copy all recall`
+      - `Raw payload` 展开
+      - 已有 `Copy JSON` / 单条 `Copy recall` / `Expand` 继续保留
+    - raw payload 展开会直接渲染当前 `MemoryTrace.payload` 的 prettified JSON，便于 inspection 时对照 dashboard 摘要和真实 telemetry 字段，而不必离开页面再打 API
+    - compare 逻辑已保持纯前端 helper 形式，按 `source + rendered recall text` 做交集/差集，不需要后端再补 compare API
+  - 已完成本轮 compare / raw-payload inspection 验证：
+    - `node` 级纯前端 helper smoke 通过：
+      - 直接加载 `static/js/pages/logs.js` 并构造两条 mock `MemoryTrace`
+      - compare helper 返回：
+        - `shared = ["shared blocker"]`
+        - `onlyA = ["semantic phrase old"]`
+        - `onlyB = ["semantic phrase new"]`
+      - `memoryTraceCompareButtonLabel()` 与 payload toggle 逻辑均符合预期
+    - `cargo build --workspace --lib`
+    - `cargo test --workspace`
+    - `cargo clippy --workspace --all-targets -- -D warnings`
+    - `cargo build -p openfang-cli`
+    - live compare/raw-payload inspection verification 通过：
+      - 在隔离的 `OPENFANG_HOME=/tmp/openfang-memory-trace-compare-live` 上，以 `127.0.0.1:4214` 启动临时 daemon
+      - 使用隔离 daemon 自带 `assistant` agent，通过 memory API 写入 shared probe `project.alpha.compare_trace_status = TRACE-COMPARE-SHARED-20260317 alpha launch blocked on QA signoff`
+      - 第一轮真实消息写入 semantic phrase `TRACE-COMPARE-SEM-20260317 launch override phrase`
+      - 执行 `POST /api/agents/{id}/session/reset` 后，第二轮真实询问 `What is the alpha launch blocker, and what is the launch override phrase?`，回复同时返回：
+        - shared blocker `QA signoff`
+        - semantic phrase `TRACE-COMPARE-SEM-20260317 launch override phrase`
+      - `GET /api/audit/recent?n=20` 中真实返回两条 `MemoryTrace`，其中：
+        - 一条为 `semantic_candidates=0 shared_candidates=1 selected_fused_recall_count=1`
+        - 另一条为 `semantic_candidates=1 shared_candidates=1 session_summaries=1 selected_fused_recall_count=2`
+        - 第二条 `selected_fused_recall` 同时包含 shared probe 与 semantic trace phrase，对 compare panel 的交集/差集场景形成真实输入
+      - `curl http://127.0.0.1:4214/` 的 dashboard HTML 中已出现：
+        - `Compare Selected Traces`
+        - `Clear compare`
+        - `Shared Recall`
+        - `Only In Trace A`
+        - `Only In Trace B`
+        - `Copy all recall`
+        - `Raw Payload`
+        证明 compare/raw-payload inspection UI 已真实进入服务端静态资源输出
+      - 隔离 daemon 的 `/api/budget` 中 `daily_spend = 0.006620900000000001`，`/api/budget/agents` 中 `assistant` 的 `daily_cost_usd = 0.006620900000000001`
+      - 验证完成后，隔离 daemon 与整个 `/tmp/openfang-memory-trace-compare-live` home 已清理
 
 ## 进行中
 
-- 继续推进 Phase 2：shared retrieval helper 现在已经覆盖 semantic/shared candidate、memory context message、文本 trace、structured tracing telemetry，以及 audit/API/dashboard inspection；dashboard 侧也已有 dedicated `Memory Trace` tab。下一步评估是否需要把它继续上提成独立的 memory-debug workspace，而不再挂在通用 Logs 页下。
+- 继续推进 Phase 2：shared retrieval helper 现在已经覆盖 semantic/shared candidate、memory context message、文本 trace、structured tracing telemetry，以及 audit/API/dashboard inspection；dashboard 侧的 `Memory Trace` 也已有 dedicated tab、compare 和 raw payload。下一步继续评估是否需要把它上提成独立的 memory-debug workspace，而不再挂在通用 Logs 页下。
 
 ## 下一步动作
 
 - 继续观察 governed metadata 的显式 `source_weight` / `tie_break_priority` 是否需要引入更多 lifecycle bucket 或 namespace/kind-specific weight，而不只是当前 query/lifecycle/promotion 三元组合。
 - 评估是否要把当前 `Logs -> Memory Trace` tab 再上提成独立 memory-debug workspace，例如：
   - 直接按 agent / semantic mode / recall source 深链接
-  - recall text expand/copy 之外补充 raw payload / copy-all / compare-two-traces
   - 对同一 agent 的连续 `MemoryTrace` 做 timeline / diff 视图
+  - 在 compare 之上补充 trace pinning、跨页面持久化 selection 或 shareable inspection URL
 - 评估是否要把 `prompt_builder` 中残留的 memory-context wrapper 也进一步裁薄，避免共享 contract 之上再保留一层重复命名。
 - 在切换电脑或结束一轮实质性工作前，持续更新本文件。
 
@@ -531,7 +579,7 @@
   - `tracing::info!` 结构化字段
   - audit-backed `/api/logs/stream` `MemoryTrace` 事件
   - dashboard `Logs -> Memory Trace` dedicated tab
-  但当前 dashboard 仍然是复用通用 Logs 页，并不是独立的 memory inspection workspace；当 trace 密度再上来时，跨-agent 对比、连续 trace diff、批量导出与深链接能力仍可能不够。
+  但当前 dashboard 仍然是复用通用 Logs 页，并不是独立的 memory inspection workspace；当 trace 密度再上来时，跨-agent 深链接、连续 trace timeline/diff、批量导出与 compare selection 持久化能力仍可能不够。
 - 需要避免在 daemon 运行中直接用 sqlite 修改 shared memory sidecar 做复杂 live probe；这类验证更稳妥的做法仍然是 daemon 停止后做 DB 注入，或改造成 API/tool 可达路径。
 - 如果后续启动工作时不先读取本文件，分支纪律和连续性可能重新漂移。
 
@@ -544,4 +592,4 @@
 
 ## 最后更新时间
 
-- 2026-03-16 Asia/Shanghai
+- 2026-03-17 Asia/Shanghai

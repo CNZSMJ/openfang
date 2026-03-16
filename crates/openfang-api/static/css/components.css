@@ -1661,6 +1661,50 @@ mark.search-highlight {
   align-items: center;
   gap: 8px;
 }
+.memory-trace-compare,
+.memory-trace-payload {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.memory-trace-compare-header,
+.memory-trace-compare-column-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.memory-trace-compare-grid,
+.memory-trace-compare-section-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 12px;
+}
+.memory-trace-compare-column,
+.memory-trace-compare-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--surface2) 72%, transparent);
+}
+.memory-trace-compare-sections {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.memory-trace-compare-section-title {
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+}
+.memory-trace-compare-empty {
+  padding: 12px 0;
+}
 .memory-trace-list {
   display: flex;
   flex-direction: column;
@@ -1720,6 +1764,26 @@ mark.search-highlight {
 .memory-trace-source-unknown {
   background: var(--surface2);
   color: var(--text-dim);
+}
+.memory-trace-payload-json {
+  margin: 0;
+  padding: 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--surface2);
+  color: var(--text);
+  font-size: 11px;
+  line-height: 1.55;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+@media (max-width: 880px) {
+  .memory-trace-hero,
+  .memory-trace-card-header {
+    flex-direction: column;
+    align-items: stretch;
+  }
 }
 
 /* Live log streaming indicator */

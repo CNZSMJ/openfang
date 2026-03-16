@@ -4591,6 +4591,92 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                   <span class="badge badge-created" x-text="memoryTraceCountLabel"></span>
                 </div>
               </div>
+              <div class="card mb-4 memory-trace-compare" x-show="memoryTraceCompareEntries.length">
+                <div class="memory-trace-compare-header">
+                  <div>
+                    <div class="font-bold" style="font-size:13px;margin-bottom:4px">Compare Selected Traces</div>
+                    <div class="text-sm text-dim" style="line-height:1.6" x-text="memoryTraceCompareEntries.length === 1 ? 'Select one more trace to compare recall drift across turns.' : 'Compare shared recall, dropouts, and new recall added between two turns.'"></div>
+                  </div>
+                  <div class="memory-trace-card-actions">
+                    <button class="btn btn-ghost btn-sm" @click="clearMemoryTraceCompare()">Clear compare</button>
+                  </div>
+                </div>
+                <div class="memory-trace-compare-grid">
+                  <template x-for="(entry, index) in memoryTraceCompareEntries" :key="'memory-trace-compare-entry-' + entry.seq">
+                    <div class="memory-trace-compare-column">
+                      <div class="memory-trace-compare-column-head">
+                        <span class="badge badge-dim" x-text="index === 0 ? 'Trace A' : 'Trace B'"></span>
+                        <span class="memory-trace-card-time" x-text="new Date(entry.timestamp).toLocaleString()"></span>
+                        <span class="badge badge-dim" x-text="auditAgentName(entry.agent_id)"></span>
+                        <template x-if="memoryTracePayload(entry)">
+                          <span class="badge badge-created" x-text="memoryTracePayload(entry).semantic_mode || 'unknown'"></span>
+                        </template>
+                      </div>
+                      <div class="memory-trace-card-detail" x-text="entry.detail"></div>
+                      <div class="memory-trace-summary">
+                        <template x-for="(item, summaryIndex) in memoryTraceSummary(entry)" :key="'memory-trace-compare-summary-' + entry.seq + '-' + summaryIndex">
+                          <span class="memory-trace-pill" x-text="item"></span>
+                        </template>
+                      </div>
+                    </div>
+                  </template>
+                </div>
+                <div class="memory-trace-compare-sections" x-show="memoryTraceCompareEntries.length === 2">
+                  <div class="memory-trace-compare-section">
+                    <div class="memory-trace-compare-section-title">Shared Recall</div>
+                    <div class="memory-trace-card-recalls" x-show="memoryTraceCompareSharedRecalls().length">
+                      <template x-for="recall in memoryTraceCompareSharedRecalls()" :key="'memory-trace-compare-shared-' + memoryTraceRecallIdentity(recall)">
+                        <div class="memory-trace-recall">
+                          <div class="memory-trace-recall-head">
+                            <div class="memory-trace-recall-meta" x-text="memoryTraceMeta(recall)"></div>
+                            <span class="memory-trace-source-pill" :class="memoryTraceRecallSourceClass(recall)" x-text="recall.source"></span>
+                          </div>
+                          <div class="memory-trace-recall-text" x-text="recall.rendered"></div>
+                        </div>
+                      </template>
+                    </div>
+                    <div class="empty-state memory-trace-compare-empty" x-show="!memoryTraceCompareSharedRecalls().length">
+                      <p class="hint">No recall items were shared across both traces.</p>
+                    </div>
+                  </div>
+                  <div class="memory-trace-compare-section-grid">
+                    <div class="memory-trace-compare-section">
+                      <div class="memory-trace-compare-section-title">Only In Trace A</div>
+                      <div class="memory-trace-card-recalls" x-show="memoryTraceCompareOnlyARecalls().length">
+                        <template x-for="recall in memoryTraceCompareOnlyARecalls()" :key="'memory-trace-compare-a-' + memoryTraceRecallIdentity(recall)">
+                          <div class="memory-trace-recall">
+                            <div class="memory-trace-recall-head">
+                              <div class="memory-trace-recall-meta" x-text="memoryTraceMeta(recall)"></div>
+                              <span class="memory-trace-source-pill" :class="memoryTraceRecallSourceClass(recall)" x-text="recall.source"></span>
+                            </div>
+                            <div class="memory-trace-recall-text" x-text="recall.rendered"></div>
+                          </div>
+                        </template>
+                      </div>
+                      <div class="empty-state memory-trace-compare-empty" x-show="!memoryTraceCompareOnlyARecalls().length">
+                        <p class="hint">No A-only recall items.</p>
+                      </div>
+                    </div>
+                    <div class="memory-trace-compare-section">
+                      <div class="memory-trace-compare-section-title">Only In Trace B</div>
+                      <div class="memory-trace-card-recalls" x-show="memoryTraceCompareOnlyBRecalls().length">
+                        <template x-for="recall in memoryTraceCompareOnlyBRecalls()" :key="'memory-trace-compare-b-' + memoryTraceRecallIdentity(recall)">
+                          <div class="memory-trace-recall">
+                            <div class="memory-trace-recall-head">
+                              <div class="memory-trace-recall-meta" x-text="memoryTraceMeta(recall)"></div>
+                              <span class="memory-trace-source-pill" :class="memoryTraceRecallSourceClass(recall)" x-text="recall.source"></span>
+                            </div>
+                            <div class="memory-trace-recall-text" x-text="recall.rendered"></div>
+                          </div>
+                        </template>
+                      </div>
+                      <div class="empty-state memory-trace-compare-empty" x-show="!memoryTraceCompareOnlyBRecalls().length">
+                        <p class="hint">No B-only recall items.</p>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
               <div class="memory-trace-list" x-show="filteredMemoryTraceEntries.length">
                 <template x-for="entry in filteredMemoryTraceEntries" :key="'memory-trace-card-' + entry.seq">
                   <div class="card memory-trace-card">
@@ -4603,7 +4689,10 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                         </template>
                       </div>
                       <div class="memory-trace-card-actions">
+                        <button class="btn btn-ghost btn-sm" @click="toggleMemoryTraceCompare(entry)" x-text="memoryTraceCompareButtonLabel(entry)"></button>
+                        <button class="btn btn-ghost btn-sm" @click="copyMemoryTraceAllRecalls(entry)" x-text="copiedMemoryTraceToken === 'all-recall-' + entry.seq ? 'Copied recall' : 'Copy all recall'"></button>
                         <button class="btn btn-ghost btn-sm" @click="copyMemoryTracePayload(entry)" x-text="copiedMemoryTraceToken === 'payload-' + entry.seq ? 'Copied JSON' : 'Copy JSON'"></button>
+                        <button class="btn btn-ghost btn-sm" @click="toggleMemoryTracePayload(entry)" x-text="isMemoryTracePayloadExpanded(entry) ? 'Hide raw payload' : 'Raw payload'"></button>
                         <button class="btn btn-ghost btn-sm" x-show="memoryTraceHiddenRecallCount(entry) > 0 || isMemoryTraceExpanded(entry)" @click="toggleMemoryTraceExpanded(entry)" x-text="isMemoryTraceExpanded(entry) ? 'Collapse' : 'Expand'"></button>
                       </div>
                     </div>
@@ -4628,6 +4717,10 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                       </template>
                     </div>
                     <div class="memory-trace-more" x-show="memoryTraceHiddenRecallCount(entry) > 0" x-text="'+' + memoryTraceHiddenRecallCount(entry) + ' more recall candidates hidden'"></div>
+                    <div class="memory-trace-payload" x-show="isMemoryTracePayloadExpanded(entry)">
+                      <div class="memory-trace-compare-section-title">Raw Payload</div>
+                      <pre class="memory-trace-payload-json" x-text="memoryTracePayloadJson(entry)"></pre>
+                    </div>
                   </div>
                 </template>
               </div>
