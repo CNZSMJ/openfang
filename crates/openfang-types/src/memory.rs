@@ -431,6 +431,30 @@ pub struct PromptMemoryContext {
     pub trace: PromptMemoryContextTrace,
 }
 
+/// Structured telemetry row for a selected fused prompt-time recall candidate.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PromptMemoryContextTraceSelectedRecall {
+    pub selected_rank: usize,
+    pub source: MemoryContextSource,
+    pub source_rank: usize,
+    pub source_weight: f32,
+    pub tie_break_priority: u8,
+    pub fused_score: f32,
+    pub rendered: String,
+}
+
+/// Structured telemetry payload for prompt-time memory context trace emission.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PromptMemoryContextTraceTelemetry {
+    pub semantic_mode: MemoryContextRecallMode,
+    pub semantic_candidates: usize,
+    pub shared_candidates: usize,
+    pub maintenance_signals: usize,
+    pub attention_signals: usize,
+    pub session_summaries: usize,
+    pub selected_fused_recall: Vec<PromptMemoryContextTraceSelectedRecall>,
+}
+
 /// Governed prompt candidate plus fusion metadata for cross-source reranking.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GovernedMemoryPromptSelection {
@@ -1820,8 +1844,10 @@ pub fn render_prompt_memory_context_message(context: &PromptMemoryContext) -> Op
     Some(out.trim_end().to_string())
 }
 
-/// Render the shared prompt-time memory trace payload used by `llm.log`.
-pub fn render_prompt_memory_context_trace(trace: &PromptMemoryContextTrace) -> Option<String> {
+/// Convert the shared prompt-time memory trace into a structured telemetry payload.
+pub fn build_prompt_memory_context_trace_telemetry(
+    trace: &PromptMemoryContextTrace,
+) -> Option<PromptMemoryContextTraceTelemetry> {
     if trace.semantic_candidates == 0
         && trace.shared_candidates == 0
         && trace.maintenance_signals == 0
@@ -1831,29 +1857,57 @@ pub fn render_prompt_memory_context_trace(trace: &PromptMemoryContextTrace) -> O
         return None;
     }
 
+    Some(PromptMemoryContextTraceTelemetry {
+        semantic_mode: trace.semantic_mode,
+        semantic_candidates: trace.semantic_candidates,
+        shared_candidates: trace.shared_candidates,
+        maintenance_signals: trace.maintenance_signals,
+        attention_signals: trace.attention_signals,
+        session_summaries: trace.session_summaries,
+        selected_fused_recall: trace
+            .fused_candidates
+            .iter()
+            .enumerate()
+            .map(|(rank, candidate)| PromptMemoryContextTraceSelectedRecall {
+                selected_rank: rank + 1,
+                source: candidate.source,
+                source_rank: candidate.source_rank + 1,
+                source_weight: candidate.source_weight,
+                tie_break_priority: candidate.tie_break_priority,
+                fused_score: candidate.fused_score,
+                rendered: crate::truncate_str(&candidate.rendered, 280).to_string(),
+            })
+            .collect(),
+    })
+}
+
+/// Render the shared prompt-time memory trace payload used by `llm.log`.
+pub fn render_prompt_memory_context_trace(trace: &PromptMemoryContextTrace) -> Option<String> {
+    let telemetry = build_prompt_memory_context_trace_telemetry(trace)?;
+
     let mut out = String::new();
     out.push_str(&format!(
         "semantic_mode={}\nsemantic_candidates={}\nshared_candidates={}\nmaintenance_signals={}\nattention_signals={}\nsession_summaries={}\n",
-        trace.semantic_mode.as_str(),
-        trace.semantic_candidates,
-        trace.shared_candidates,
-        trace.maintenance_signals,
-        trace.attention_signals,
-        trace.session_summaries
+        telemetry.semantic_mode.as_str(),
+        telemetry.semantic_candidates,
+        telemetry.shared_candidates,
+        telemetry.maintenance_signals,
+        telemetry.attention_signals,
+        telemetry.session_summaries
     ));
 
-    if !trace.fused_candidates.is_empty() {
+    if !telemetry.selected_fused_recall.is_empty() {
         out.push_str("selected_fused_recall:\n");
-        for (rank, candidate) in trace.fused_candidates.iter().enumerate() {
+        for candidate in telemetry.selected_fused_recall {
             out.push_str(&format!(
                 "{}. source={} source_rank={} source_weight={:.3} tie_break_priority={} fused_score={:.5} {}\n",
-                rank + 1,
+                candidate.selected_rank,
                 candidate.source.as_str(),
-                candidate.source_rank + 1,
+                candidate.source_rank,
                 candidate.source_weight,
                 candidate.tie_break_priority,
                 candidate.fused_score,
-                crate::truncate_str(&candidate.rendered, 280)
+                candidate.rendered
             ));
         }
     }
@@ -2766,6 +2820,76 @@ mod tests {
         assert_eq!(result.fused_candidates[0].source, MemoryContextSource::Shared);
         assert_eq!(result.fused_candidates[1].source, MemoryContextSource::Semantic);
         assert!(result.fused_candidates[0].fused_score > result.fused_candidates[1].fused_score);
+    }
+
+    #[test]
+    fn test_build_prompt_memory_context_trace_telemetry_preserves_selected_recall_metadata() {
+        let trace = PromptMemoryContextTrace {
+            semantic_mode: MemoryContextRecallMode::Hybrid,
+            semantic_candidates: 2,
+            shared_candidates: 1,
+            fused_candidates: vec![
+                FusedMemoryContextCandidate {
+                    rendered: "Shared memory [project.alpha.status] qa signoff".to_string(),
+                    source: MemoryContextSource::Shared,
+                    source_weight: 1.32,
+                    fused_score: 0.01613,
+                    source_rank: 0,
+                    tie_break_priority: 0,
+                },
+                FusedMemoryContextCandidate {
+                    rendered: "Semantic memory [episodic] waiver code".to_string(),
+                    source: MemoryContextSource::Semantic,
+                    source_weight: 1.0,
+                    fused_score: 0.01611,
+                    source_rank: 1,
+                    tie_break_priority: 3,
+                },
+            ],
+            maintenance_signals: 2,
+            attention_signals: 1,
+            session_summaries: 1,
+        };
+
+        let telemetry = build_prompt_memory_context_trace_telemetry(&trace).unwrap();
+
+        assert_eq!(telemetry.semantic_mode, MemoryContextRecallMode::Hybrid);
+        assert_eq!(telemetry.semantic_candidates, 2);
+        assert_eq!(telemetry.shared_candidates, 1);
+        assert_eq!(telemetry.maintenance_signals, 2);
+        assert_eq!(telemetry.attention_signals, 1);
+        assert_eq!(telemetry.session_summaries, 1);
+        assert_eq!(telemetry.selected_fused_recall.len(), 2);
+        assert_eq!(telemetry.selected_fused_recall[0].selected_rank, 1);
+        assert_eq!(
+            telemetry.selected_fused_recall[0].source,
+            MemoryContextSource::Shared
+        );
+        assert_eq!(telemetry.selected_fused_recall[0].source_rank, 1);
+        assert_eq!(telemetry.selected_fused_recall[0].tie_break_priority, 0);
+        assert_eq!(telemetry.selected_fused_recall[1].selected_rank, 2);
+        assert_eq!(
+            telemetry.selected_fused_recall[1].source,
+            MemoryContextSource::Semantic
+        );
+        assert_eq!(telemetry.selected_fused_recall[1].source_rank, 2);
+        assert_eq!(telemetry.selected_fused_recall[1].tie_break_priority, 3);
+    }
+
+    #[test]
+    fn test_build_prompt_memory_context_trace_telemetry_omits_empty_trace() {
+        let trace = PromptMemoryContextTrace {
+            semantic_mode: MemoryContextRecallMode::TextOnly,
+            semantic_candidates: 0,
+            shared_candidates: 0,
+            fused_candidates: Vec::new(),
+            maintenance_signals: 0,
+            attention_signals: 0,
+            session_summaries: 0,
+        };
+
+        assert!(build_prompt_memory_context_trace_telemetry(&trace).is_none());
+        assert!(render_prompt_memory_context_trace(&trace).is_none());
     }
 
     #[test]

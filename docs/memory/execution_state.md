@@ -354,22 +354,63 @@
       - verifier 的 `llm.log` 中第二轮 `*** MEMORY TRACE` 与 `Relevant recalled memories` 都明确包含该 semantic probe
     - live 验证期间 `/api/budget` 的 `daily_spend` 从 `0.11647460000000001` 增到 `0.1223772`
     - 临时 smoke verifier、其 workspace 与关联 DB rows 已在验证后清理；daemon 已按流程停止
+  - 已完成 Phase 2 第七批 structured memory trace telemetry 导出：
+    - `openfang-types::memory` 新增统一的 structured trace payload：
+      - `PromptMemoryContextTraceSelectedRecall`
+      - `PromptMemoryContextTraceTelemetry`
+      - `build_prompt_memory_context_trace_telemetry`
+    - `render_prompt_memory_context_trace` 现在改为复用同一份 telemetry helper 组装 `llm.log` 文本，避免文本 trace 与结构化字段再次漂移
+    - `openfang-runtime::agent_loop` 新增统一的 `emit_prompt_memory_context_trace`：
+      - 两条主路径都通过同一个 helper 发 trace
+      - 保留原有 `llm.log` 的 `*** MEMORY TRACE`
+      - 同时新增 `tracing::info!` 结构化字段：
+        - `semantic_mode`
+        - `semantic_candidates`
+        - `shared_candidates`
+        - `maintenance_signals`
+        - `attention_signals`
+        - `session_summaries`
+        - `selected_fused_recall_count`
+        - `selected_fused_recall`（JSON）
+    - 新增/更新单测覆盖：
+      - `PromptMemoryContextTraceTelemetry` 会保留 selected rank / source rank / weight / tie-break metadata
+      - 空 trace 会同时被 telemetry helper 与文本 trace renderer 正确省略
+  - 已完成本轮 structured trace telemetry 验证：
+    - `cargo build --workspace --lib`
+    - `cargo test --workspace`
+    - `cargo clippy --workspace --all-targets -- -D warnings`
+    - `cargo build -p openfang-cli`
+    - live structured telemetry smoke 验证通过：
+      - 在隔离的 `OPENFANG_HOME=/tmp/openfang-memory-trace-live` 上，以 `127.0.0.1:4210` 启动临时 daemon，并把 stdout/stderr 重定向到 `/tmp/openfang-memory-trace-live/daemon.log`
+      - 临时创建 `memory-trace-telemetry-verifier-20260316b` agent，通过 memory API 写入 shared probe `project.alpha.telemetry_status_b = TRACE-SHARED-20260316B ...`
+      - 第一轮真实消息写入 semantic probe `TRACE-SEM-20260316B device unlock phrase`，随后执行 `POST /api/agents/{id}/session/reset`
+      - 第二轮真实询问 `What is the alpha telemetry status, and what is the device unlock phrase?`，回复同时返回 shared blocker 与 semantic phrase
+      - `/tmp/openfang-memory-trace-live/daemon.log` 中真实出现：
+        - `INFO openfang_runtime::agent_loop: Prompt memory context trace ...`
+        - `semantic_mode="hybrid" semantic_candidates=2 shared_candidates=2 ...`
+        - `selected_fused_recall=[{"selected_rank":1,"source":"shared",...,"rendered":"... TRACE-SHARED-20260316B ..."},{"selected_rank":4,"source":"semantic",...,"rendered":"... TRACE-SEM-20260316B ..."}]`
+      - 同一 verifier 的 `llm.log` 中仍保留：
+        - `*** MEMORY TRACE`
+        - `Relevant recalled memories`
+        - shared / semantic 两条 probe
+      - 隔离 daemon 的 `/api/budget` 中 `daily_spend = 0.013873200000000002`；`/api/budget/agents` 中两个临时 verifier agent 的 `daily_cost_usd` 分别为 `0.006641800000000001` 与 `0.007231400000000001`
+      - 验证完成后，临时 daemon、agent、workspace、shared probe 与整个 `/tmp/openfang-memory-trace-live` home 已清理
 
 ## 进行中
 
-- 继续推进 Phase 2：shared retrieval helper 已覆盖 semantic/shared candidate、memory context message 与 trace contract，下一步评估是否把这套 payload 同步成更结构化的 telemetry / inspection 输出。
+- 继续推进 Phase 2：shared retrieval helper 现在已经覆盖 semantic/shared candidate、memory context message、文本 trace 与结构化 tracing telemetry；下一步评估是否把这套 trace 再暴露到 inspection/API surface，而不只存在于进程日志与 `llm.log`。
 
 ## 下一步动作
 
 - 继续观察 governed metadata 的显式 `source_weight` / `tie_break_priority` 是否需要引入更多 lifecycle bucket 或 namespace/kind-specific weight，而不只是当前 query/lifecycle/promotion 三元组合。
-- 评估是否要把 `MEMORY_TRACE` 的 source/fused 信息进一步同步到 structured telemetry / tracing fields，而不只写入 `llm.log` 文本。
+- 评估是否要把新的 structured trace 从进程 `tracing` 日志进一步接到 inspection surface，例如 `/api/logs/stream` 或专门的 debug endpoint，而不只依赖 daemon stdout / stderr。
 - 评估是否要把 `prompt_builder` 中残留的 memory-context wrapper 也进一步裁薄，避免共享 contract 之上再保留一层重复命名。
 - 在切换电脑或结束一轮实质性工作前，持续更新本文件。
 
 ## 风险与阻塞
 
 - 当前现有 agent 的 tool-call 路径存在两类既有兼容问题：`assistant` 的 gemini path 仍有 `thought_signature` 错误，`Researcher` 的 MiniMax path 也出现了 tool-result id 不匹配；因此本轮 dashboard cleanup live LLM verification 同样改用临时无工具 MiniMax verifier agent 完成。
-- Phase 2 已经把 semantic/shared candidate、memory context message 与 trace payload 下沉到了 `openfang-types::memory`，但 `MEMORY_TRACE` 目前仍只写文本日志，尚未同步成更结构化的 telemetry。
+- Phase 2 现在已经把 `MEMORY_TRACE` 同步到了 `tracing::info!` 结构化字段，但当前 `/api/logs/stream` 仍然主要是 audit/event 流，并不会直接暴露这些 daemon process logs；如果需要 dashboard 可见性，后续还要补 inspection surface。
 - 需要避免在 daemon 运行中直接用 sqlite 修改 shared memory sidecar 做复杂 live probe；这类验证更稳妥的做法仍然是 daemon 停止后做 DB 注入，或改造成 API/tool 可达路径。
 - 如果后续启动工作时不先读取本文件，分支纪律和连续性可能重新漂移。
 
@@ -382,4 +423,4 @@
 
 ## 最后更新时间
 
-- 2026-03-15 Asia/Shanghai
+- 2026-03-16 Asia/Shanghai

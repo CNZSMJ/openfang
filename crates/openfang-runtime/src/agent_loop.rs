@@ -22,7 +22,8 @@ use openfang_types::agent::AgentManifest;
 use openfang_types::error::{OpenFangError, OpenFangResult};
 use openfang_types::memory::{
     Memory, MemoryContextRecallMode, MemoryFilter, MemorySource, PromptMemoryContextBuildOptions,
-    build_prompt_memory_context, render_prompt_memory_context_trace,
+    PromptMemoryContextTrace, build_prompt_memory_context,
+    build_prompt_memory_context_trace_telemetry, render_prompt_memory_context_trace,
 };
 use openfang_types::message::{
     ContentBlock, Message, MessageContent, Role, StopReason, TokenUsage,
@@ -305,9 +306,13 @@ pub async fn run_agent_loop_with_session_message(
     );
     let memory_context_msg =
         crate::prompt_builder::build_memory_context_message(&memory_context);
-    if let Some(memory_trace) = render_prompt_memory_context_trace(&memory_context.trace) {
-        log_llm_event(workspace_root, "MEMORY_TRACE", "", &memory_trace).await;
-    }
+    emit_prompt_memory_context_trace(
+        workspace_root,
+        &manifest.name,
+        session.agent_id,
+        &memory_context.trace,
+    )
+    .await;
 
     // Fire BeforePromptBuild hook
     let agent_id_str = session.agent_id.0.to_string();
@@ -1313,9 +1318,13 @@ pub async fn run_agent_loop_streaming(
     );
     let memory_context_msg =
         crate::prompt_builder::build_memory_context_message(&memory_context);
-    if let Some(memory_trace) = render_prompt_memory_context_trace(&memory_context.trace) {
-        log_llm_event(workspace_root, "MEMORY_TRACE", "", &memory_trace).await;
-    }
+    emit_prompt_memory_context_trace(
+        workspace_root,
+        &manifest.name,
+        session.agent_id,
+        &memory_context.trace,
+    )
+    .await;
 
     // Fire BeforePromptBuild hook
     let agent_id_str = session.agent_id.0.to_string();
@@ -2791,6 +2800,35 @@ async fn log_llm_event(
         let _ = write!(file, "\n{}\n", separator);
     } else {
         let _ = writeln!(file);
+    }
+}
+
+async fn emit_prompt_memory_context_trace(
+    workspace_root: Option<&Path>,
+    agent_name: &str,
+    agent_id: AgentId,
+    trace: &PromptMemoryContextTrace,
+) {
+    if let Some(telemetry) = build_prompt_memory_context_trace_telemetry(trace) {
+        let selected_fused_recall = serde_json::to_string(&telemetry.selected_fused_recall)
+            .unwrap_or_else(|_| "[]".to_string());
+        info!(
+            agent = %agent_name,
+            agent_id = %agent_id,
+            semantic_mode = telemetry.semantic_mode.as_str(),
+            semantic_candidates = telemetry.semantic_candidates,
+            shared_candidates = telemetry.shared_candidates,
+            maintenance_signals = telemetry.maintenance_signals,
+            attention_signals = telemetry.attention_signals,
+            session_summaries = telemetry.session_summaries,
+            selected_fused_recall_count = telemetry.selected_fused_recall.len(),
+            selected_fused_recall = %selected_fused_recall,
+            "Prompt memory context trace"
+        );
+    }
+
+    if let Some(memory_trace) = render_prompt_memory_context_trace(trace) {
+        log_llm_event(workspace_root, "MEMORY_TRACE", "", &memory_trace).await;
     }
 }
 
