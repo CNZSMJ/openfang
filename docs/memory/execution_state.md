@@ -395,22 +395,98 @@
         - shared / semantic 两条 probe
       - 隔离 daemon 的 `/api/budget` 中 `daily_spend = 0.013873200000000002`；`/api/budget/agents` 中两个临时 verifier agent 的 `daily_cost_usd` 分别为 `0.006641800000000001` 与 `0.007231400000000001`
       - 验证完成后，临时 daemon、agent、workspace、shared probe 与整个 `/tmp/openfang-memory-trace-live` home 已清理
+  - 已完成 Phase 2 第八批 memory trace audit / inspection surface 接线：
+    - `openfang-runtime::audit::AuditAction` 新增 `MemoryTrace`
+    - `KernelHandle` 新增统一 `record_audit_event` bridge，runtime 可以在不依赖 kernel 内部结构的前提下把 prompt-time memory trace 写入 kernel-owned audit log
+    - `openfang-runtime::agent_loop::emit_prompt_memory_context_trace` 现在除了：
+      - `tracing::info!` 结构化字段
+      - `llm.log` 的 `*** MEMORY TRACE`
+      之外，还会追加一条 audit event：
+      - `action = MemoryTrace`
+      - `detail = semantic_mode / source counts / selected_fused_recall_count`
+      - `outcome = structured telemetry JSON`
+    - `/api/logs/stream` 现在会为 `MemoryTrace` audit entry 额外附带已解析的 `payload` 字段，而不只是原始 `detail/outcome` 字符串
+    - 新增/更新单测覆盖：
+      - `MemoryTrace` 会正确在持久化 audit log 中 roundtrip
+      - API 路由 helper 会只对 `MemoryTrace` 解析 JSON payload，其他 audit action 维持原样
+  - 已完成本轮 inspection surface 验证：
+    - `cargo build --workspace --lib`
+    - `cargo test --workspace`
+    - `cargo clippy --workspace --all-targets -- -D warnings`
+    - `cargo build -p openfang-cli`
+    - live `/api/logs/stream` verification 通过：
+      - 在隔离的 `OPENFANG_HOME=/tmp/openfang-memory-audit-live` 上，以 `127.0.0.1:4211` 启动临时 daemon
+      - 临时创建 `memory-trace-audit-stream-verifier-20260316` agent，通过 memory API 写入 shared probe `project.alpha.audit_trace_status = TRACE-AUDIT-SHARED-20260316 ...`
+      - 第一轮真实消息写入 semantic probe `TRACE-AUDIT-SEM-20260316 device unlock phrase`，随后执行 `POST /api/agents/{id}/session/reset`
+      - 第二轮真实询问 `What is the alpha launch blocker, and what is the device unlock phrase?`，回复同时返回 shared blocker 与 semantic phrase
+      - 随后 `GET /api/logs/stream?filter=memorytrace` 的 SSE backfill 中真实返回了两条 `MemoryTrace` 事件；每条 event 除了原有 `action/detail/outcome/hash/...` 外，还带有：
+        - `payload.semantic_mode`
+        - `payload.semantic_candidates`
+        - `payload.shared_candidates`
+        - `payload.selected_fused_recall[*].source`
+        - `payload.selected_fused_recall[*].source_weight`
+        - `payload.selected_fused_recall[*].fused_score`
+      - 第二条 SSE `payload` 中同时出现：
+        - shared rendered probe `TRACE-AUDIT-SHARED-20260316`
+        - semantic rendered probe `TRACE-AUDIT-SEM-20260316`
+      - 同一 verifier 的真实回复与 prompt-time recall 一致；隔离 daemon 的 `/api/budget` 中 `daily_spend = 0.007979400000000001`，`/api/budget/agents` 中 verifier `daily_cost_usd = 0.007979400000000001`
+      - 临时 daemon、agent、workspace、shared probe 与整个 `/tmp/openfang-memory-audit-live` home 已清理
+  - 已完成 Phase 2 第九批 dashboard memory trace inspection surface 接线：
+    - `/api/audit/recent` 现在与 `/api/logs/stream` 共用统一 audit-entry serializer；`MemoryTrace` 在 polling fallback 与 Audit Trail tab 中也会携带已解析的 `payload`
+    - dashboard `Logs` 页现在会把 `MemoryTrace` 当作一类一等 audit event 渲染，而不再只显示原始 `detail/outcome` 字符串：
+      - Live tab 会对 `MemoryTrace` 展示 `semantic_mode` / source counts / selected recall count 摘要 pills
+      - Live tab 会额外展开前 3 条 `selected_fused_recall`，直接显示 `source` / `source_rank` / `source_weight` / `tie_break_priority` / `fused_score` 与 recall 文本
+      - Audit Trail tab 新增 `Memory Trace` action filter，并把 Outcome 列升级为 `Outcome / Trace`
+      - Audit Trail tab 对 `MemoryTrace` 也会渲染相同的摘要与 recall 明细；非 `MemoryTrace` action 仍维持普通 outcome preview
+    - Logs 页本地 search 现在会一并搜索 `outcome` 与 `payload`，便于直接按 shared/semantic probe 文本筛查 memory trace
+    - 新增/更新单测覆盖：
+      - `audit_entry_json` 会在 `/api/audit/recent` 与 `/api/logs/stream` 两条路径上稳定附带 `payload`
+      - `MemoryTrace` JSON payload 仍只对对应 audit action 解析，不影响其他 action
+  - 已完成本轮 dashboard inspection 验证：
+    - `cargo build --workspace --lib`
+    - `cargo test --workspace`
+    - `cargo clippy --workspace --all-targets -- -D warnings`
+    - `cargo build -p openfang-cli`
+    - live dashboard memory-trace inspection verification 通过：
+      - 在隔离的 `OPENFANG_HOME=/tmp/openfang-memory-trace-dashboard-live` 上，以 `127.0.0.1:4212` 启动临时 daemon
+      - 使用隔离 daemon 自带 `assistant` agent，通过 memory API 写入 shared probe `project.alpha.dashboard_trace_status = TRACE-DASHBOARD-SHARED-20260316 ...`
+      - 第一轮真实消息写入 semantic probe `TRACE-DASHBOARD-SEM-20260316 device unlock phrase`，随后执行 `POST /api/agents/{id}/session/reset`
+      - 第二轮真实询问 `What is the alpha launch blocker, and what is the device unlock phrase?`，回复同时返回 shared blocker `QA signoff` 与 semantic phrase `TRACE-DASHBOARD-SEM-20260316 device unlock phrase`
+      - `GET /api/audit/recent?n=20` 中真实返回了两条 `MemoryTrace` entry，且第二条 entry 的 `payload` 同时包含：
+        - `semantic_mode = hybrid`
+        - `semantic_candidates = 1`
+        - `shared_candidates = 1`
+        - `selected_fused_recall[0] = shared ... TRACE-DASHBOARD-SHARED-20260316 ...`
+        - `selected_fused_recall[1] = semantic ... TRACE-DASHBOARD-SEM-20260316 ...`
+      - `GET /api/logs/stream?filter=memorytrace` 的 SSE backfill 也仍返回同样的 parsed `payload`
+      - `curl http://127.0.0.1:4212/` 的 dashboard HTML 中已出现：
+        - `Memory Trace`
+        - `Outcome / Trace`
+        - `memory-trace-pill`
+        证明 Logs 页模板与样式已真实进入服务端静态资源输出
+      - 隔离 daemon 的 `/api/budget` 中 `daily_spend = 0.0038346000000000005`，`/api/budget/agents` 中 `assistant` 的 `daily_cost_usd = 0.0038346000000000005`
+      - 验证完成后，隔离 daemon 与整个 `/tmp/openfang-memory-trace-dashboard-live` home 已清理
 
 ## 进行中
 
-- 继续推进 Phase 2：shared retrieval helper 现在已经覆盖 semantic/shared candidate、memory context message、文本 trace 与结构化 tracing telemetry；下一步评估是否把这套 trace 再暴露到 inspection/API surface，而不只存在于进程日志与 `llm.log`。
+- 继续推进 Phase 2：shared retrieval helper 现在已经覆盖 semantic/shared candidate、memory context message、文本 trace、structured tracing telemetry，以及 audit/API/dashboard 三层 inspection。下一步评估是否需要把 Logs 页上的 `MemoryTrace` 从通用日志表再上提成专门的 memory-debug workspace。
 
 ## 下一步动作
 
 - 继续观察 governed metadata 的显式 `source_weight` / `tie_break_priority` 是否需要引入更多 lifecycle bucket 或 namespace/kind-specific weight，而不只是当前 query/lifecycle/promotion 三元组合。
-- 评估是否要把新的 structured trace 从进程 `tracing` 日志进一步接到 inspection surface，例如 `/api/logs/stream` 或专门的 debug endpoint，而不只依赖 daemon stdout / stderr。
+- 评估是否要把 Logs 页里的 `MemoryTrace` 再拆成更专门的 inspection 视图，例如独立 memory trace tab、按 source/agent/query-mode 的筛选，或 recall text 的 expand/copy 能力。
 - 评估是否要把 `prompt_builder` 中残留的 memory-context wrapper 也进一步裁薄，避免共享 contract 之上再保留一层重复命名。
 - 在切换电脑或结束一轮实质性工作前，持续更新本文件。
 
 ## 风险与阻塞
 
 - 当前现有 agent 的 tool-call 路径存在两类既有兼容问题：`assistant` 的 gemini path 仍有 `thought_signature` 错误，`Researcher` 的 MiniMax path 也出现了 tool-result id 不匹配；因此本轮 dashboard cleanup live LLM verification 同样改用临时无工具 MiniMax verifier agent 完成。
-- Phase 2 现在已经把 `MEMORY_TRACE` 同步到了 `tracing::info!` 结构化字段，但当前 `/api/logs/stream` 仍然主要是 audit/event 流，并不会直接暴露这些 daemon process logs；如果需要 dashboard 可见性，后续还要补 inspection surface。
+- Phase 2 现在已经把 `MEMORY_TRACE` 同步到了：
+  - `llm.log` 文本 trace
+  - `tracing::info!` 结构化字段
+  - audit-backed `/api/logs/stream` `MemoryTrace` 事件
+  - dashboard `Logs` 页的 `MemoryTrace` 摘要视图
+  但当前 dashboard 仍然是复用通用 Logs 页，并不是专门的 memory inspection workspace；当 trace 密度再上来时，表格可读性和筛选粒度仍可能不够。
 - 需要避免在 daemon 运行中直接用 sqlite 修改 shared memory sidecar 做复杂 live probe；这类验证更稳妥的做法仍然是 daemon 停止后做 DB 注入，或改造成 API/tool 可达路径。
 - 如果后续启动工作时不先读取本文件，分支纪律和连续性可能重新漂移。
 

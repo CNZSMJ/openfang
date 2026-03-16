@@ -1045,12 +1045,7 @@ pub async fn delete_workflow(
         }
     });
 
-    if state
-        .kernel
-        .workflows
-        .remove_workflow(workflow_id)
-        .await
-    {
+    if state.kernel.workflows.remove_workflow(workflow_id).await {
         (
             StatusCode::OK,
             Json(serde_json::json!({"status": "removed", "workflow_id": id})),
@@ -4014,7 +4009,10 @@ pub async fn uninstall_skill(
     let skills_dir = state.kernel.config.home_dir.join("skills");
     let mut registry = openfang_skills::registry::SkillRegistry::new(skills_dir);
     let bundled_count = registry.load_bundled();
-    tracing::debug!(count = bundled_count, "Loaded bundled skills before uninstall");
+    tracing::debug!(
+        count = bundled_count,
+        "Loaded bundled skills before uninstall"
+    );
     if let Err(e) = registry.load_all() {
         tracing::warn!(error = %e, "Failed to load installed skills before uninstall");
     }
@@ -4439,7 +4437,10 @@ pub async fn list_hands(State(state): State<Arc<AppState>>) -> impl IntoResponse
                 .check_requirements(&d.id)
                 .unwrap_or_default();
             let readiness = state.kernel.hand_registry.readiness(&d.id);
-            let requirements_met = readiness.as_ref().map(|r| r.requirements_met).unwrap_or(false);
+            let requirements_met = readiness
+                .as_ref()
+                .map(|r| r.requirements_met)
+                .unwrap_or(false);
             let active = readiness.as_ref().map(|r| r.active).unwrap_or(false);
             let degraded = readiness.as_ref().map(|r| r.degraded).unwrap_or(false);
             serde_json::json!({
@@ -4502,7 +4503,10 @@ pub async fn get_hand(
                 .check_requirements(&hand_id)
                 .unwrap_or_default();
             let readiness = state.kernel.hand_registry.readiness(&hand_id);
-            let requirements_met = readiness.as_ref().map(|r| r.requirements_met).unwrap_or(false);
+            let requirements_met = readiness
+                .as_ref()
+                .map(|r| r.requirements_met)
+                .unwrap_or(false);
             let active = readiness.as_ref().map(|r| r.active).unwrap_or(false);
             let degraded = readiness.as_ref().map(|r| r.degraded).unwrap_or(false);
             let settings_status = state
@@ -4579,7 +4583,10 @@ pub async fn check_hand_deps(
                 .check_requirements(&hand_id)
                 .unwrap_or_default();
             let readiness = state.kernel.hand_registry.readiness(&hand_id);
-            let requirements_met = readiness.as_ref().map(|r| r.requirements_met).unwrap_or(false);
+            let requirements_met = readiness
+                .as_ref()
+                .map(|r| r.requirements_met)
+                .unwrap_or(false);
             let active = readiness.as_ref().map(|r| r.active).unwrap_or(false);
             let degraded = readiness.as_ref().map(|r| r.degraded).unwrap_or(false);
             (
@@ -5336,17 +5343,7 @@ pub async fn audit_recent(
 
     let items: Vec<serde_json::Value> = entries
         .iter()
-        .map(|e| {
-            serde_json::json!({
-                "seq": e.seq,
-                "timestamp": e.timestamp,
-                "agent_id": e.agent_id,
-                "action": format!("{:?}", e.action),
-                "detail": e.detail,
-                "outcome": e.outcome,
-                "hash": e.hash,
-            })
-        })
+        .map(audit_entry_json)
         .collect();
 
     Json(serde_json::json!({
@@ -5449,15 +5446,7 @@ pub async fn logs_stream(
                     }
                 }
 
-                let json = serde_json::json!({
-                    "seq": entry.seq,
-                    "timestamp": entry.timestamp,
-                    "agent_id": entry.agent_id,
-                    "action": action_str,
-                    "detail": entry.detail,
-                    "outcome": entry.outcome,
-                    "hash": entry.hash,
-                });
+                let json = audit_entry_json(entry);
                 let data = serde_json::to_string(&json).unwrap_or_default();
                 if tx.send(Ok(Event::default().data(data))).await.is_err() {
                     return; // Client disconnected
@@ -5491,6 +5480,95 @@ fn classify_audit_level(action: &str) -> &'static str {
         "warn"
     } else {
         "info"
+    }
+}
+
+fn audit_entry_json(entry: &openfang_runtime::audit::AuditEntry) -> serde_json::Value {
+    serde_json::json!({
+        "seq": entry.seq,
+        "timestamp": entry.timestamp,
+        "agent_id": entry.agent_id,
+        "action": format!("{:?}", entry.action),
+        "detail": entry.detail,
+        "outcome": entry.outcome,
+        "hash": entry.hash,
+        "payload": audit_entry_payload(entry),
+    })
+}
+
+fn audit_entry_payload(entry: &openfang_runtime::audit::AuditEntry) -> Option<serde_json::Value> {
+    if matches!(entry.action, openfang_runtime::audit::AuditAction::MemoryTrace) {
+        serde_json::from_str(&entry.outcome).ok()
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_audit_entry_payload_extracts_memory_trace_json() {
+        let entry = openfang_runtime::audit::AuditEntry {
+            seq: 1,
+            timestamp: "2026-03-16T00:00:00Z".to_string(),
+            agent_id: "agent-1".to_string(),
+            action: openfang_runtime::audit::AuditAction::MemoryTrace,
+            detail: "semantic_mode=hybrid semantic_candidates=1 shared_candidates=1 selected_fused_recall_count=1".to_string(),
+            outcome: serde_json::json!({
+                "semantic_mode": "hybrid",
+                "selected_fused_recall": [
+                    {"selected_rank": 1, "source": "shared"}
+                ]
+            })
+            .to_string(),
+            prev_hash: "0".repeat(64),
+            hash: "1".repeat(64),
+        };
+
+        let payload = audit_entry_payload(&entry).unwrap();
+        assert_eq!(payload["semantic_mode"], "hybrid");
+        assert_eq!(payload["selected_fused_recall"][0]["source"], "shared");
+    }
+
+    #[test]
+    fn test_audit_entry_json_includes_memory_trace_payload() {
+        let entry = openfang_runtime::audit::AuditEntry {
+            seq: 7,
+            timestamp: "2026-03-16T00:00:00Z".to_string(),
+            agent_id: "agent-7".to_string(),
+            action: openfang_runtime::audit::AuditAction::MemoryTrace,
+            detail: "semantic_mode=hybrid semantic_candidates=1".to_string(),
+            outcome: serde_json::json!({
+                "semantic_mode": "hybrid",
+                "shared_candidates": 1
+            })
+            .to_string(),
+            prev_hash: "0".repeat(64),
+            hash: "7".repeat(64),
+        };
+
+        let payload = audit_entry_json(&entry);
+        assert_eq!(payload["action"], "MemoryTrace");
+        assert_eq!(payload["payload"]["semantic_mode"], "hybrid");
+        assert_eq!(payload["payload"]["shared_candidates"], 1);
+    }
+
+    #[test]
+    fn test_audit_entry_payload_ignores_non_memory_trace_actions() {
+        let entry = openfang_runtime::audit::AuditEntry {
+            seq: 1,
+            timestamp: "2026-03-16T00:00:00Z".to_string(),
+            agent_id: "agent-1".to_string(),
+            action: openfang_runtime::audit::AuditAction::AgentMessage,
+            detail: "tokens_in=1, tokens_out=2".to_string(),
+            outcome: "ok".to_string(),
+            prev_hash: "0".repeat(64),
+            hash: "1".repeat(64),
+        };
+
+        assert!(audit_entry_payload(&entry).is_none());
     }
 }
 
@@ -5740,10 +5818,7 @@ pub async fn usage_daily(State(state): State<Arc<AppState>>) -> impl IntoRespons
 /// GET /api/budget — Current budget status (limits, spend, % used).
 pub async fn budget_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let budget = state.kernel.current_budget();
-    let status = state
-        .kernel
-        .metering
-        .budget_status(&budget);
+    let status = state.kernel.metering.budget_status(&budget);
     Json(serde_json::to_value(&status).unwrap_or_default())
 }
 
@@ -5771,10 +5846,7 @@ pub async fn update_budget(
     });
 
     let budget = state.kernel.current_budget();
-    let status = state
-        .kernel
-        .metering
-        .budget_status(&budget);
+    let status = state.kernel.metering.budget_status(&budget);
     Json(serde_json::to_value(&status).unwrap_or_default())
 }
 
@@ -5895,7 +5967,9 @@ pub async fn update_agent_budget(
     if hourly.is_none() && daily.is_none() && monthly.is_none() && tokens.is_none() {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "Provide at least one of: max_cost_per_hour_usd, max_cost_per_day_usd, max_cost_per_month_usd, max_llm_tokens_per_hour"})),
+            Json(
+                serde_json::json!({"error": "Provide at least one of: max_cost_per_hour_usd, max_cost_per_day_usd, max_cost_per_month_usd, max_llm_tokens_per_hour"}),
+            ),
         );
     }
 
@@ -6189,7 +6263,10 @@ pub async fn patch_agent(
     }
     if let Some(model) = body.get("model").and_then(|v| v.as_str()) {
         let explicit_provider = body.get("provider").and_then(|v| v.as_str());
-        if let Err(e) = state.kernel.set_agent_model(agent_id, model, explicit_provider) {
+        if let Err(e) = state
+            .kernel
+            .set_agent_model(agent_id, model, explicit_provider)
+        {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"error": format!("{e}")})),
@@ -7447,7 +7524,10 @@ pub async fn set_model(
         }
     };
     let explicit_provider = body["provider"].as_str();
-    match state.kernel.set_agent_model(agent_id, model, explicit_provider) {
+    match state
+        .kernel
+        .set_agent_model(agent_id, model, explicit_provider)
+    {
         Ok(()) => {
             // Return the resolved model+provider so frontend stays in sync.
             // The model name may have been normalized (provider prefix stripped),
@@ -7456,11 +7536,18 @@ pub async fn set_model(
                 .kernel
                 .registry
                 .get(agent_id)
-                .map(|e| (e.manifest.model.model.clone(), e.manifest.model.provider.clone()))
+                .map(|e| {
+                    (
+                        e.manifest.model.model.clone(),
+                        e.manifest.model.provider.clone(),
+                    )
+                })
                 .unwrap_or_else(|| (model.to_string(), String::new()));
             (
                 StatusCode::OK,
-                Json(serde_json::json!({"status": "ok", "model": resolved_model, "provider": resolved_provider})),
+                Json(
+                    serde_json::json!({"status": "ok", "model": resolved_model, "provider": resolved_provider}),
+                ),
             )
         }
         Err(e) => (
@@ -7894,9 +7981,10 @@ pub async fn set_provider_key(
     let mut resp = serde_json::json!({"status": "saved", "provider": name});
     if switched {
         resp["switched_default"] = serde_json::json!(true);
-        resp["message"] = serde_json::json!(
-            format!("API key saved and default provider switched to '{}'.", name)
-        );
+        resp["message"] = serde_json::json!(format!(
+            "API key saved and default provider switched to '{}'.",
+            name
+        ));
     }
 
     (StatusCode::OK, Json(resp))
@@ -11671,9 +11759,8 @@ pub async fn auth_login(
     let token =
         crate::session_auth::create_session_token(username, &secret, auth_cfg.session_ttl_hours);
     let ttl_secs = auth_cfg.session_ttl_hours * 3600;
-    let cookie = format!(
-        "openfang_session={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={ttl_secs}"
-    );
+    let cookie =
+        format!("openfang_session={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={ttl_secs}");
 
     state.kernel.audit_log.record(
         "system",
@@ -11684,12 +11771,16 @@ pub async fn auth_login(
 
     (
         StatusCode::OK,
-        [("content-type", "application/json"), ("set-cookie", cookie.as_str())],
+        [
+            ("content-type", "application/json"),
+            ("set-cookie", cookie.as_str()),
+        ],
         serde_json::json!({
             "status": "ok",
             "token": token,
             "username": username,
-        }).to_string(),
+        })
+        .to_string(),
     )
         .into_response()
 }
@@ -11731,9 +11822,11 @@ pub async fn auth_check(
         .get("cookie")
         .and_then(|v| v.to_str().ok())
         .and_then(|cookies| {
-            cookies
-                .split(';')
-                .find_map(|c| c.trim().strip_prefix("openfang_session=").map(|v| v.to_string()))
+            cookies.split(';').find_map(|c| {
+                c.trim()
+                    .strip_prefix("openfang_session=")
+                    .map(|v| v.to_string())
+            })
         })
         .and_then(|token| crate::session_auth::verify_session_token(&token, &secret));
 

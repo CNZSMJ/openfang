@@ -6,6 +6,7 @@
 //! it into the agent loop.
 
 use async_trait::async_trait;
+use crate::audit::AuditAction;
 
 /// Agent info returned by list and discovery operations.
 #[derive(Debug, Clone)]
@@ -86,6 +87,18 @@ pub trait KernelHandle: Send + Sync {
         event_type: &str,
         payload: serde_json::Value,
     ) -> Result<(), String>;
+
+    /// Record an audit event through the kernel-owned audit log.
+    fn record_audit_event(
+        &self,
+        agent_id: &str,
+        action: AuditAction,
+        detail: &str,
+        outcome: &str,
+    ) -> Result<(), String> {
+        let _ = (agent_id, action, detail, outcome);
+        Ok(())
+    }
 
     /// Add an entity to the knowledge graph.
     async fn knowledge_add_entity(
@@ -226,7 +239,9 @@ pub trait KernelHandle: Send + Sync {
         filename: Option<&str>,
         thread_id: Option<&str>,
     ) -> Result<String, String> {
-        let _ = (channel, recipient, media_type, media_url, caption, filename, thread_id);
+        let _ = (
+            channel, recipient, media_type, media_url, caption, filename, thread_id,
+        );
         Err("Channel media send not available".to_string())
     }
 
@@ -295,5 +310,4 @@ pub trait KernelHandle: Send + Sync {
         let _ = (query, top_k, agent_id);
         Err("Skill system not available".to_string())
     }
-
 }

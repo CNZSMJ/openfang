@@ -4,6 +4,7 @@
 //! calling the LLM, executing tool calls, and saving the conversation.
 
 use crate::auth_cooldown::{CooldownVerdict, ProviderCooldown};
+use crate::audit::AuditAction;
 use crate::context_budget::{ContextBudget, apply_context_guard, truncate_tool_result_dynamic};
 use crate::context_overflow::{RecoveryStage, recover_from_overflow};
 use crate::embedding::EmbeddingDriver;
@@ -310,6 +311,7 @@ pub async fn run_agent_loop_with_session_message(
         workspace_root,
         &manifest.name,
         session.agent_id,
+        kernel.as_ref(),
         &memory_context.trace,
     )
     .await;
@@ -1322,6 +1324,7 @@ pub async fn run_agent_loop_streaming(
         workspace_root,
         &manifest.name,
         session.agent_id,
+        kernel.as_ref(),
         &memory_context.trace,
     )
     .await;
@@ -2807,6 +2810,7 @@ async fn emit_prompt_memory_context_trace(
     workspace_root: Option<&Path>,
     agent_name: &str,
     agent_id: AgentId,
+    kernel: Option<&Arc<dyn KernelHandle>>,
     trace: &PromptMemoryContextTrace,
 ) {
     if let Some(telemetry) = build_prompt_memory_context_trace_telemetry(trace) {
@@ -2825,6 +2829,28 @@ async fn emit_prompt_memory_context_trace(
             selected_fused_recall = %selected_fused_recall,
             "Prompt memory context trace"
         );
+        if let Some(kernel) = kernel {
+            let detail = format!(
+                "semantic_mode={} semantic_candidates={} shared_candidates={} maintenance_signals={} attention_signals={} session_summaries={} selected_fused_recall_count={}",
+                telemetry.semantic_mode.as_str(),
+                telemetry.semantic_candidates,
+                telemetry.shared_candidates,
+                telemetry.maintenance_signals,
+                telemetry.attention_signals,
+                telemetry.session_summaries,
+                telemetry.selected_fused_recall.len(),
+            );
+            let outcome =
+                serde_json::to_string(&telemetry).unwrap_or_else(|_| "{}".to_string());
+            if let Err(error) = kernel.record_audit_event(
+                &agent_id.to_string(),
+                AuditAction::MemoryTrace,
+                &detail,
+                &outcome,
+            ) {
+                warn!(agent_id = %agent_id, error = %error, "Failed to record memory trace audit event");
+            }
+        }
     }
 
     if let Some(memory_trace) = render_prompt_memory_context_trace(trace) {

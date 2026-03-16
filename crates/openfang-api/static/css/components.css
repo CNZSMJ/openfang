@@ -1609,11 +1609,47 @@ mark.search-highlight {
 /* Logs page */
 .log-entry { padding: 4px 0; border-bottom: 1px solid var(--border); font-size: 11px; }
 .log-entry:last-child { border-bottom: none; }
+.log-entry-memory-trace { padding: 8px 0; }
 .log-level { display: inline-block; width: 44px; font-weight: 600; font-size: 10px; }
 .log-level-info { color: var(--info); }
 .log-level-warn { color: var(--warning, #f59e0b); }
 .log-level-error { color: var(--error); }
 .log-timestamp { color: var(--text-muted); font-size: 10px; margin-right: 8px; }
+.memory-trace-block { margin-left: 64px; margin-top: 6px; }
+.memory-trace-summary { display: flex; flex-wrap: wrap; gap: 6px; }
+.memory-trace-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--surface2);
+  color: var(--text-dim);
+  font-size: 10px;
+  letter-spacing: 0.2px;
+}
+.memory-trace-recalls { margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }
+.memory-trace-recall {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+}
+.memory-trace-recall-meta {
+  color: var(--text-dim);
+  font-size: 10px;
+  margin-bottom: 4px;
+}
+.memory-trace-recall-text {
+  color: var(--text);
+  font-size: 11px;
+  line-height: 1.5;
+  word-break: break-word;
+}
+.memory-trace-more {
+  color: var(--text-muted);
+  font-size: 10px;
+}
+.memory-trace-block-audit { margin-left: 0; margin-top: 0; }
 
 /* Live log streaming indicator */
 .live-indicator {

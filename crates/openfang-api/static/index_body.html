@@ -4510,11 +4510,31 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
             <div x-show="!loading && !loadError">
             <div class="card" style="font-family:monospace;max-height:70vh;overflow-y:auto" id="log-container" @mouseenter="hovering = true" @mouseleave="hovering = false">
               <template x-for="entry in filteredEntries" :key="entry.seq">
-                <div class="log-entry">
-                  <span class="log-timestamp" x-text="new Date(entry.timestamp).toLocaleTimeString()"></span>
-                  <span class="log-level" :class="'log-level-' + classifyLevel(entry.action)" x-text="classifyLevel(entry.action).toUpperCase()"></span>
-                  <span class="text-xs" style="color:var(--text-dim);margin-right:6px" x-text="'[' + entry.action + ']'"></span>
-                  <span class="text-xs" x-text="entry.detail"></span>
+                <div class="log-entry" :class="{ 'log-entry-memory-trace': isMemoryTrace(entry) }">
+                  <div>
+                    <span class="log-timestamp" x-text="new Date(entry.timestamp).toLocaleTimeString()"></span>
+                    <span class="log-level" :class="'log-level-' + classifyLevel(entry.action)" x-text="classifyLevel(entry.action).toUpperCase()"></span>
+                    <span class="text-xs" style="color:var(--text-dim);margin-right:6px" x-text="'[' + entry.action + ']'"></span>
+                    <span class="text-xs" x-text="entry.detail"></span>
+                  </div>
+                  <template x-if="isMemoryTrace(entry)">
+                    <div class="memory-trace-block">
+                      <div class="memory-trace-summary">
+                        <template x-for="(item, index) in memoryTraceSummary(entry)" :key="entry.seq + '-summary-' + index">
+                          <span class="memory-trace-pill" x-text="item"></span>
+                        </template>
+                      </div>
+                      <div class="memory-trace-recalls" x-show="memoryTraceSelectedRecall(entry).length">
+                        <template x-for="recall in memoryTraceSelectedRecall(entry)" :key="entry.seq + '-recall-' + recall.selected_rank + '-' + recall.source">
+                          <div class="memory-trace-recall">
+                            <div class="memory-trace-recall-meta" x-text="memoryTraceMeta(recall)"></div>
+                            <div class="memory-trace-recall-text" x-text="recall.rendered"></div>
+                          </div>
+                        </template>
+                        <div class="memory-trace-more" x-show="memoryTraceOverflowCount(entry) > 0" x-text="'+' + memoryTraceOverflowCount(entry) + ' more selected recall items'"></div>
+                      </div>
+                    </div>
+                  </template>
                 </div>
               </template>
               <div class="empty-state" x-show="!filteredEntries.length" style="padding:20px">
@@ -4546,6 +4566,7 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                 <option value="AgentSpawn">Agent Created</option>
                 <option value="AgentKill">Agent Stopped</option>
                 <option value="AgentMessage">Message</option>
+                <option value="MemoryTrace">Memory Trace</option>
                 <option value="ToolInvoke">Tool Used</option>
                 <option value="NetworkAccess">Network Access</option>
                 <option value="ShellExec">Shell Command</option>
@@ -4558,7 +4579,7 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
             </div>
             <div class="table-wrap" x-show="filteredAuditEntries.length">
               <table>
-                <thead><tr><th>#</th><th>Timestamp</th><th>Agent</th><th>Action</th><th>Detail</th><th>Outcome</th></tr></thead>
+                <thead><tr><th>#</th><th>Timestamp</th><th>Agent</th><th>Action</th><th>Detail</th><th>Outcome / Trace</th></tr></thead>
                 <tbody>
                   <template x-for="e in filteredAuditEntries" :key="e.seq">
                     <tr>
@@ -4567,7 +4588,29 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                       <td class="truncate" style="max-width:120px" x-text="auditAgentName(e.agent_id)" :title="e.agent_id"></td>
                       <td><span class="badge badge-created" x-text="friendlyAction(e.action)"></span></td>
                       <td class="truncate" style="max-width:200px" x-text="e.detail" :title="e.detail"></td>
-                      <td x-text="e.outcome"></td>
+                      <td style="max-width:360px">
+                        <template x-if="isMemoryTrace(e)">
+                          <div class="memory-trace-block memory-trace-block-audit">
+                            <div class="memory-trace-summary">
+                              <template x-for="(item, index) in memoryTraceSummary(e)" :key="e.seq + '-audit-summary-' + index">
+                                <span class="memory-trace-pill" x-text="item"></span>
+                              </template>
+                            </div>
+                            <div class="memory-trace-recalls" x-show="memoryTraceSelectedRecall(e).length">
+                              <template x-for="recall in memoryTraceSelectedRecall(e)" :key="e.seq + '-audit-recall-' + recall.selected_rank + '-' + recall.source">
+                                <div class="memory-trace-recall">
+                                  <div class="memory-trace-recall-meta" x-text="memoryTraceMeta(recall)"></div>
+                                  <div class="memory-trace-recall-text" x-text="recall.rendered"></div>
+                                </div>
+                              </template>
+                              <div class="memory-trace-more" x-show="memoryTraceOverflowCount(e) > 0" x-text="'+' + memoryTraceOverflowCount(e) + ' more selected recall items'"></div>
+                            </div>
+                          </div>
+                        </template>
+                        <template x-if="!isMemoryTrace(e)">
+                          <span x-text="auditOutcomePreview(e)" :title="e.outcome"></span>
+                        </template>
+                      </td>
                     </tr>
                   </template>
                 </tbody>

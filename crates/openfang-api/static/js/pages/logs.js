@@ -151,6 +151,59 @@ function logsPage() {
       return 'info';
     },
 
+    isMemoryTrace: function(entry) {
+      return !!(entry && entry.action === 'MemoryTrace' && entry.payload && typeof entry.payload === 'object');
+    },
+
+    memoryTracePayload: function(entry) {
+      return this.isMemoryTrace(entry) ? entry.payload : null;
+    },
+
+    memoryTraceSummary: function(entry) {
+      var payload = this.memoryTracePayload(entry);
+      if (!payload) return [];
+      return [
+        String(payload.semantic_mode || 'unknown'),
+        String(payload.semantic_candidates || 0) + ' semantic',
+        String(payload.shared_candidates || 0) + ' shared',
+        String(payload.maintenance_signals || 0) + ' maintenance',
+        String(payload.attention_signals || 0) + ' attention',
+        String(payload.session_summaries || 0) + ' session',
+        String((payload.selected_fused_recall || []).length) + ' selected'
+      ];
+    },
+
+    memoryTraceSelectedRecall: function(entry) {
+      var payload = this.memoryTracePayload(entry);
+      if (!payload || !Array.isArray(payload.selected_fused_recall)) return [];
+      return payload.selected_fused_recall.slice(0, 3);
+    },
+
+    memoryTraceOverflowCount: function(entry) {
+      var payload = this.memoryTracePayload(entry);
+      if (!payload || !Array.isArray(payload.selected_fused_recall)) return 0;
+      return Math.max(payload.selected_fused_recall.length - 3, 0);
+    },
+
+    memoryTraceMeta: function(recall) {
+      if (!recall) return '';
+      var weight = typeof recall.source_weight === 'number' ? recall.source_weight.toFixed(3) : '?';
+      var score = typeof recall.fused_score === 'number' ? recall.fused_score.toFixed(5) : '?';
+      return '#' + recall.selected_rank + ' ' + recall.source + ' r' + recall.source_rank + ' · w=' + weight + ' · t=' + recall.tie_break_priority + ' · score=' + score;
+    },
+
+    previewText: function(value, limit) {
+      if (!value) return '';
+      var text = String(value);
+      if (text.length <= limit) return text;
+      return text.slice(0, Math.max(limit - 1, 1)) + '…';
+    },
+
+    auditOutcomePreview: function(entry) {
+      if (this.isMemoryTrace(entry)) return '';
+      return this.previewText(entry && entry.outcome ? entry.outcome : '', 160);
+    },
+
     get filteredEntries() {
       var self = this;
       var levelF = this.levelFilter;
@@ -158,7 +211,7 @@ function logsPage() {
       return this.entries.filter(function(e) {
         if (levelF && self.classifyLevel(e.action) !== levelF) return false;
         if (textF) {
-          var haystack = ((e.action || '') + ' ' + (e.detail || '') + ' ' + (e.agent_id || '')).toLowerCase();
+          var haystack = ((e.action || '') + ' ' + (e.detail || '') + ' ' + (e.outcome || '') + ' ' + (e.agent_id || '') + ' ' + JSON.stringify(e.payload || '')).toLowerCase();
           if (haystack.indexOf(textF) === -1) return false;
         }
         return true;
@@ -227,7 +280,8 @@ function logsPage() {
         'ToolInvoke': 'Tool Used', 'ToolResult': 'Tool Completed', 'AgentMessage': 'Message',
         'NetworkAccess': 'Network Access', 'ShellExec': 'Shell Command', 'FileAccess': 'File Access',
         'MemoryAccess': 'Memory Access', 'AuthAttempt': 'Login Attempt', 'AuthSuccess': 'Login Success',
-        'AuthFailure': 'Login Failed', 'CapabilityDenied': 'Permission Denied', 'RateLimited': 'Rate Limited'
+        'AuthFailure': 'Login Failed', 'CapabilityDenied': 'Permission Denied', 'RateLimited': 'Rate Limited',
+        'MemoryTrace': 'Memory Trace'
       };
       return map[action] || action.replace(/([A-Z])/g, ' $1').trim();
     },

@@ -33,10 +33,12 @@ use openfang_types::capability::Capability;
 use openfang_types::config::KernelConfig;
 use openfang_types::error::OpenFangError;
 use openfang_types::event::*;
-use openfang_types::inbound::{AttachmentScope, InboundAttachment, InboundMessage, StoredAttachment};
+use openfang_types::inbound::{
+    AttachmentScope, InboundAttachment, InboundMessage, StoredAttachment,
+};
+use openfang_types::media::{MediaAttachment, MediaSource, MediaType};
 use openfang_types::memory::Memory;
 use openfang_types::message::{ContentBlock, Message, MessageContent, Role};
-use openfang_types::media::{MediaAttachment, MediaSource, MediaType};
 use openfang_types::tool::ToolDefinition;
 
 use async_trait::async_trait;
@@ -155,9 +157,11 @@ pub struct OpenFangKernel {
     /// WhatsApp Web gateway child process PID (for shutdown cleanup).
     pub whatsapp_gateway_pid: Arc<std::sync::Mutex<Option<u32>>>,
     /// Channel adapters registered at bridge startup (for proactive `channel_send` tool).
-    pub channel_adapters: dashmap::DashMap<String, Arc<dyn openfang_channels::types::ChannelAdapter>>,
+    pub channel_adapters:
+        dashmap::DashMap<String, Arc<dyn openfang_channels::types::ChannelAdapter>>,
     /// Hot-reloadable default model override (set via config hot-reload, read at agent spawn).
-    pub default_model_override: std::sync::RwLock<Option<openfang_types::config::DefaultModelConfig>>,
+    pub default_model_override:
+        std::sync::RwLock<Option<openfang_types::config::DefaultModelConfig>>,
     /// Per-agent message locks — serializes LLM calls for the same agent to prevent
     /// session corruption when multiple messages arrive concurrently (e.g. rapid voice
     /// messages via Telegram). Different agents can still run in parallel.
@@ -401,8 +405,8 @@ fn generate_identity_files(
          <!-- Visual identity and personality at a glance. Edit these fields freely. -->\n",
         name = manifest.name
     );
-    let identity_content = scaffold_override(scaffold, |s| s.identity_md.as_ref())
-        .unwrap_or(default_identity_content);
+    let identity_content =
+        scaffold_override(scaffold, |s| s.identity_md.as_ref()).unwrap_or(default_identity_content);
 
     let files: &[(&str, &str)] = &[
         ("SOUL.md", &soul_content),
@@ -416,8 +420,7 @@ fn generate_identity_files(
 
     // Conditionally generate HEARTBEAT.md for autonomous agents
     let heartbeat_content = if manifest.autonomous.is_some() {
-        let default_heartbeat_content =
-            "# Heartbeat Checklist\n\
+        let default_heartbeat_content = "# Heartbeat Checklist\n\
              <!-- Proactive reminders to check during heartbeat cycles -->\n\n\
              ## Every Heartbeat\n\
              - [ ] Check for pending tasks or messages\n\
@@ -426,7 +429,7 @@ fn generate_identity_files(
              - [ ] Summarize today's activity for the user\n\n\
              ## Weekly\n\
              - [ ] Archive old sessions and clean up memory\n"
-                .to_string();
+            .to_string();
         Some(
             scaffold_override(scaffold, |s| s.heartbeat_md.as_ref())
                 .unwrap_or(default_heartbeat_content),
@@ -634,11 +637,12 @@ impl OpenFangKernel {
         let driver_config = DriverConfig {
             provider: config.default_model.provider.clone(),
             api_key: default_api_key,
-            base_url: config
-                .default_model
-                .base_url
-                .clone()
-                .or_else(|| config.provider_urls.get(&config.default_model.provider).cloned()),
+            base_url: config.default_model.base_url.clone().or_else(|| {
+                config
+                    .provider_urls
+                    .get(&config.default_model.provider)
+                    .cloned()
+            }),
             skip_permissions: true,
         };
         // Primary driver failure is non-fatal: the dashboard should remain accessible
@@ -729,9 +733,7 @@ impl OpenFangKernel {
 
         // Use the chain, or create a stub driver if everything failed
         let driver: Arc<dyn LlmDriver> = if driver_chain.len() > 1 {
-            Arc::new(openfang_runtime::drivers::fallback::FallbackDriver::with_models(
-                model_chain,
-            ))
+            Arc::new(openfang_runtime::drivers::fallback::FallbackDriver::with_models(model_chain))
         } else if let Some(single) = driver_chain.into_iter().next() {
             single
         } else {
@@ -889,7 +891,10 @@ impl OpenFangKernel {
                     configured_model.as_str()
                 };
                 let api_key_env = config.memory.embedding_api_key_env.as_deref().unwrap_or("");
-                let custom_url = config.provider_urls.get(provider.as_str()).map(|s| s.as_str());
+                let custom_url = config
+                    .provider_urls
+                    .get(provider.as_str())
+                    .map(|s| s.as_str());
                 match create_embedding_driver(provider, model, api_key_env, custom_url) {
                     Ok(d) => {
                         info!(provider = %provider, model = %model, "Embedding driver configured from memory config");
@@ -1100,11 +1105,16 @@ impl OpenFangKernel {
                                     Ok(disk_manifest) => {
                                         // Compare key fields to detect changes
                                         let changed = disk_manifest.name != entry.manifest.name
-                                            || disk_manifest.description != entry.manifest.description
-                                            || disk_manifest.model.system_prompt != entry.manifest.model.system_prompt
-                                            || disk_manifest.model.provider != entry.manifest.model.provider
-                                            || disk_manifest.model.model != entry.manifest.model.model
-                                            || disk_manifest.capabilities.tools != entry.manifest.capabilities.tools
+                                            || disk_manifest.description
+                                                != entry.manifest.description
+                                            || disk_manifest.model.system_prompt
+                                                != entry.manifest.model.system_prompt
+                                            || disk_manifest.model.provider
+                                                != entry.manifest.model.provider
+                                            || disk_manifest.model.model
+                                                != entry.manifest.model.model
+                                            || disk_manifest.capabilities.tools
+                                                != entry.manifest.capabilities.tools
                                             || disk_manifest.resources != entry.manifest.resources;
                                         if changed {
                                             info!(
@@ -1158,8 +1168,6 @@ impl OpenFangKernel {
                             Some(kernel.config.exec_policy.clone());
                     }
 
-
-
                     // Apply default_model to restored agents.
                     //
                     // Two cases:
@@ -1182,10 +1190,15 @@ impl OpenFangKernel {
                                 restored_entry.manifest.model.model = dm.model.clone();
                             }
                             if !dm.api_key_env.is_empty() {
-                                restored_entry.manifest.model.api_key_env = Some(dm.api_key_env.clone());
+                                restored_entry.manifest.model.api_key_env =
+                                    Some(dm.api_key_env.clone());
                             }
                             if dm.base_url.is_some() {
-                                restored_entry.manifest.model.base_url.clone_from(&dm.base_url);
+                                restored_entry
+                                    .manifest
+                                    .model
+                                    .base_url
+                                    .clone_from(&dm.base_url);
                             }
                         }
                     }
@@ -1338,12 +1351,11 @@ impl OpenFangKernel {
             manifest.model.model = normalized;
         }
 
-
-
         // Create workspace directory for the agent (name-based, so SOUL.md survives recreation)
-        let workspace_dir = manifest.workspace.clone().unwrap_or_else(|| {
-            self.config.effective_workspaces_dir().join(&name)
-        });
+        let workspace_dir = manifest
+            .workspace
+            .clone()
+            .unwrap_or_else(|| self.config.effective_workspaces_dir().join(&name));
         ensure_workspace(&workspace_dir)?;
         if manifest.generate_identity_files {
             generate_identity_files(&workspace_dir, &manifest, scaffold.as_ref());
@@ -1525,7 +1537,8 @@ impl OpenFangKernel {
             && !entry.manifest.module.starts_with("wasm:")
             && !entry.manifest.module.starts_with("python:")
         {
-            let session_user_message = self.build_vision_user_message(&stored_attachments, &text)?;
+            let session_user_message =
+                self.build_vision_user_message(&stored_attachments, &text)?;
             self.execute_llm_agent_with_session_message(
                 &entry,
                 agent_id,
@@ -1642,7 +1655,11 @@ impl OpenFangKernel {
         self.model_catalog
             .read()
             .ok()
-            .and_then(|catalog| catalog.find_model(model_name).map(|entry| entry.supports_vision))
+            .and_then(|catalog| {
+                catalog
+                    .find_model(model_name)
+                    .map(|entry| entry.supports_vision)
+            })
             .unwrap_or(false)
     }
 
@@ -3059,15 +3076,11 @@ impl OpenFangKernel {
                 None
             } else {
                 // No custom base_url: safe to auto-detect from catalog / model name
-                let resolved_provider = self
-                    .model_catalog
-                    .read()
-                    .ok()
-                    .and_then(|catalog| {
-                        catalog
-                            .find_model(model)
-                            .map(|entry| entry.provider.clone())
-                    });
+                let resolved_provider = self.model_catalog.read().ok().and_then(|catalog| {
+                    catalog
+                        .find_model(model)
+                        .map(|entry| entry.provider.clone())
+                });
                 resolved_provider.or_else(|| infer_provider_from_model(model))
             }
         };
@@ -3550,7 +3563,11 @@ impl OpenFangKernel {
         // If an agent with this hand's name already exists, remove it first.
         // Save triggers before kill so they can be restored under the new ID
         // (issue #519 — triggers were lost on agent restart).
-        let existing = self.registry.list().into_iter().find(|e| e.name == def.agent.name);
+        let existing = self
+            .registry
+            .list()
+            .into_iter()
+            .find(|e| e.name == def.agent.name);
         let old_agent_id = existing.as_ref().map(|e| e.id);
         let saved_triggers = old_agent_id
             .map(|id| self.triggers.take_agent_triggers(id))
@@ -4002,7 +4019,9 @@ impl OpenFangKernel {
                                         "Reassigned cron jobs after restart"
                                     );
                                     if let Err(e) = self.cron_scheduler.persist() {
-                                        warn!("Failed to persist cron jobs after hand restore: {e}");
+                                        warn!(
+                                            "Failed to persist cron jobs after hand restore: {e}"
+                                        );
                                     }
                                 }
                                 // Reassign triggers (#519). Currently a no-op on
@@ -4028,14 +4047,17 @@ impl OpenFangKernel {
         }
 
         let agents = self.registry.list();
-        let mut bg_agents: Vec<(openfang_types::agent::AgentId, String, ScheduleMode)> =
-            Vec::new();
+        let mut bg_agents: Vec<(openfang_types::agent::AgentId, String, ScheduleMode)> = Vec::new();
 
         for entry in &agents {
             if matches!(entry.manifest.schedule, ScheduleMode::Reactive) {
                 continue;
             }
-            bg_agents.push((entry.id, entry.name.clone(), entry.manifest.schedule.clone()));
+            bg_agents.push((
+                entry.id,
+                entry.name.clone(),
+                entry.manifest.schedule.clone(),
+            ));
         }
 
         if !bg_agents.is_empty() {
@@ -4262,7 +4284,9 @@ impl OpenFangKernel {
                                 let timeout_s = timeout_secs.unwrap_or(120);
                                 let timeout = std::time::Duration::from_secs(timeout_s);
                                 let delivery = job.delivery.clone();
-                                let kh: std::sync::Arc<dyn openfang_runtime::kernel_handle::KernelHandle> = kernel.clone();
+                                let kh: std::sync::Arc<
+                                    dyn openfang_runtime::kernel_handle::KernelHandle,
+                                > = kernel.clone();
                                 match tokio::time::timeout(
                                     timeout,
                                     kernel.send_message_with_handle(agent_id, message, Some(kh)),
@@ -4311,10 +4335,13 @@ impl OpenFangKernel {
                                     Ok(uuid) => crate::workflow::WorkflowId(uuid),
                                     Err(_) => {
                                         let all_wfs = kernel.workflows.list_workflows().await;
-                                        if let Some(wf) = all_wfs.iter().find(|w| w.name == *workflow_id) {
+                                        if let Some(wf) =
+                                            all_wfs.iter().find(|w| w.name == *workflow_id)
+                                        {
                                             wf.id
                                         } else {
-                                            let err_msg = format!("workflow not found: {workflow_id}");
+                                            let err_msg =
+                                                format!("workflow not found: {workflow_id}");
                                             tracing::warn!(job = %job_name, %err_msg);
                                             kernel.cron_scheduler.record_failure(job_id, &err_msg);
                                             continue;
@@ -4332,10 +4359,7 @@ impl OpenFangKernel {
                                         tracing::info!(job = %job_name, "Cron workflow completed");
                                         kernel.cron_scheduler.record_success(job_id);
                                         cron_deliver_response(
-                                            &kernel,
-                                            agent_id,
-                                            &output,
-                                            &delivery,
+                                            &kernel, agent_id, &output, &delivery,
                                         )
                                         .await;
                                     }
@@ -4794,8 +4818,10 @@ impl OpenFangKernel {
         // If fallback models are configured, wrap in FallbackDriver
         if !manifest.fallback_models.is_empty() {
             // Primary driver uses the agent's own model name (already set in request)
-            let mut chain: Vec<(std::sync::Arc<dyn openfang_runtime::llm_driver::LlmDriver>, String)> =
-                vec![(primary.clone(), String::new())];
+            let mut chain: Vec<(
+                std::sync::Arc<dyn openfang_runtime::llm_driver::LlmDriver>,
+                String,
+            )> = vec![(primary.clone(), String::new())];
             for fb in &manifest.fallback_models {
                 let fb_provider = if fb.provider == "default" {
                     self.config.clone().default_model.provider
@@ -5182,8 +5208,8 @@ impl OpenFangKernel {
         // Check if the agent has unrestricted tool access:
         // - capabilities.tools is empty (not specified → all tools)
         // - capabilities.tools contains "*" (explicit wildcard)
-        let tools_unrestricted = declared_tools.is_empty()
-            || declared_tools.iter().any(|t| t == "*");
+        let tools_unrestricted =
+            declared_tools.is_empty() || declared_tools.iter().any(|t| t == "*");
 
         // Step 1: Filter builtin tools.
         // Priority: declared tools > ToolProfile > all builtins.
@@ -5232,25 +5258,20 @@ impl OpenFangKernel {
                 .into_iter()
                 .filter(|tool| tool.policy.model_invocable())
                 .filter(|tool| {
-                    tool.policy
-                        .host_tools
-                        .iter()
-                        .all(|host_tool| {
-                            caps.iter().any(|c| match c {
-                                Capability::ToolAll => true,
-                                Capability::ToolInvoke(name) => name == host_tool || name == "*",
-                                _ => false,
-                            })
+                    tool.policy.host_tools.iter().all(|host_tool| {
+                        caps.iter().any(|c| match c {
+                            Capability::ToolAll => true,
+                            Capability::ToolInvoke(name) => name == host_tool || name == "*",
+                            _ => false,
                         })
+                    })
                 })
                 .collect::<Vec<_>>()
         };
         for skill_tool in skill_tools {
             skill_tool_names.insert(skill_tool.name.clone());
             // If agent declares specific tools, only include matching skill tools
-            if !tools_unrestricted
-                && !declared_tools.iter().any(|d| d == &skill_tool.name)
-            {
+            if !tools_unrestricted && !declared_tools.iter().any(|d| d == &skill_tool.name) {
                 continue;
             }
             all_tools.push(ToolDefinition {
@@ -5305,7 +5326,12 @@ impl OpenFangKernel {
         // These are separate from capabilities.tools and act as additional filters.
         let (tool_allowlist, tool_blocklist) = entry
             .as_ref()
-            .map(|e| (e.manifest.tool_allowlist.clone(), e.manifest.tool_blocklist.clone()))
+            .map(|e| {
+                (
+                    e.manifest.tool_allowlist.clone(),
+                    e.manifest.tool_blocklist.clone(),
+                )
+            })
             .unwrap_or_default();
 
         if !tool_allowlist.is_empty() {
@@ -5358,7 +5384,11 @@ impl OpenFangKernel {
 
     /// Build a compact MCP server/tool summary for the system prompt so the
     /// agent knows what external tool servers are connected.
-    fn build_mcp_summary(&self, visible_tools: &[ToolDefinition], mcp_allowlist: &[String]) -> String {
+    fn build_mcp_summary(
+        &self,
+        visible_tools: &[ToolDefinition],
+        mcp_allowlist: &[String],
+    ) -> String {
         if visible_tools.is_empty() {
             return String::new();
         }
@@ -5383,10 +5413,7 @@ impl OpenFangKernel {
             if !mcp_allowlist.is_empty() && !normalized.iter().any(|n| n == &server) {
                 continue;
             }
-            servers
-                .entry(server)
-                .or_default()
-                .push(tool.name.clone());
+            servers.entry(server).or_default().push(tool.name.clone());
             tool_count += 1;
         }
         if tool_count == 0 {
@@ -5399,10 +5426,16 @@ impl OpenFangKernel {
                 "- **{}**: {} tools available\n  - full names: {}\n",
                 server,
                 tool_names.len(),
-                tool_names.iter().map(|n| format!("`{n}`")).collect::<Vec<_>>().join(", ")
+                tool_names
+                    .iter()
+                    .map(|n| format!("`{n}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
         }
-        summary.push_str("\nTo use these tools, call them by their FULL name exactly as shown above.\n");
+        summary.push_str(
+            "\nTo use these tools, call them by their FULL name exactly as shown above.\n",
+        );
 
         // Add filesystem-specific guidance when a filesystem MCP server is connected
         let has_filesystem = servers.keys().any(|s| s.contains("filesystem"));
@@ -5445,8 +5478,10 @@ impl OpenFangKernel {
         skill_allowlist: &[String],
         visible_tools: &[ToolDefinition],
     ) -> Vec<openfang_runtime::prompt_builder::SkillInfo> {
-        let visible_tool_names: std::collections::HashSet<&str> =
-            visible_tools.iter().map(|tool| tool.name.as_str()).collect();
+        let visible_tool_names: std::collections::HashSet<&str> = visible_tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
         let registry = self
             .skill_registry
             .read()
@@ -5612,8 +5647,8 @@ fn infer_provider_from_model(model: &str) -> Option<String> {
             "minimax" | "gemini" | "anthropic" | "openai" | "groq" | "deepseek" | "mistral"
             | "cohere" | "xai" | "ollama" | "together" | "fireworks" | "perplexity"
             | "cerebras" | "sambanova" | "replicate" | "huggingface" | "ai21" | "codex"
-            | "claude-code" | "copilot" | "github-copilot" | "qwen" | "zhipu" | "zai" | "moonshot"
-            | "openrouter" | "volcengine" | "doubao" | "dashscope" => {
+            | "claude-code" | "copilot" | "github-copilot" | "qwen" | "zhipu" | "zai"
+            | "moonshot" | "openrouter" | "volcengine" | "doubao" | "dashscope" => {
                 return Some(prefix.to_string());
             }
             // "kimi" is a brand alias for moonshot
@@ -5630,16 +5665,26 @@ fn infer_provider_from_model(model: &str) -> Option<String> {
         Some("gemini".to_string())
     } else if lower.starts_with("claude") {
         Some("anthropic".to_string())
-    } else if lower.starts_with("gpt") || lower.starts_with("o1") || lower.starts_with("o3") || lower.starts_with("o4") {
+    } else if lower.starts_with("gpt")
+        || lower.starts_with("o1")
+        || lower.starts_with("o3")
+        || lower.starts_with("o4")
+    {
         Some("openai".to_string())
-    } else if lower.starts_with("llama") || lower.starts_with("mixtral") || lower.starts_with("qwen") {
+    } else if lower.starts_with("llama")
+        || lower.starts_with("mixtral")
+        || lower.starts_with("qwen")
+    {
         // These could be on multiple providers; don't infer
         None
     } else if lower.starts_with("grok") {
         Some("xai".to_string())
     } else if lower.starts_with("deepseek") {
         Some("deepseek".to_string())
-    } else if lower.starts_with("mistral") || lower.starts_with("codestral") || lower.starts_with("pixtral") {
+    } else if lower.starts_with("mistral")
+        || lower.starts_with("codestral")
+        || lower.starts_with("pixtral")
+    {
         Some("mistral".to_string())
     } else if lower.starts_with("command") || lower.starts_with("embed-") {
         Some("cohere".to_string())
@@ -5923,6 +5968,17 @@ impl KernelHandle for OpenFangKernel {
             EventPayload::Custom(payload_bytes),
         );
         OpenFangKernel::publish_event(self, event).await;
+        Ok(())
+    }
+
+    fn record_audit_event(
+        &self,
+        agent_id: &str,
+        action: openfang_runtime::audit::AuditAction,
+        detail: &str,
+        outcome: &str,
+    ) -> Result<(), String> {
+        self.audit_log.record(agent_id, action, detail, outcome);
         Ok(())
     }
 
@@ -6217,8 +6273,20 @@ impl KernelHandle for OpenFangKernel {
 
     async fn get_channel_default_recipient(&self, channel: &str) -> Option<String> {
         match channel {
-            "telegram" => self.config.channels.telegram.as_ref()?.default_chat_id.clone(),
-            "discord" => self.config.channels.discord.as_ref()?.default_channel_id.clone(),
+            "telegram" => self
+                .config
+                .channels
+                .telegram
+                .as_ref()?
+                .default_chat_id
+                .clone(),
+            "discord" => self
+                .config
+                .channels
+                .discord
+                .as_ref()?
+                .default_channel_id
+                .clone(),
             _ => None,
         }
     }
@@ -6269,14 +6337,22 @@ impl KernelHandle for OpenFangKernel {
                     .unwrap_or("unnamed_skill");
                 let dest = target_base_dir.join(name);
                 if dest.exists() {
-                    return Err(format!("Skill '{}' already exists at {}", name, dest.display()));
+                    return Err(format!(
+                        "Skill '{}' already exists at {}",
+                        name,
+                        dest.display()
+                    ));
                 }
                 copy_skill_dir_recursive(&src, &dest).map_err(|e| e.to_string())?;
                 self.reload_skills();
                 return Ok(format!(
                     "Successfully installed local skill '{}' to {}.",
                     name,
-                    if is_workspace { "workspace" } else { "global home" }
+                    if is_workspace {
+                        "workspace"
+                    } else {
+                        "global home"
+                    }
                 ));
             }
         }
@@ -6292,7 +6368,11 @@ impl KernelHandle for OpenFangKernel {
                     "Successfully installed skill '{}' (version {}) to {}.",
                     source,
                     version,
-                    if is_workspace { "workspace" } else { "global home" }
+                    if is_workspace {
+                        "workspace"
+                    } else {
+                        "global home"
+                    }
                 ))
             }
             Err(e) => Err(format!("Skill install failed: {e}")),
@@ -6366,7 +6446,11 @@ impl KernelHandle for OpenFangKernel {
         Ok(format!(
             "Successfully created prompt-only skill '{}' in {}.",
             name,
-            if is_workspace { "workspace" } else { "global home" }
+            if is_workspace {
+                "workspace"
+            } else {
+                "global home"
+            }
         ))
     }
 
@@ -6483,7 +6567,9 @@ impl KernelHandle for OpenFangKernel {
                 filename: filename.unwrap_or("file").to_string(),
             },
             _ => {
-                return Err(format!("Unsupported media type: '{media_type}'. Use 'image' or 'file'."));
+                return Err(format!(
+                    "Unsupported media type: '{media_type}'. Use 'image' or 'file'."
+                ));
             }
         };
 
@@ -6499,7 +6585,10 @@ impl KernelHandle for OpenFangKernel {
                 .map_err(|e| format!("Channel media send failed: {e}"))?;
         }
 
-        Ok(format!("{} sent to {} via {}", media_type, recipient, channel))
+        Ok(format!(
+            "{} sent to {} via {}",
+            media_type, recipient, channel
+        ))
     }
 
     async fn send_channel_file_data(
@@ -6551,7 +6640,10 @@ impl KernelHandle for OpenFangKernel {
                 .map_err(|e| format!("Channel file send failed: {e}"))?;
         }
 
-        Ok(format!("File '{}' sent to {} via {}", filename, recipient, channel))
+        Ok(format!(
+            "File '{}' sent to {} via {}",
+            filename, recipient, channel
+        ))
     }
 
     async fn spawn_agent_checked(
