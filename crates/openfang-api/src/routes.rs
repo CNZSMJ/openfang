@@ -3094,6 +3094,12 @@ pub struct MemoryCleanupRequest {
     pub limit: Option<usize>,
 }
 
+#[derive(Default, serde::Deserialize)]
+pub struct MemoryAutoconvergeRequest {
+    pub apply: Option<bool>,
+    pub limit: Option<usize>,
+}
+
 fn extract_memory_list_tags(uri: &axum::http::Uri) -> Vec<String> {
     uri.query()
         .map(|query| {
@@ -9863,6 +9869,161 @@ pub async fn set_agent_file(
             "status": "ok",
             "name": filename,
             "size_bytes": size_bytes,
+        })),
+    )
+}
+
+/// GET /api/agents/{id}/memory/autoconverge — Preview a managed MEMORY.md autoconverge plan.
+pub async fn get_agent_memory_autoconverge(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(query): Query<MemoryAutoconvergeRequest>,
+) -> impl IntoResponse {
+    agent_memory_autoconverge_impl(state, id, false, query.limit).await
+}
+
+/// POST /api/agents/{id}/memory/autoconverge — Audit or apply a managed MEMORY.md autoconverge plan.
+pub async fn post_agent_memory_autoconverge(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<MemoryAutoconvergeRequest>,
+) -> impl IntoResponse {
+    agent_memory_autoconverge_impl(state, id, body.apply.unwrap_or(false), body.limit).await
+}
+
+async fn agent_memory_autoconverge_impl(
+    state: Arc<AppState>,
+    id: String,
+    apply: bool,
+    limit: Option<usize>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let agent_id: AgentId = match id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid agent ID"})),
+            );
+        }
+    };
+
+    let entry = match state.kernel.registry.get(agent_id) {
+        Some(entry) => entry,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Agent not found"})),
+            );
+        }
+    };
+
+    let workspace = match entry.manifest.workspace {
+        Some(ref ws) => ws.clone(),
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Agent has no workspace"})),
+            );
+        }
+    };
+
+    let shared_agent_id = openfang_kernel::kernel::shared_memory_agent_id();
+    let memory_pairs = match state.kernel.memory.list_kv(shared_agent_id) {
+        Ok(pairs) => pairs,
+        Err(e) => {
+            tracing::warn!("Memory list_kv failed during autoconverge planning: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Memory operation failed"})),
+            );
+        }
+    };
+
+    let limit = limit.map(|value| value.min(64)).unwrap_or(24);
+    let memory_path = workspace.join("MEMORY.md");
+    let current_content = std::fs::read_to_string(&memory_path).unwrap_or_default();
+    let plan = openfang_types::memory::build_memory_autoconverge_plan(
+        &current_content,
+        &memory_pairs,
+        chrono::Utc::now(),
+        limit,
+    );
+
+    if apply && !plan.summary.can_apply {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "status": "blocked",
+                "error": "Autoconverge is blocked until shared memory governance cleanup issues are repaired",
+                "agent_id": agent_id.to_string(),
+                "agent_name": entry.name,
+                "path": memory_path.display().to_string(),
+                "summary": plan.summary,
+                "candidates": plan.candidates,
+                "stale_review": plan.stale_review,
+                "cleanup_blockers": plan.cleanup_blockers,
+                "current_content": plan.current_content,
+                "proposed_content": plan.proposed_content,
+            })),
+        );
+    }
+
+    if apply && plan.summary.changed {
+        const MAX_FILE_SIZE: usize = 32_768;
+        if plan.proposed_content.len() > MAX_FILE_SIZE {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(serde_json::json!({
+                    "error": "Autoconverged MEMORY.md would exceed 32KB",
+                    "agent_id": agent_id.to_string(),
+                    "path": memory_path.display().to_string(),
+                })),
+            );
+        }
+
+        let tmp_path = workspace.join(".MEMORY.md.tmp");
+        if let Err(e) = std::fs::write(&tmp_path, &plan.proposed_content) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Write failed: {e}")})),
+            );
+        }
+        if let Err(e) = std::fs::rename(&tmp_path, &memory_path) {
+            if let Err(cleanup_err) = std::fs::remove_file(&tmp_path) {
+                tracing::warn!(path = ?tmp_path, error = %cleanup_err, "Failed to cleanup temporary MEMORY.md autoconverge file");
+            }
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Rename failed: {e}")})),
+            );
+        }
+
+        state.kernel.audit_log.record(
+            agent_id.to_string(),
+            openfang_runtime::audit::AuditAction::ConfigChange,
+            "memory autoconverge apply",
+            format!(
+                "managed_entries={} cleanup_blockers={} stale_review={}",
+                plan.summary.managed_entries,
+                plan.summary.cleanup_blockers,
+                plan.summary.stale_review
+            ),
+        );
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": if apply { "applied" } else { "audit" },
+            "agent_id": agent_id.to_string(),
+            "agent_name": entry.name,
+            "path": memory_path.display().to_string(),
+            "summary": plan.summary,
+            "candidates": plan.candidates,
+            "stale_review": plan.stale_review,
+            "cleanup_blockers": plan.cleanup_blockers,
+            "current_content": plan.current_content,
+            "proposed_content": plan.proposed_content,
         })),
     )
 }

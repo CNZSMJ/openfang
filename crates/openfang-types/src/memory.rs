@@ -16,6 +16,10 @@ pub const MEMORY_METADATA_PREFIX: &str = "__openfang_memory_meta.";
 pub const MEMORY_METADATA_SCHEMA_VERSION: u32 = 1;
 /// Source label used when cleanup backfills governed metadata.
 pub const MEMORY_CLEANUP_SOURCE: &str = "memory_cleanup_api";
+/// Begin marker for the managed autoconverged MEMORY.md block.
+pub const MEMORY_AUTOCONVERGE_BEGIN: &str = "<!-- OPENFANG_AUTOCONVERGE_BEGIN -->";
+/// End marker for the managed autoconverged MEMORY.md block.
+pub const MEMORY_AUTOCONVERGE_END: &str = "<!-- OPENFANG_AUTOCONVERGE_END -->";
 
 /// Unique identifier for a memory fragment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -569,6 +573,57 @@ pub struct MemoryCleanupOrchestrationSnapshot {
     pub orphan_metadata: Vec<MemoryCleanupOrchestrationSignal>,
 }
 
+/// Section targets for managed MEMORY.md autoconverge entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryAutoconvergeSection {
+    DurableUserContext,
+    StableReferenceFacts,
+}
+
+impl MemoryAutoconvergeSection {
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::DurableUserContext => "Durable User Context",
+            Self::StableReferenceFacts => "Stable Reference Facts",
+        }
+    }
+}
+
+/// A promotion candidate prepared for managed MEMORY.md insertion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryAutoconvergeCandidate {
+    pub key: String,
+    pub section: MemoryAutoconvergeSection,
+    pub rendered: String,
+    pub metadata: MemoryRecordMetadata,
+    pub lifecycle: MemoryLifecycleSnapshot,
+}
+
+/// Summary fields for a managed MEMORY.md autoconverge plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct MemoryAutoconvergeSummary {
+    pub promotion_candidates: usize,
+    pub proposed_entries: usize,
+    pub already_curated: usize,
+    pub stale_review: usize,
+    pub cleanup_blockers: usize,
+    pub managed_entries: usize,
+    pub can_apply: bool,
+    pub changed: bool,
+}
+
+/// Full review/apply plan for converging governed shared memory into MEMORY.md.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryAutoconvergePlan {
+    pub summary: MemoryAutoconvergeSummary,
+    pub current_content: String,
+    pub proposed_content: String,
+    pub candidates: Vec<MemoryAutoconvergeCandidate>,
+    pub stale_review: Vec<GovernedMemoryOrchestrationSignal>,
+    pub cleanup_blockers: Vec<MemoryCleanupFinding>,
+}
+
 /// Build a governance cleanup plan for legacy bare keys and sidecar inconsistencies.
 pub fn plan_memory_cleanup(entries: &[(String, serde_json::Value)]) -> MemoryCleanupPlan {
     let metadata_map = collect_memory_metadata(entries);
@@ -704,6 +759,194 @@ pub fn summarize_memory_cleanup_for_orchestration(
         legacy_repairs,
         metadata_repairs,
         orphan_metadata,
+    }
+}
+
+fn strip_memory_autoconverge_block(content: &str) -> (String, bool) {
+    let Some(start) = content.find(MEMORY_AUTOCONVERGE_BEGIN) else {
+        return (content.trim_end().to_string(), false);
+    };
+    let Some(end_rel) = content[start..].find(MEMORY_AUTOCONVERGE_END) else {
+        return (content.trim_end().to_string(), false);
+    };
+
+    let end = start + end_rel + MEMORY_AUTOCONVERGE_END.len();
+    let mut merged = String::new();
+    merged.push_str(content[..start].trim_end());
+
+    let tail = content[end..].trim_start_matches('\n').trim_start();
+    if !tail.is_empty() {
+        if !merged.is_empty() {
+            merged.push_str("\n\n");
+        }
+        merged.push_str(tail.trim_end());
+    }
+
+    (merged, true)
+}
+
+fn normalize_memory_autoconverge_text(input: &str) -> String {
+    input
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn render_memory_autoconverge_value(value: &serde_json::Value) -> Option<String> {
+    let rendered = match value {
+        serde_json::Value::String(text) => text.trim().to_string(),
+        other => serde_json::to_string(other).ok()?.trim().to_string(),
+    };
+    if rendered.is_empty() {
+        None
+    } else {
+        Some(rendered)
+    }
+}
+
+fn memory_autoconverge_section_for_kind(kind: &str) -> MemoryAutoconvergeSection {
+    match kind {
+        "preference" | "profile" | "constraint" => MemoryAutoconvergeSection::DurableUserContext,
+        _ => MemoryAutoconvergeSection::StableReferenceFacts,
+    }
+}
+
+fn render_memory_autoconverge_block(candidates: &[MemoryAutoconvergeCandidate]) -> Option<String> {
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let mut durable = Vec::new();
+    let mut facts = Vec::new();
+    for candidate in candidates {
+        let line = format!("- {}", candidate.rendered);
+        match candidate.section {
+            MemoryAutoconvergeSection::DurableUserContext => durable.push(line),
+            MemoryAutoconvergeSection::StableReferenceFacts => facts.push(line),
+        }
+    }
+
+    let mut block = Vec::new();
+    block.push(MEMORY_AUTOCONVERGE_BEGIN.to_string());
+    block.push("## Autoconverged Memory Snapshot".to_string());
+    block.push(
+        "These entries are derived from active governed promotion candidates. Edit surrounding sections freely; this managed block is safe to regenerate."
+            .to_string(),
+    );
+
+    if !durable.is_empty() {
+        block.push(String::new());
+        block.push(format!(
+            "### {}",
+            MemoryAutoconvergeSection::DurableUserContext.title()
+        ));
+        block.extend(durable);
+    }
+
+    if !facts.is_empty() {
+        block.push(String::new());
+        block.push(format!(
+            "### {}",
+            MemoryAutoconvergeSection::StableReferenceFacts.title()
+        ));
+        block.extend(facts);
+    }
+
+    block.push(String::new());
+    block.push(MEMORY_AUTOCONVERGE_END.to_string());
+    Some(block.join("\n"))
+}
+
+/// Build a review/apply plan for merging governed shared memory promotion candidates into MEMORY.md.
+pub fn build_memory_autoconverge_plan(
+    memory_md: &str,
+    entries: &[(String, serde_json::Value)],
+    now: DateTime<Utc>,
+    max_candidates: usize,
+) -> MemoryAutoconvergePlan {
+    let current_content = memory_md.trim_end().to_string();
+    let (base_content, _) = strip_memory_autoconverge_block(&current_content);
+    let cleanup_blockers = plan_memory_cleanup(entries).findings;
+    let stale_review_snapshot =
+        summarize_governed_memory_orchestration_for_query(entries, now, max_candidates, None);
+    let stale_review = stale_review_snapshot.stale_review;
+
+    let promotion_candidates: Vec<GovernedMemoryPromptCandidate> =
+        select_governed_memory_prompt_candidates(entries, now, usize::MAX)
+            .into_iter()
+            .filter(|candidate| {
+                candidate.lifecycle.promotion_candidate
+                    && candidate.lifecycle.state == MemoryLifecycleState::Active
+            })
+            .collect();
+
+    let mut dedupe_seen: HashSet<String> = HashSet::new();
+    let mut candidates = Vec::new();
+    let mut already_curated = 0usize;
+    let base_normalized = normalize_memory_autoconverge_text(&base_content);
+
+    for candidate in promotion_candidates.iter().take(max_candidates) {
+        let Some(value_text) = render_memory_autoconverge_value(&candidate.value) else {
+            continue;
+        };
+        let rendered = format!(
+            "[{}] {}",
+            candidate.key,
+            crate::truncate_str(&value_text, 240)
+        );
+        let normalized_rendered = normalize_memory_autoconverge_text(&rendered);
+        let normalized_key = normalize_memory_autoconverge_text(&candidate.key);
+
+        if normalized_rendered.is_empty()
+            || base_normalized.contains(&normalized_key)
+            || base_normalized.contains(&normalized_rendered)
+            || !dedupe_seen.insert(normalized_rendered)
+        {
+            already_curated += 1;
+            continue;
+        }
+
+        candidates.push(MemoryAutoconvergeCandidate {
+            key: candidate.key.clone(),
+            section: memory_autoconverge_section_for_kind(&candidate.metadata.kind),
+            rendered,
+            metadata: candidate.metadata.clone(),
+            lifecycle: candidate.lifecycle.clone(),
+        });
+    }
+
+    let proposed_block = render_memory_autoconverge_block(&candidates);
+    let proposed_content = match proposed_block {
+        Some(block) if !base_content.is_empty() => format!("{base_content}\n\n{block}"),
+        Some(block) => block,
+        None => base_content.clone(),
+    };
+
+    MemoryAutoconvergePlan {
+        summary: MemoryAutoconvergeSummary {
+            promotion_candidates: promotion_candidates.len(),
+            proposed_entries: candidates.len(),
+            already_curated,
+            stale_review: stale_review.len(),
+            cleanup_blockers: cleanup_blockers.len(),
+            managed_entries: candidates.len(),
+            can_apply: cleanup_blockers.is_empty(),
+            changed: proposed_content.trim_end() != current_content.trim_end(),
+        },
+        current_content,
+        proposed_content,
+        candidates,
+        stale_review,
+        cleanup_blockers,
     }
 }
 
@@ -3121,5 +3364,144 @@ mod tests {
         );
         assert_eq!(snapshot.promotion_candidates.len(), 1);
         assert_eq!(snapshot.promotion_candidates[0].key, "pref.editor.theme");
+    }
+
+    #[test]
+    fn test_build_memory_autoconverge_plan_appends_managed_block_for_active_promotions() {
+        let now = Utc::now();
+        let pref = MemoryRecordMetadata {
+            schema_version: MEMORY_METADATA_SCHEMA_VERSION,
+            key: "pref.reply.style".to_string(),
+            namespace: "pref".to_string(),
+            kind: "preference".to_string(),
+            tags: vec!["profile".to_string()],
+            freshness: MemoryFreshness::Durable,
+            source: "memory_api".to_string(),
+            updated_at: now - Duration::days(1),
+        };
+        let project = MemoryRecordMetadata {
+            schema_version: MEMORY_METADATA_SCHEMA_VERSION,
+            key: "project.alpha.status".to_string(),
+            namespace: "project".to_string(),
+            kind: "project_state".to_string(),
+            tags: vec!["project".to_string(), "alpha".to_string()],
+            freshness: MemoryFreshness::Durable,
+            source: "memory_api".to_string(),
+            updated_at: now - Duration::days(1),
+        };
+        let entries = vec![
+            (
+                "pref.reply.style".to_string(),
+                serde_json::json!("Prefer bullet lists."),
+            ),
+            (
+                memory_metadata_key("pref.reply.style").unwrap(),
+                serde_json::to_value(&pref).unwrap(),
+            ),
+            (
+                "project.alpha.status".to_string(),
+                serde_json::json!("Alpha launch remains blocked on QA signoff."),
+            ),
+            (
+                memory_metadata_key("project.alpha.status").unwrap(),
+                serde_json::to_value(&project).unwrap(),
+            ),
+        ];
+
+        let plan = build_memory_autoconverge_plan(
+            "# Long-Term Memory\n\n## Durable User Context\n- Existing manual note.",
+            &entries,
+            now,
+            8,
+        );
+
+        assert!(plan.summary.can_apply);
+        assert!(plan.summary.changed);
+        assert_eq!(plan.summary.proposed_entries, 2);
+        assert!(plan.proposed_content.contains(MEMORY_AUTOCONVERGE_BEGIN));
+        assert!(plan.proposed_content.contains("## Autoconverged Memory Snapshot"));
+        assert!(plan.proposed_content.contains("[pref.reply.style] Prefer bullet lists."));
+        assert!(plan.proposed_content.contains("### Durable User Context"));
+        assert!(plan.proposed_content.contains("### Stable Reference Facts"));
+    }
+
+    #[test]
+    fn test_build_memory_autoconverge_plan_skips_already_curated_entries_and_existing_block() {
+        let now = Utc::now();
+        let pref = MemoryRecordMetadata {
+            schema_version: MEMORY_METADATA_SCHEMA_VERSION,
+            key: "pref.reply.style".to_string(),
+            namespace: "pref".to_string(),
+            kind: "preference".to_string(),
+            tags: vec!["profile".to_string()],
+            freshness: MemoryFreshness::Durable,
+            source: "memory_api".to_string(),
+            updated_at: now - Duration::days(1),
+        };
+        let entries = vec![
+            (
+                "pref.reply.style".to_string(),
+                serde_json::json!("Prefer bullet lists."),
+            ),
+            (
+                memory_metadata_key("pref.reply.style").unwrap(),
+                serde_json::to_value(&pref).unwrap(),
+            ),
+        ];
+        let current = [
+            "# Long-Term Memory",
+            "",
+            "## Durable User Context",
+            "- [pref.reply.style] Prefer bullet lists.",
+            "",
+            MEMORY_AUTOCONVERGE_BEGIN,
+            "## Autoconverged Memory Snapshot",
+            "outdated",
+            MEMORY_AUTOCONVERGE_END,
+        ]
+        .join("\n");
+
+        let plan = build_memory_autoconverge_plan(&current, &entries, now, 8);
+
+        assert!(plan.summary.can_apply);
+        assert_eq!(plan.summary.proposed_entries, 0);
+        assert_eq!(plan.summary.already_curated, 1);
+        assert!(plan.summary.changed);
+        assert!(!plan.proposed_content.contains("outdated"));
+        assert!(!plan.proposed_content.contains(MEMORY_AUTOCONVERGE_BEGIN));
+    }
+
+    #[test]
+    fn test_build_memory_autoconverge_plan_surfaces_cleanup_and_stale_blockers() {
+        let now = Utc::now();
+        let stale_pref = MemoryRecordMetadata {
+            schema_version: MEMORY_METADATA_SCHEMA_VERSION,
+            key: "pref.editor.theme".to_string(),
+            namespace: "pref".to_string(),
+            kind: "preference".to_string(),
+            tags: vec!["profile".to_string()],
+            freshness: MemoryFreshness::Durable,
+            source: "memory_api".to_string(),
+            updated_at: now - Duration::days(40),
+        };
+        let entries = vec![
+            ("legacy_pref".to_string(), serde_json::json!("legacy value")),
+            (
+                "pref.editor.theme".to_string(),
+                serde_json::json!("Use solarized dark."),
+            ),
+            (
+                memory_metadata_key("pref.editor.theme").unwrap(),
+                serde_json::to_value(&stale_pref).unwrap(),
+            ),
+        ];
+
+        let plan = build_memory_autoconverge_plan("# Long-Term Memory", &entries, now, 8);
+
+        assert!(!plan.summary.can_apply);
+        assert_eq!(plan.summary.cleanup_blockers, 1);
+        assert_eq!(plan.summary.stale_review, 1);
+        assert_eq!(plan.cleanup_blockers[0].key, "legacy_pref");
+        assert_eq!(plan.stale_review[0].key, "pref.editor.theme");
     }
 }

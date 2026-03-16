@@ -218,6 +218,11 @@ pub async fn build_router(
             axum::routing::get(routes::get_agent_file).put(routes::set_agent_file),
         )
         .route(
+            "/api/agents/{id}/memory/autoconverge",
+            axum::routing::get(routes::get_agent_memory_autoconverge)
+                .post(routes::post_agent_memory_autoconverge),
+        )
+        .route(
             "/api/agents/{id}/deliveries",
             axum::routing::get(routes::get_agent_deliveries),
         )
