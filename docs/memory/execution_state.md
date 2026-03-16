@@ -466,15 +466,60 @@
         证明 Logs 页模板与样式已真实进入服务端静态资源输出
       - 隔离 daemon 的 `/api/budget` 中 `daily_spend = 0.0038346000000000005`，`/api/budget/agents` 中 `assistant` 的 `daily_cost_usd = 0.0038346000000000005`
       - 验证完成后，隔离 daemon 与整个 `/tmp/openfang-memory-trace-dashboard-live` home 已清理
+  - 已完成 Phase 2 第十批 dedicated memory trace tab / filter / export 接线：
+    - dashboard `Logs` 页现在新增独立的 `Memory Trace` tab，不再只能在 `Live` / `Audit Trail` 两张通用日志表里筛 `MemoryTrace`
+    - `Memory Trace` tab 提供专门的 inspection controls：
+      - `All Agents` agent filter
+      - `All Modes` semantic-mode filter（`hybrid` / `text_only`）
+      - `All Sources` recall-source filter（`shared` / `semantic`）
+      - trace text search
+      - `Reset` / `Export JSON`
+    - `Memory Trace` tab 的每条 card 现在会渲染：
+      - 时间、agent、semantic mode
+      - 选中 recall 的 summary pills
+      - 默认前 3 条 fused recall，带 `source` pill、score/rank meta 与 recall 文本
+      - `Expand` / `Collapse`
+      - `Copy JSON` 与逐条 `Copy recall`
+    - polling fallback 现在也会在 `Memory Trace` tab 保持刷新，不再只在 `Live` tab 自动轮询，避免 SSE 降级时 dedicated trace 视图停更
+  - 已完成本轮 dedicated memory trace tab 验证：
+    - `cargo build --workspace --lib`
+    - `cargo test --workspace`
+    - `cargo clippy --workspace --all-targets -- -D warnings`
+    - `cargo build -p openfang-cli`
+    - live dedicated memory-trace-tab verification 通过：
+      - 在隔离的 `OPENFANG_HOME=/tmp/openfang-memory-trace-tab-live` 上，以 `127.0.0.1:4213` 启动临时 daemon
+      - 使用隔离 daemon 自带 `assistant` agent，通过 memory API 写入 shared probe `project.alpha.memory_tab_status = TRACE-TAB-SHARED-20260316 alpha launch blocked on QA signoff`
+      - 第一轮真实消息写入 semantic probe `TRACE-TAB-SEM-20260316 launch override phrase`，随后执行 `POST /api/agents/{id}/session/reset`
+      - 第二轮真实询问 `What is the alpha launch blocker, and what is the launch override phrase?`，回复同时返回 shared blocker `QA signoff` 与 semantic phrase `TRACE-TAB-SEM-20260316 launch override phrase`
+      - `GET /api/audit/recent?n=20` 中真实返回了两条 `MemoryTrace` entry，且第二条 entry 的 `payload` 同时包含：
+        - `semantic_mode = hybrid`
+        - `semantic_candidates = 1`
+        - `shared_candidates = 1`
+        - `selected_fused_recall[0] = shared ... TRACE-TAB-SHARED-20260316 ...`
+        - `selected_fused_recall[1] = semantic ... TRACE-TAB-SEM-20260316 ...`
+      - `curl http://127.0.0.1:4213/` 的 dashboard HTML 中已出现：
+        - `Memory Trace`
+        - `Prompt-Time Memory Trace`
+        - `All Agents`
+        - `All Modes`
+        - `All Sources`
+        - `Export JSON`
+        - `Copy JSON`
+        证明 dedicated tab 与其 controls 已真实进入服务端静态资源输出
+      - 隔离 daemon 的 `/api/budget` 中 `daily_spend = 0.0038511000000000005`，`/api/budget/agents` 中 `assistant` 的 `daily_cost_usd = 0.0038511000000000005`
+      - 验证完成后，隔离 daemon 与整个 `/tmp/openfang-memory-trace-tab-live` home 已清理
 
 ## 进行中
 
-- 继续推进 Phase 2：shared retrieval helper 现在已经覆盖 semantic/shared candidate、memory context message、文本 trace、structured tracing telemetry，以及 audit/API/dashboard 三层 inspection。下一步评估是否需要把 Logs 页上的 `MemoryTrace` 从通用日志表再上提成专门的 memory-debug workspace。
+- 继续推进 Phase 2：shared retrieval helper 现在已经覆盖 semantic/shared candidate、memory context message、文本 trace、structured tracing telemetry，以及 audit/API/dashboard inspection；dashboard 侧也已有 dedicated `Memory Trace` tab。下一步评估是否需要把它继续上提成独立的 memory-debug workspace，而不再挂在通用 Logs 页下。
 
 ## 下一步动作
 
 - 继续观察 governed metadata 的显式 `source_weight` / `tie_break_priority` 是否需要引入更多 lifecycle bucket 或 namespace/kind-specific weight，而不只是当前 query/lifecycle/promotion 三元组合。
-- 评估是否要把 Logs 页里的 `MemoryTrace` 再拆成更专门的 inspection 视图，例如独立 memory trace tab、按 source/agent/query-mode 的筛选，或 recall text 的 expand/copy 能力。
+- 评估是否要把当前 `Logs -> Memory Trace` tab 再上提成独立 memory-debug workspace，例如：
+  - 直接按 agent / semantic mode / recall source 深链接
+  - recall text expand/copy 之外补充 raw payload / copy-all / compare-two-traces
+  - 对同一 agent 的连续 `MemoryTrace` 做 timeline / diff 视图
 - 评估是否要把 `prompt_builder` 中残留的 memory-context wrapper 也进一步裁薄，避免共享 contract 之上再保留一层重复命名。
 - 在切换电脑或结束一轮实质性工作前，持续更新本文件。
 
@@ -485,8 +530,8 @@
   - `llm.log` 文本 trace
   - `tracing::info!` 结构化字段
   - audit-backed `/api/logs/stream` `MemoryTrace` 事件
-  - dashboard `Logs` 页的 `MemoryTrace` 摘要视图
-  但当前 dashboard 仍然是复用通用 Logs 页，并不是专门的 memory inspection workspace；当 trace 密度再上来时，表格可读性和筛选粒度仍可能不够。
+  - dashboard `Logs -> Memory Trace` dedicated tab
+  但当前 dashboard 仍然是复用通用 Logs 页，并不是独立的 memory inspection workspace；当 trace 密度再上来时，跨-agent 对比、连续 trace diff、批量导出与深链接能力仍可能不够。
 - 需要避免在 daemon 运行中直接用 sqlite 修改 shared memory sidecar 做复杂 live probe；这类验证更稳妥的做法仍然是 daemon 停止后做 DB 注入，或改造成 API/tool 可达路径。
 - 如果后续启动工作时不先读取本文件，分支纪律和连续性可能重新漂移。
 

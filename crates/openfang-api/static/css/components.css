@@ -1650,6 +1650,77 @@ mark.search-highlight {
   font-size: 10px;
 }
 .memory-trace-block-audit { margin-left: 0; margin-top: 0; }
+.memory-trace-hero {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+.memory-trace-hero-stats {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.memory-trace-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.memory-trace-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.memory-trace-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.memory-trace-card-title,
+.memory-trace-card-actions,
+.memory-trace-recall-head,
+.memory-trace-recall-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.memory-trace-card-time {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+.memory-trace-card-detail {
+  color: var(--text-dim);
+  font-size: 11px;
+  line-height: 1.6;
+}
+.memory-trace-card-recalls {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.memory-trace-source-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+.memory-trace-source-shared {
+  background: rgba(59,130,246,0.12);
+  color: var(--info);
+}
+.memory-trace-source-semantic {
+  background: rgba(16,185,129,0.12);
+  color: var(--success);
+}
+.memory-trace-source-unknown {
+  background: var(--surface2);
+  color: var(--text-dim);
+}
 
 /* Live log streaming indicator */
 .live-indicator {

@@ -4493,9 +4493,35 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
             <button class="btn btn-ghost btn-sm" @click="verifyChain()">Verify Chain</button>
             <span class="badge" :class="chainValid === true ? 'badge-running' : chainValid === false ? 'badge-crashed' : ''" x-text="chainValid === true ? 'VALID' : chainValid === false ? 'BROKEN' : ''" x-show="chainValid !== null"></span>
           </div>
+          <div class="flex gap-2 items-center" x-show="tab === 'memory'">
+            <span class="live-indicator" :class="connectionClass">
+              <span class="live-dot"></span>
+              <span x-text="connectionLabel"></span>
+            </span>
+            <select class="form-select" style="width:180px" x-model="memoryTraceAgentFilter">
+              <option value="">All Agents</option>
+              <template x-for="option in memoryTraceAgentOptions()" :key="'memory-agent-' + option.id">
+                <option :value="option.id" x-text="auditAgentName(option.id)"></option>
+              </template>
+            </select>
+            <select class="form-select" style="width:120px" x-model="memoryTraceModeFilter">
+              <option value="">All Modes</option>
+              <option value="hybrid">hybrid</option>
+              <option value="text_only">text_only</option>
+            </select>
+            <select class="form-select" style="width:130px" x-model="memoryTraceSourceFilter">
+              <option value="">All Sources</option>
+              <option value="shared">shared</option>
+              <option value="semantic">semantic</option>
+            </select>
+            <input class="form-input" style="width:180px" placeholder="Search trace..." x-model="memoryTraceTextFilter">
+            <button class="btn btn-ghost btn-sm" @click="clearMemoryTraceFilters()">Reset</button>
+            <button class="btn btn-ghost btn-sm" @click="exportMemoryTraces()">Export JSON</button>
+          </div>
         </div>
         <div class="tabs">
           <div class="tab" :class="{ active: tab === 'live' }" @click="tab = 'live'">Live</div>
+          <div class="tab" :class="{ active: tab === 'memory' }" @click="tab = 'memory'">Memory Trace</div>
           <div class="tab" :class="{ active: tab === 'audit' }" @click="tab = 'audit'; if (!auditEntries.length && !auditLoading) loadAudit()">Audit Trail</div>
         </div>
         <div class="page-body" x-init="startStreaming()">
@@ -4542,6 +4568,73 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                 <p class="hint">Activity will appear here as agents run.</p>
               </div>
             </div>
+            </div>
+          </div>
+
+          <!-- Memory trace tab -->
+          <div x-show="tab === 'memory'">
+            <div x-show="loading" class="loading-state"><div class="spinner"></div><span>Loading memory trace stream...</span></div>
+            <div x-show="!loading && loadError" class="error-state">
+              <span class="error-icon">!</span>
+              <p x-text="loadError"></p>
+              <button class="btn btn-ghost btn-sm" @click="loadData()">Retry</button>
+            </div>
+            <div x-show="!loading && !loadError">
+              <div class="card mb-4 memory-trace-hero">
+                <div>
+                  <div class="font-bold" style="font-size:13px;margin-bottom:4px">Prompt-Time Memory Trace</div>
+                  <div class="text-sm text-dim" style="line-height:1.6">
+                    Inspect fused prompt memory selection by agent, recall mode, and source. Entries below are sourced from the same live audit stream as the Logs tab.
+                  </div>
+                </div>
+                <div class="memory-trace-hero-stats">
+                  <span class="badge badge-created" x-text="memoryTraceCountLabel"></span>
+                </div>
+              </div>
+              <div class="memory-trace-list" x-show="filteredMemoryTraceEntries.length">
+                <template x-for="entry in filteredMemoryTraceEntries" :key="'memory-trace-card-' + entry.seq">
+                  <div class="card memory-trace-card">
+                    <div class="memory-trace-card-header">
+                      <div class="memory-trace-card-title">
+                        <span class="memory-trace-card-time" x-text="new Date(entry.timestamp).toLocaleString()"></span>
+                        <span class="badge badge-dim" x-text="auditAgentName(entry.agent_id)"></span>
+                        <template x-if="memoryTracePayload(entry)">
+                          <span class="badge badge-created" x-text="memoryTracePayload(entry).semantic_mode || 'unknown'"></span>
+                        </template>
+                      </div>
+                      <div class="memory-trace-card-actions">
+                        <button class="btn btn-ghost btn-sm" @click="copyMemoryTracePayload(entry)" x-text="copiedMemoryTraceToken === 'payload-' + entry.seq ? 'Copied JSON' : 'Copy JSON'"></button>
+                        <button class="btn btn-ghost btn-sm" x-show="memoryTraceHiddenRecallCount(entry) > 0 || isMemoryTraceExpanded(entry)" @click="toggleMemoryTraceExpanded(entry)" x-text="isMemoryTraceExpanded(entry) ? 'Collapse' : 'Expand'"></button>
+                      </div>
+                    </div>
+                    <div class="memory-trace-card-detail" x-text="entry.detail"></div>
+                    <div class="memory-trace-summary">
+                      <template x-for="(item, index) in memoryTraceSummary(entry)" :key="'memory-trace-card-summary-' + entry.seq + '-' + index">
+                        <span class="memory-trace-pill" x-text="item"></span>
+                      </template>
+                    </div>
+                    <div class="memory-trace-card-recalls" x-show="memoryTraceVisibleRecall(entry).length">
+                      <template x-for="recall in memoryTraceVisibleRecall(entry)" :key="'memory-trace-card-recall-' + entry.seq + '-' + recall.selected_rank + '-' + recall.source">
+                        <div class="memory-trace-recall">
+                          <div class="memory-trace-recall-head">
+                            <div class="memory-trace-recall-meta" x-text="memoryTraceMeta(recall)"></div>
+                            <div class="memory-trace-recall-actions">
+                              <span class="memory-trace-source-pill" :class="memoryTraceRecallSourceClass(recall)" x-text="recall.source"></span>
+                              <button class="btn btn-ghost btn-sm" @click="copyMemoryTraceRecall(entry, recall)" x-text="copiedMemoryTraceToken === 'recall-' + entry.seq + '-' + recall.selected_rank ? 'Copied' : 'Copy recall'"></button>
+                            </div>
+                          </div>
+                          <div class="memory-trace-recall-text" x-text="recall.rendered"></div>
+                        </div>
+                      </template>
+                    </div>
+                    <div class="memory-trace-more" x-show="memoryTraceHiddenRecallCount(entry) > 0" x-text="'+' + memoryTraceHiddenRecallCount(entry) + ' more recall candidates hidden'"></div>
+                  </div>
+                </template>
+              </div>
+              <div class="empty-state" x-show="!filteredMemoryTraceEntries.length">
+                <h4>No memory trace entries match</h4>
+                <p class="hint">Run an agent turn that hits memory recall, or relax the current trace filters.</p>
+              </div>
             </div>
           </div>
 
