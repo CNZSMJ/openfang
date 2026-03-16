@@ -9,7 +9,7 @@
 
 ## 当前阶段
 
-- `phase-2-embedding-hybrid-retrieval`
+- `phase-2-embedding-hybrid-retrieval (completed)`
 
 ## 基线分支
 
@@ -30,7 +30,7 @@
 
 ## 当前目标
 
-- 在 `phase2-embedding-hybrid-retrieval` 分支上开始 Phase 2，围绕 governed shared memory 设计并落地 embedding / hybrid retrieval 的接线顺序与验证路径。
+- 完成 `phase-2-embedding-hybrid-retrieval` 收口，并为下一阶段 `prompt architecture` 的 attention governance / section arbitration 做切换准备。
 
 ## 已完成
 
@@ -659,18 +659,75 @@
         证明 pinning / persistent inspection workspace 已真实进入服务端静态资源输出
       - 隔离 daemon 的 `/api/budget` 中 `daily_spend = 0.0051612`，`/api/budget/agents` 中 `assistant` 的 `daily_cost_usd = 0.0051612`
       - 验证完成后，隔离 daemon 与整个 `/tmp/openfang-memory-trace-pin-live` home 已清理
+  - 已完成 Phase 2 第十四批 independent memory-debug workspace 收口：
+    - dashboard 现在不再只有 `Logs -> Memory Trace` 这一条 inspection 入口，而是新增独立 `Memory Debug` page：
+      - sidebar Monitor 区新增 `Memory Debug`
+      - `#memory-trace` 成为独立 hash route
+      - 独立页面会直接固定到 `memory` inspection 模式，不再暴露 live/audit tabs
+    - `openfang-api/static/js/pages/logs.js` 现在支持按页面模式工作：
+      - `logsPage('logs')`
+      - `logsPage('memory-trace')`
+      - standalone `Memory Debug` page 下 `Copy Link` 会生成 `#memory-trace` 链接，不再携带 `logs_tab`
+    - 原先的 Memory Trace deep-link / pinning / compare / raw payload / export 能力全部保留，并被独立 workspace 复用，没有再分叉第二套 inspection 语义
+    - Logs 页仍保留原来的 `Memory Trace` tab，兼容已有 usage；独立 `Memory Debug` page 则作为 Phase 2 对 inspection surface 的正式收口入口
+  - 已完成本轮 independent memory-debug workspace 验证：
+    - `node` 级 standalone-route smoke 通过：
+      - `logsPage('memory-trace')` 在 `?mt_agent=agent-9&mt_pinned=1#memory-trace` 下会自动恢复：
+        - `tab = memory`
+        - `memoryTracePinnedOnly = true`
+      - `syncLogsUrlState()` 生成的链接保持 `#memory-trace`，并写回 `mt_agent` / `mt_pinned` / `mt_mode`，不再写 `logs_tab`
+    - `cargo build --workspace --lib`
+    - `cargo test --workspace`
+    - `cargo clippy --workspace --all-targets -- -D warnings`
+    - `cargo build -p openfang-cli`
+    - live independent-workspace verification 通过：
+      - 在隔离的 `OPENFANG_HOME=/tmp/openfang-memory-trace-workspace-live` 上，以 `127.0.0.1:4217` 启动临时 daemon
+      - 使用隔离 daemon 自带 `assistant` agent，通过 memory API 写入 shared probe `project.alpha.workspace_status = { summary = "QA signoff pending", blocker = "memory debug workspace verification", owner = "release" }`
+      - 第一轮真实询问 `What is blocking the alpha launch?`，第二轮注入 semantic phrase `WORKSPACE-SEM-20260317-024814`，随后执行 `POST /api/agents/{id}/session/reset`
+      - 第三轮真实询问 `What is blocking the alpha launch, and what is the workspace probe phrase you were told to remember?`，回复同时返回：
+        - shared blocker `memory debug workspace verification`
+        - semantic phrase `WORKSPACE-SEM-20260317-024814`
+      - `GET /api/audit/recent?n=30` 中真实返回三条 `MemoryTrace` entry，形成 shared-only / shared+semantic / shared+2 semantic 的 inspection 输入
+      - `curl http://127.0.0.1:4217/` 的 dashboard HTML 中已出现：
+        - `Memory Debug`
+        - `Open Workspace`
+        - `Open Logs`
+        - `memory-trace`
+        - `Pinned Traces`
+        - `mt_pinned`
+        证明独立 workspace 路由、导航与 memory inspection surface 已真实进入服务端静态资源输出
+      - 隔离 daemon 的 `/api/budget` 中 `daily_spend = 0.005888300000000001`，`/api/budget/agents` 中 `assistant` 的 `daily_cost_usd = 0.005888300000000001`
+      - 验证完成后，隔离 daemon 与整个 `/tmp/openfang-memory-trace-workspace-live` home 已清理
+  - 已完成 Phase 2 `embedding-hybrid-retrieval` 收口：
+    - retrieval 主链路已覆盖：
+      - semantic hybrid recall
+      - governed shared memory + semantic fusion
+      - weighted source fusion helper
+      - prompt memory context shared contract
+    - observability / telemetry 已覆盖：
+      - `llm.log` 文本 `*** MEMORY TRACE`
+      - structured tracing telemetry
+      - audit-backed `/api/logs/stream` / `/api/audit/recent`
+    - inspection surface 已覆盖：
+      - Logs/Audit inspection
+      - dedicated `Memory Trace` tab
+      - compare / raw payload / export
+      - shareable inspection URL
+      - persisted pinned trace workspace
+      - independent `Memory Debug` page
+    - Phase 2 当前不再有未收口的 retrieval / trace / inspection 缺口；后续工作转入 Phase 3 `prompt architecture`
 
 ## 进行中
 
-- 继续推进 Phase 2：shared retrieval helper 现在已经覆盖 semantic/shared candidate、memory context message、文本 trace、structured tracing telemetry，以及 audit/API/dashboard inspection；dashboard 侧的 `Memory Trace` 也已有 dedicated tab、compare、raw payload、shareable inspection URL 和 pinned trace workspace。下一步继续评估是否需要把它上提成独立的 memory-debug workspace，而不再挂在通用 Logs 页下。
+- Phase 2 已完成。下一步切换到 `prompt architecture` 阶段，重点收口 prompt section 职责去重、attention budget 治理与跨 section 冲突仲裁。
 
 ## 下一步动作
 
-- 继续观察 governed metadata 的显式 `source_weight` / `tie_break_priority` 是否需要引入更多 lifecycle bucket 或 namespace/kind-specific weight，而不只是当前 query/lifecycle/promotion 三元组合。
-- 评估是否要把当前 `Logs -> Memory Trace` tab 再上提成独立 memory-debug workspace，例如：
-  - 对同一 agent 的连续 `MemoryTrace` 做 timeline / diff 视图
-  - 在现有 pinning 之上补充批量 bookmark、命名 pinned sets 或跨设备同步的 inspection state
-- 评估是否要把 `prompt_builder` 中残留的 memory-context wrapper 也进一步裁薄，避免共享 contract 之上再保留一层重复命名。
+- 切换到 Phase 3 `prompt architecture`：
+  - 继续梳理 `AGENTS.md` / `USER.md` / `TOOLS.md` / `MEMORY.md` 的职责去重与模板收敛
+  - 引入 prompt attention / token budget 治理，减少跨 section 冗余和注意力漂移
+  - 明确 `USER.md` / `MEMORY.md` / KV recall / governed signals 之间的冲突优先级
+- 将 `Memory Debug` workspace 视作 Phase 2 已完成资产；后续若继续增强，只作为 Phase 3+ 的 inspection 优化，例如 timeline/diff、命名 pinned sets 或跨设备同步
 - 在切换电脑或结束一轮实质性工作前，持续更新本文件。
 
 ## 风险与阻塞
@@ -681,7 +738,8 @@
   - `tracing::info!` 结构化字段
   - audit-backed `/api/logs/stream` `MemoryTrace` 事件
   - dashboard `Logs -> Memory Trace` dedicated tab
-  但当前 dashboard 仍然是复用通用 Logs 页，并不是独立的 memory inspection workspace；当 trace 密度再上来时，跨-agent 深链接、连续 trace timeline/diff、批量导出与 compare selection 持久化能力仍可能不够。
+  - dashboard `Memory Debug` independent workspace
+  当前 retrieval / trace / inspection 链路已经收口；后续如果 trace 密度继续上升，timeline/diff、命名 pinned sets 与跨设备同步更像是 Phase 3+ 的 inspection 增强，而不再是 Phase 2 阻塞项。
 - 需要避免在 daemon 运行中直接用 sqlite 修改 shared memory sidecar 做复杂 live probe；这类验证更稳妥的做法仍然是 daemon 停止后做 DB 注入，或改造成 API/tool 可达路径。
 - 如果后续启动工作时不先读取本文件，分支纪律和连续性可能重新漂移。
 

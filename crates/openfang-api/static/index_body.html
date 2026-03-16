@@ -92,6 +92,10 @@
               <span class="nav-icon"><svg viewBox="0 0 24 24"><path d="m4 17 6-6-6-6"/><path d="M12 19h8"/></svg></span>
               <span class="nav-label">Logs</span>
             </a>
+            <a class="nav-item" :class="{ active: page === 'memory-trace' }" @click="navigate('memory-trace')" :aria-current="page === 'memory-trace' ? 'page' : false">
+              <span class="nav-icon"><svg viewBox="0 0 24 24"><path d="M9 3h6"/><path d="M12 3v5"/><path d="M6 8h12"/><path d="M6 12h4"/><path d="M14 12h4"/><path d="M6 16h12"/><path d="M8 21h8"/></svg></span>
+              <span class="nav-label">Memory Debug</span>
+            </a>
           </div>
         </template>
       </div>
@@ -4466,11 +4470,11 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
     </template>
 
     <!-- Page: Logs -->
-    <template x-if="page === 'logs'">
-      <div x-data="logsPage">
+    <template x-if="page === 'logs' || page === 'memory-trace'">
+      <div x-data="logsPage(page === 'memory-trace' ? 'memory-trace' : 'logs')">
         <div class="page-header">
-          <h2>Logs</h2>
-          <div class="flex gap-2 items-center" x-show="tab === 'live'">
+          <h2 x-text="isStandaloneMemoryTracePage() ? 'Memory Debug' : 'Logs'"></h2>
+          <div class="flex gap-2 items-center" x-show="tab === 'live' && !isStandaloneMemoryTracePage()">
             <!-- Connection status indicator -->
             <span class="live-indicator" :class="connectionClass">
               <span class="live-dot"></span>
@@ -4489,7 +4493,7 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
             <div class="toggle" :class="{ active: autoRefresh }" @click="autoRefresh = !autoRefresh" title="Auto-scroll"></div>
             <span class="text-xs text-dim" x-text="autoRefresh ? 'Auto-scroll' : 'Scroll locked'"></span>
           </div>
-          <div class="flex gap-2 items-center" x-show="tab === 'audit'">
+          <div class="flex gap-2 items-center" x-show="tab === 'audit' && !isStandaloneMemoryTracePage()">
             <button class="btn btn-ghost btn-sm" @click="verifyChain()">Verify Chain</button>
             <span class="badge" :class="chainValid === true ? 'badge-running' : chainValid === false ? 'badge-crashed' : ''" x-text="chainValid === true ? 'VALID' : chainValid === false ? 'BROKEN' : ''" x-show="chainValid !== null"></span>
           </div>
@@ -4522,14 +4526,14 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
             <button class="btn btn-ghost btn-sm" @click="exportMemoryTraces()">Export JSON</button>
           </div>
         </div>
-        <div class="tabs">
+        <div class="tabs" x-show="!isStandaloneMemoryTracePage()">
           <div class="tab" :class="{ active: tab === 'live' }" @click="setLogsTab('live')">Live</div>
           <div class="tab" :class="{ active: tab === 'memory' }" @click="setLogsTab('memory')">Memory Trace</div>
           <div class="tab" :class="{ active: tab === 'audit' }" @click="setLogsTab('audit')">Audit Trail</div>
         </div>
         <div class="page-body" x-init="initLogsPage()">
           <!-- Live logs tab -->
-          <div x-show="tab === 'live'">
+          <div x-show="tab === 'live' && !isStandaloneMemoryTracePage()">
             <div x-show="loading" class="loading-state"><div class="spinner"></div><span>Connecting to log stream...</span></div>
             <div x-show="!loading && loadError" class="error-state">
               <span class="error-icon">!</span>
@@ -4586,12 +4590,12 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
               <div class="card mb-4 memory-trace-hero">
                 <div>
                   <div class="font-bold" style="font-size:13px;margin-bottom:4px">Prompt-Time Memory Trace</div>
-                  <div class="text-sm text-dim" style="line-height:1.6">
-                    Inspect fused prompt memory selection by agent, recall mode, and source. Entries below are sourced from the same live audit stream as the Logs tab.
-                  </div>
+                  <div class="text-sm text-dim" style="line-height:1.6" x-text="isStandaloneMemoryTracePage() ? 'Inspect fused prompt memory selection in a dedicated workspace. This view uses the same live audit stream, but stays focused on recall inspection and compare workflows.' : 'Inspect fused prompt memory selection by agent, recall mode, and source. Entries below are sourced from the same live audit stream as the Logs tab.'"></div>
                 </div>
                 <div class="memory-trace-hero-stats">
                   <span class="badge badge-created" x-text="memoryTraceCountLabel"></span>
+                  <button class="btn btn-ghost btn-sm" x-show="!isStandaloneMemoryTracePage()" @click="location.hash='memory-trace'">Open Workspace</button>
+                  <button class="btn btn-ghost btn-sm" x-show="isStandaloneMemoryTracePage()" @click="location.hash='logs'">Open Logs</button>
                 </div>
               </div>
               <div class="card mb-4 memory-trace-pinned" x-show="memoryTracePinnedEntries.length">
@@ -4772,7 +4776,7 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
           </div>
 
           <!-- Audit trail tab -->
-          <div x-show="tab === 'audit'">
+          <div x-show="tab === 'audit' && !isStandaloneMemoryTracePage()">
             <div x-show="auditLoading" class="loading-state"><div class="spinner"></div><span>Loading audit log...</span></div>
             <div x-show="!auditLoading && auditLoadError" class="error-state">
               <span class="error-icon">!</span>

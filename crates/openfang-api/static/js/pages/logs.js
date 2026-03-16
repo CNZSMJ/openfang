@@ -1,8 +1,9 @@
 // OpenFang Logs Page — Real-time log viewer (SSE streaming + polling fallback) + Audit Trail tab
 'use strict';
 
-function logsPage() {
+function logsPage(pageName) {
   return {
+    pageName: pageName || 'logs',
     tab: 'live',
     // -- Live logs state --
     entries: [],
@@ -53,9 +54,13 @@ function logsPage() {
 
     applyLogsUrlState: function() {
       var params = new URLSearchParams(window.location.search || '');
-      var logsTab = params.get('logs_tab');
-      if (logsTab === 'live' || logsTab === 'memory' || logsTab === 'audit') {
-        this.tab = logsTab;
+      if (this.isStandaloneMemoryTracePage()) {
+        this.tab = 'memory';
+      } else {
+        var logsTab = params.get('logs_tab');
+        if (logsTab === 'live' || logsTab === 'memory' || logsTab === 'audit') {
+          this.tab = logsTab;
+        }
       }
       this.memoryTraceAgentFilter = params.get('mt_agent') || '';
       this.memoryTraceModeFilter = params.get('mt_mode') || '';
@@ -76,8 +81,12 @@ function logsPage() {
 
     buildLogsUrl: function() {
       var url = new URL(window.location.href);
-      url.hash = 'logs';
-      url.searchParams.set('logs_tab', this.tab);
+      url.hash = this.pageName || 'logs';
+      if (this.isStandaloneMemoryTracePage()) {
+        url.searchParams.delete('logs_tab');
+      } else {
+        url.searchParams.set('logs_tab', this.tab);
+      }
       if (this.memoryTraceAgentFilter) url.searchParams.set('mt_agent', this.memoryTraceAgentFilter);
       else url.searchParams.delete('mt_agent');
       if (this.memoryTraceModeFilter) url.searchParams.set('mt_mode', this.memoryTraceModeFilter);
@@ -98,6 +107,7 @@ function logsPage() {
     },
 
     setLogsTab: function(tab) {
+      if (this.isStandaloneMemoryTracePage() && tab !== 'memory') return;
       this.tab = tab;
       if (tab === 'audit' && !this.auditEntries.length && !this.auditLoading) {
         this.loadAudit();
@@ -295,6 +305,10 @@ function logsPage() {
     memoryTraceRecallSourceClass: function(recall) {
       if (!recall || !recall.source) return 'memory-trace-source-unknown';
       return recall.source === 'shared' ? 'memory-trace-source-shared' : 'memory-trace-source-semantic';
+    },
+
+    isStandaloneMemoryTracePage: function() {
+      return this.pageName === 'memory-trace';
     },
 
     memoryTracePinStorageKey: function() {

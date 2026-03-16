@@ -260,7 +260,7 @@ function app() {
       });
 
       // Hash routing
-      var validPages = ['overview','agents','sessions','approvals','comms','workflows','scheduler','channels','skills','hands','analytics','logs','runtime','settings','wizard'];
+      var validPages = ['overview','agents','sessions','approvals','comms','workflows','scheduler','channels','skills','hands','analytics','logs','memory-trace','runtime','settings','wizard'];
       var pageRedirects = {
         'chat': 'agents',
         'templates': 'agents',
@@ -268,6 +268,9 @@ function app() {
         'cron': 'scheduler',
         'schedules': 'scheduler',
         'memory': 'sessions',
+        'memory-debug': 'memory-trace',
+        'memorytrace': 'memory-trace',
+        'memory_debug': 'memory-trace',
         'audit': 'logs',
         'security': 'settings',
         'peers': 'settings',
