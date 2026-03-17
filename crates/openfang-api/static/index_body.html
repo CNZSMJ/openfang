@@ -911,7 +911,7 @@
                 </div>
                 <div class="tabs" style="margin-bottom:16px">
                   <div class="tab" :class="{ active: detailTab === 'info' }" @click="detailTab = 'info'">Info</div>
-                  <div class="tab" :class="{ active: detailTab === 'files' }" @click="detailTab = 'files'; loadAgentFiles()">Files</div>
+                  <div class="tab" :class="{ active: detailTab === 'files' }" @click="detailTab = 'files'; loadAgentFiles(); loadMemoryAutoconvergePlan()">Files</div>
                   <div class="tab" :class="{ active: detailTab === 'config' }" @click="detailTab = 'config'; loadToolFilters()">Config</div>
                 </div>
 
@@ -986,6 +986,89 @@
 
                 <!-- Tab: Files -->
                 <div x-show="detailTab === 'files'">
+                  <div class="card" style="margin-bottom:12px;padding:14px">
+                    <div class="flex justify-between items-start gap-2" style="margin-bottom:8px">
+                      <div>
+                        <div class="card-header" style="padding:0;border:none">Managed MEMORY.md Snapshot</div>
+                        <p class="text-sm text-dim" style="margin:6px 0 0 0;line-height:1.6">Audit governed promotion candidates before writing the managed autoconverged block into this agent workspace <code>MEMORY.md</code>.</p>
+                      </div>
+                      <span class="badge" :class="memoryAutoconvergePlan && memoryAutoconvergePlan.summary && memoryAutoconvergePlan.summary.can_apply ? 'badge-running' : 'badge-idle'" x-text="memoryAutoconvergePlan && memoryAutoconvergePlan.summary ? (memoryAutoconvergePlan.summary.can_apply ? 'Ready' : 'Needs Cleanup') : 'Not Audited'"></span>
+                    </div>
+                    <div class="flex gap-2 items-center" style="flex-wrap:wrap;margin-bottom:10px">
+                      <label class="text-xs text-dim" for="agent-memory-autoconverge-limit">Limit</label>
+                      <input id="agent-memory-autoconverge-limit" class="form-input" type="number" min="1" max="64" style="width:88px" x-model="memoryAutoconvergeLimit">
+                      <button class="btn btn-ghost btn-sm" @click="loadMemoryAutoconvergePlan()" :disabled="memoryAutoconvergeLoading || memoryAutoconvergeApplying">
+                        <span x-show="!memoryAutoconvergeLoading">Audit MEMORY.md</span>
+                        <span x-show="memoryAutoconvergeLoading">Auditing...</span>
+                      </button>
+                      <button class="btn btn-ghost btn-sm" @click="openMemoryAutoconvergePreview()" :disabled="!memoryAutoconvergePlan">Open Preview</button>
+                      <button class="btn btn-primary btn-sm" @click="applyMemoryAutoconverge()" :disabled="memoryAutoconvergeApplying || !memoryAutoconvergePlan || !memoryAutoconvergePlan.summary || !memoryAutoconvergePlan.summary.can_apply">
+                        <span x-show="!memoryAutoconvergeApplying">Apply Managed Snapshot</span>
+                        <span x-show="memoryAutoconvergeApplying">Applying...</span>
+                      </button>
+                    </div>
+                    <div class="text-xs text-dim" x-show="memoryAutoconvergeRanAt" x-text="'Last audit: ' + new Date(memoryAutoconvergeRanAt).toLocaleString()"></div>
+                    <div class="alert alert-danger" style="margin-top:10px" x-show="memoryAutoconvergeError" x-text="memoryAutoconvergeError"></div>
+                    <template x-if="memoryAutoconvergePlan && memoryAutoconvergePlan.summary">
+                      <div style="margin-top:12px">
+                        <div class="grid grid-cols-4 gap-2" style="margin-bottom:12px">
+                          <div class="card" style="padding:10px">
+                            <div class="text-xs text-dim">Managed Entries</div>
+                            <div class="text-lg font-bold" x-text="memoryAutoconvergePlan.summary.managed_entries || 0"></div>
+                          </div>
+                          <div class="card" style="padding:10px">
+                            <div class="text-xs text-dim">Already Curated</div>
+                            <div class="text-lg font-bold" x-text="memoryAutoconvergePlan.summary.already_curated || 0"></div>
+                          </div>
+                          <div class="card" style="padding:10px">
+                            <div class="text-xs text-dim">Stale Review</div>
+                            <div class="text-lg font-bold" x-text="memoryAutoconvergePlan.summary.stale_review || 0"></div>
+                          </div>
+                          <div class="card" style="padding:10px">
+                            <div class="text-xs text-dim">Cleanup Blockers</div>
+                            <div class="text-lg font-bold" x-text="memoryAutoconvergePlan.summary.cleanup_blockers || 0"></div>
+                          </div>
+                        </div>
+                        <div class="text-xs text-dim" x-show="memoryAutoconvergePlan.path" x-text="'Target: ' + memoryAutoconvergePlan.path"></div>
+                        <div style="margin-top:10px" x-show="memoryAutoconvergePlan.candidates && memoryAutoconvergePlan.candidates.length">
+                          <div class="text-xs text-dim" style="margin-bottom:6px">Managed snapshot candidates</div>
+                          <template x-for="candidate in memoryAutoconvergePlan.candidates" :key="candidate.key">
+                            <div class="file-list-item" style="cursor:default">
+                              <div style="min-width:0">
+                                <div class="font-mono" style="font-size:12px;word-break:break-all" x-text="candidate.key"></div>
+                                <div class="text-xs text-dim" x-text="candidate.rendered"></div>
+                              </div>
+                              <span class="badge" x-text="candidate.section"></span>
+                            </div>
+                          </template>
+                        </div>
+                        <div style="margin-top:10px" x-show="memoryAutoconvergePlan.stale_review && memoryAutoconvergePlan.stale_review.length">
+                          <div class="text-xs text-dim" style="margin-bottom:6px">Review before apply</div>
+                          <template x-for="signal in memoryAutoconvergePlan.stale_review" :key="signal.key">
+                            <div class="file-list-item" style="cursor:default">
+                              <div style="min-width:0">
+                                <div class="font-mono" style="font-size:12px;word-break:break-all" x-text="signal.key"></div>
+                                <div class="text-xs text-dim" x-text="'lifecycle=' + signal.lifecycle.state + ', review_at=' + signal.lifecycle.review_at"></div>
+                              </div>
+                              <span class="badge" x-text="signal.metadata.kind"></span>
+                            </div>
+                          </template>
+                        </div>
+                        <div style="margin-top:10px" x-show="memoryAutoconvergePlan.cleanup_blockers && memoryAutoconvergePlan.cleanup_blockers.length">
+                          <div class="text-xs text-dim" style="margin-bottom:6px">Cleanup blockers</div>
+                          <template x-for="finding in memoryAutoconvergePlan.cleanup_blockers" :key="finding.key + '-' + finding.action">
+                            <div class="file-list-item" style="cursor:default">
+                              <div style="min-width:0">
+                                <div class="font-mono" style="font-size:12px;word-break:break-all" x-text="finding.key"></div>
+                                <div class="text-xs text-dim" x-text="finding.canonical_key || finding.metadata_key || ''"></div>
+                              </div>
+                              <span class="badge" x-text="finding.action"></span>
+                            </div>
+                          </template>
+                        </div>
+                      </div>
+                    </template>
+                  </div>
                   <div x-show="filesLoading" class="text-center text-dim" style="padding:24px">Loading files...</div>
                   <div x-show="!filesLoading && !editingFile">
                     <template x-for="file in agentFiles" :key="file.name">
@@ -998,12 +1081,20 @@
                   </div>
                   <div x-show="editingFile">
                     <div class="flex justify-between items-center mb-2">
-                      <span class="font-bold font-mono" x-text="editingFile"></span>
+                      <div class="flex items-center gap-2">
+                        <span class="font-bold font-mono" x-text="editingFile"></span>
+                        <span class="badge" x-show="memoryAutoconvergePreviewing">Managed Preview</span>
+                      </div>
                       <button class="btn btn-ghost btn-sm" @click="closeFileEditor()">&larr; Back</button>
                     </div>
                     <textarea class="file-editor" x-model="fileContent" style="width:100%;height:280px;resize:vertical"></textarea>
+                    <div class="text-xs text-dim" style="margin-top:8px" x-show="memoryAutoconvergePreviewing">This editor is showing the proposed managed snapshot. Use the autoconverge apply action instead of saving manually to preserve audit semantics.</div>
                     <div class="flex gap-2 mt-2">
-                      <button class="btn btn-primary btn-sm" @click="saveFile()" :disabled="fileSaving"><span x-show="!fileSaving">Save</span><span x-show="fileSaving">Saving...</span></button>
+                      <button class="btn btn-primary btn-sm" @click="saveFile()" :disabled="fileSaving || memoryAutoconvergePreviewing"><span x-show="!fileSaving">Save</span><span x-show="fileSaving">Saving...</span></button>
+                      <button class="btn btn-primary btn-sm" x-show="memoryAutoconvergePreviewing" @click="applyMemoryAutoconverge()" :disabled="memoryAutoconvergeApplying || !memoryAutoconvergePlan || !memoryAutoconvergePlan.summary || !memoryAutoconvergePlan.summary.can_apply">
+                        <span x-show="!memoryAutoconvergeApplying">Apply Managed Snapshot</span>
+                        <span x-show="memoryAutoconvergeApplying">Applying...</span>
+                      </button>
                       <button class="btn btn-ghost btn-sm" @click="closeFileEditor()">Cancel</button>
                     </div>
                   </div>

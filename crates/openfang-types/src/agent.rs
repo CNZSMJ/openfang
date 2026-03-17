@@ -336,6 +336,8 @@ impl ToolProfile {
                 "memory_store",
                 "memory_recall",
                 "memory_list",
+                "memory_cleanup",
+                "memory_autoconverge",
                 "tool_search",
                 "tool_get_instructions",
             ],
@@ -351,6 +353,8 @@ impl ToolProfile {
                 "memory_store",
                 "memory_recall",
                 "memory_list",
+                "memory_cleanup",
+                "memory_autoconverge",
                 "tool_search",
                 "tool_get_instructions",
             ],
@@ -871,20 +875,24 @@ mod tests {
         assert!(tools.contains(&"agent_send".to_string()));
         assert!(tools.contains(&"memory_recall".to_string()));
         assert!(tools.contains(&"memory_list".to_string()));
+        assert!(tools.contains(&"memory_cleanup".to_string()));
+        assert!(tools.contains(&"memory_autoconverge".to_string()));
         assert!(tools.contains(&"tool_search".to_string()));
         assert!(tools.contains(&"tool_get_instructions".to_string()));
         assert!(!tools.contains(&"skill_search".to_string()));
-        assert_eq!(tools.len(), 7);
+        assert_eq!(tools.len(), 9);
     }
 
     #[test]
     fn test_tool_profile_automation() {
         let tools = ToolProfile::Automation.tools();
         assert!(tools.contains(&"memory_list".to_string()));
+        assert!(tools.contains(&"memory_cleanup".to_string()));
+        assert!(tools.contains(&"memory_autoconverge".to_string()));
         assert!(tools.contains(&"tool_search".to_string()));
         assert!(tools.contains(&"tool_get_instructions".to_string()));
         assert!(!tools.contains(&"skill_search".to_string()));
-        assert_eq!(tools.len(), 13);
+        assert_eq!(tools.len(), 15);
     }
 
     #[test]

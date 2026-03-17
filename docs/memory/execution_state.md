@@ -9,7 +9,7 @@
 
 ## 当前阶段
 
-- `phase-3-prompt-architecture (completed)`
+- `phase-4-assistant-memory-autoconverge (completed)`
 
 ## 基线分支
 
@@ -17,11 +17,11 @@
 
 ## 当前工作分支
 
-- `phase3-prompt-architecture`
+- `phase4-assistant-memory-autoconverge`
 
 ## 当前 worktree 路径
 
-- `/Users/huangjiahao/workspace/openfang-0.1.0/phase3-prompt-architecture`
+- `/Users/huangjiahao/workspace/openfang-0.1.0/phase4-assistant-memory-autoconverge`
 
 ## 设计文档
 
@@ -30,7 +30,7 @@
 
 ## 当前目标
 
-- 完成 `phase-3-prompt-architecture` 收口，并为下一阶段 `assistant memory autoconverge` 做切换准备。
+- Phase 4 已完成收口：assistant 已具备 `MEMORY.md` managed snapshot 的 audit/apply API、runtime tool、自举 prompt guidance 与 dashboard review/apply surface，形成完整的 review / write-back 闭环。
 
 ## 已完成
 
@@ -739,22 +739,111 @@
     - `llm.log` 的 `[Memory context]` 中已真实出现 `Priority reminder: current user request and workspace guidance outrank recalled memory...`
     - live prompt 中 `Prefer bullet lists.` 跨 `USER.md` / `MEMORY.md` 去重后只保留一次
     - `/api/budget` 与 `/api/budget/agents` 在隔离 daemon 上均出现真实 spend 增量，证明验证使用的是当前新二进制而不是旧进程
+- 已完成 Phase 4 第一批 `MEMORY.md` autoconverge audit/apply 落地：
+  - `openfang-types::memory` 新增受管 `MEMORY.md` autoconverge plan：
+    - `build_memory_autoconverge_plan`
+    - `MemoryAutoconvergePlan` / `MemoryAutoconvergeSummary`
+    - `MemoryAutoconvergeCandidate` / `MemoryAutoconvergeSection`
+  - autoconverge 现在会：
+    - 只消费 active 的 governed promotion candidates
+    - 把 `preference` / `profile` / `constraint` 归入 `Durable User Context`
+    - 把 `decision` / `project_state` 等 durable 事实归入 `Stable Reference Facts`
+    - 跳过已经在手工 `MEMORY.md` 中出现的条目，避免重复灌入
+    - 用 `<!-- OPENFANG_AUTOCONVERGE_BEGIN --> ... <!-- OPENFANG_AUTOCONVERGE_END -->` 维护一段可重建的 managed block，而不覆盖手工编辑区
+    - 显式暴露 cleanup blockers 与 stale-review signals；若 shared memory 仍有治理异常，则 `can_apply=false`
+  - `openfang-api` 新增 `/api/agents/{id}/memory/autoconverge`：
+    - `GET` 返回 audit plan、候选条目、cleanup blockers、stale review 与当前/提议中的 `MEMORY.md`
+    - `POST {"apply":true}` 会原子写回 agent workspace `MEMORY.md`，并记录 `ConfigChange` audit event
+  - 新增单测覆盖：
+    - active promotion candidates 会生成 managed MEMORY snapshot
+    - 已人工收录的条目会被跳过，旧 managed block 会被替换/清除
+    - cleanup blockers 与 stale-review 会进入 autoconverge review plan
+  - 已完成本轮验证：
+    - `cargo build --workspace --lib`
+    - `cargo test --workspace`
+    - `cargo clippy --workspace --all-targets -- -D warnings`
+    - `cargo build -p openfang-cli`
+    - live autoconverge API 验证通过：
+      - 使用隔离 `OPENFANG_HOME=/tmp/openfang-phase4-step1-live.6PwM4f`，以当前调试二进制启动 daemon 于 `127.0.0.1:4219`
+      - 通过 memory API 写入 `pref.autocvg.reply_style` 与 `project.alpha.autocvg_status` 两条 durable governed probe
+      - `GET /api/agents/{assistant_id}/memory/autoconverge` 返回：
+        - `can_apply=true`
+        - `promotion_candidates=2`
+        - `managed_entries=2`
+        - `cleanup_blockers=0`
+      - `POST /api/agents/{assistant_id}/memory/autoconverge {"apply":true}` 返回 `status=applied`
+      - 随后 `GET /api/agents/{assistant_id}/files/MEMORY.md` 真实读回：
+        - `<!-- OPENFANG_AUTOCONVERGE_BEGIN -->`
+        - `## Autoconverged Memory Snapshot`
+        - `[pref.autocvg.reply_style] Prefer bullet lists in direct answers.`
+        - `[project.alpha.autocvg_status] Alpha launch remains blocked on QA signoff.`
+      - 二次 audit 时 `changed=false`，证明 managed block 可稳定重放，不会每次 apply 都产生无意义 diff
+      - 同轮尝试真实 `/api/agents/{assistant_id}/message` 时，隔离 home 因缺少 `MINIMAX_API_KEY` 返回 `Boot failed: Agent LLM driver init failed`；本轮 live 先收口新 endpoint 的真实持久化链路，后续需要在带 provider key 的环境下补齐 LLM spend 验证
+- 已完成 Phase 4 第二批 autoconverge self-serve 闭环落地：
+  - `openfang-runtime::tool_runner` 新增 builtin tool `memory_autoconverge`：
+    - 支持 `apply` / `limit`
+    - 可直接 audit/apply agent workspace `MEMORY.md` managed block
+    - `apply=true` 且存在 cleanup blockers 时会返回 `status=blocked`，不会写入脏快照
+    - 成功 apply 时会原子写回 `MEMORY.md` 并记录 `ConfigChange` audit event
+  - `openfang-runtime::prompt_builder` 与 `openfang-kernel::wizard` 已把 `memory_autoconverge` 纳入 memory capability 指导：
+    - prompt memory guidance 现在会直接提示 assistant 用它审阅/应用 managed snapshot
+    - setup wizard 也会把它与 `memory_cleanup` 串成“先治理 shared memory，再收敛 `MEMORY.md`”的操作路径
+  - dashboard review/apply surface 已补齐：
+    - `Agents -> Files` 新增 `Managed MEMORY.md Snapshot` 审阅面板
+    - 支持 `limit`、audit、preview、apply 与 summary cards
+    - file editor 进入 managed preview 后会阻止手工保存，改为显式走 `Apply Managed Snapshot`
+  - 收口过程中发现并修复了一个真实 live bug：
+    - 真实 agent 首轮 `/api/agents/{id}/message` 无法看到 `memory_autoconverge`
+    - 根因是 `openfang-kernel::kernel::available_tools()` 对“未显式限制 tools 的 agent”仍错误要求 `Capability::ToolInvoke(...)`，导致 builtin tool 暴露不完整
+    - 修复后，未显式限制 tools 的 agent 会按预期拿到全部 builtin tools
+    - 同时把 `memory_cleanup` / `memory_autoconverge` 纳入 `ToolProfile::Messaging` 与 `ToolProfile::Automation`，避免 profile agent 再次缺失这两个 memory maintenance tool
+  - 已完成本轮验证：
+    - `cargo build --workspace --lib`
+    - `cargo test --workspace`
+    - `cargo clippy --workspace --all-targets -- -D warnings`
+    - `cargo build -p openfang-cli`
+    - live autoconverge tool + dashboard wiring 验证通过：
+      - 使用当前调试二进制在默认 `127.0.0.1:4200` 启动 daemon，并确认 `/api/health` 返回 `{"status":"ok","version":"0.4.0"}`
+      - 临时创建 `phase4-autoconverge-verifier-20260317` agent，写入 `pref.phase4_autoconverge.reply_style` 与 `project.alpha.phase4_autoconverge_status` 两条 durable governed probe
+      - `GET /api/agents/{verifier_id}/memory/autoconverge?limit=8` 返回：
+        - `managed_entries=2`
+        - `promotion_candidates=2`
+        - `cleanup_blockers=6`
+        - `can_apply=false`
+      - 真实 `/api/agents/{verifier_id}/message` 指定“仅调用 `memory_autoconverge` 且 `apply=false`”后，agent 成功返回两条 candidate key，并明确报告存在 cleanup blockers
+      - verifier workspace 的 `llm.log` 中已真实出现：
+        - `memory_autoconverge (review or apply the managed MEMORY.md snapshot)` tool hint
+        - `Use memory_autoconverge ...` guidance 文本
+        - 真实 tool call：`name: "memory_autoconverge", input={"apply":false,"limit":8}`
+      - `/api/budget` 中本轮 verifier 的真实 LLM 调用已产生 spend 增量，证明接入的是当前新二进制而不是死代码路径
+- 已完成 Phase 4 `assistant-memory-autoconverge` 收口：
+  - autoconverge 主链路已覆盖：
+    - governed shared memory promotion candidate audit/apply API
+    - runtime `memory_autoconverge` tool
+    - prompt / wizard self-serve guidance
+    - dashboard review / preview / apply workspace
+    - `MEMORY.md` managed block 原子写回与 audit logging
+  - live 验证已覆盖：
+    - endpoint 持久化链路
+    - 真实 LLM tool invocation
+    - tool exposure bug 修复后回归验证
+    - spend side effect
+  - Phase 4 当前不再有阻塞收口的实现缺口；后续如需增强，只属于 Phase 4 之后的增量优化，而不影响本阶段完成判定。
 
 ## 进行中
 
-- Phase 3 已完成。下一步切换到 `assistant memory autoconverge` 阶段，重点收口 assistant 专属 `MEMORY.md` 的生成、更新、晋升与自动收敛策略。
+- 无。Phase 4 已完成收口，当前分支已进入收尾与交付状态。
 
 ## 下一步动作
 
-- 切换到 Phase 4 `assistant memory autoconverge`：
-  - 设计 assistant 专属 `MEMORY.md` 的生成、合并、审阅与回写策略
-  - 把 promotion candidates、cleanup / attention signals 与 `MEMORY.md` 维护形成更稳定的闭环
-  - 继续把 `Memory Debug` workspace 视作已完成资产；后续仅在 autoconverge/inspection 需要时补充 timeline/diff、命名 pinned sets 或跨设备同步
+- 保持当前 daemon 运行并确认健康状态，作为 Phase 4 交付完成时的最终运行态。
+- 等待用户决定是否从当前收口分支切回主线，或开启下一阶段工作。
 - 在切换电脑或结束一轮实质性工作前，持续更新本文件。
 
 ## 风险与阻塞
 
 - 当前现有 agent 的 tool-call 路径存在两类既有兼容问题：`assistant` 的 gemini path 仍有 `thought_signature` 错误，`Researcher` 的 MiniMax path 也出现了 tool-result id 不匹配；因此本轮 dashboard cleanup live LLM verification 同样改用临时无工具 MiniMax verifier agent 完成。
+- 本轮已确认 `memory_autoconverge` 的 tool exposure 问题已经修复；若后续再出现“builtin tool 在真实 agent 中不可见”的症状，优先回看 `available_tools()` 与 tool profile 的组合过滤逻辑，而不是只检查 prompt builder。
 - Phase 2 现在已经把 `MEMORY_TRACE` 同步到了：
   - `llm.log` 文本 trace
   - `tracing::info!` 结构化字段

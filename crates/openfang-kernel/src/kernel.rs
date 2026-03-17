@@ -5352,7 +5352,7 @@ impl OpenFangKernel {
             all_tools.retain(|t| t.name != "shell_exec");
         }
 
-        if caps.iter().any(|c| matches!(c, Capability::ToolAll)) {
+        if tools_unrestricted || caps.iter().any(|c| matches!(c, Capability::ToolAll)) {
             return all_tools;
         }
 
