@@ -21,6 +21,7 @@ pub enum AuditAction {
     AgentSpawn,
     AgentKill,
     AgentMessage,
+    MemoryTrace,
     MemoryAccess,
     FileAccess,
     NetworkAccess,
@@ -124,6 +125,7 @@ impl AuditLog {
                         "AgentSpawn" => AuditAction::AgentSpawn,
                         "AgentKill" => AuditAction::AgentKill,
                         "AgentMessage" => AuditAction::AgentMessage,
+                        "MemoryTrace" => AuditAction::MemoryTrace,
                         "MemoryAccess" => AuditAction::MemoryAccess,
                         "FileAccess" => AuditAction::FileAccess,
                         "NetworkAccess" => AuditAction::NetworkAccess,
@@ -418,5 +420,44 @@ mod tests {
         // Verify tip is correct
         let entries = log2.recent(3);
         assert_eq!(entries[2].prev_hash, entries[1].hash);
+    }
+
+    #[test]
+    fn test_memory_trace_roundtrips_through_persistent_audit_log() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE audit_entries (
+                seq INTEGER PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                action TEXT NOT NULL,
+                detail TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                prev_hash TEXT NOT NULL,
+                hash TEXT NOT NULL
+            )",
+        )
+        .unwrap();
+
+        let db = Arc::new(Mutex::new(conn));
+        let log = AuditLog::with_db(Arc::clone(&db));
+        let payload = serde_json::json!({
+            "semantic_mode": "hybrid",
+            "selected_fused_recall": [
+                {"selected_rank": 1, "source": "shared"}
+            ]
+        });
+        log.record(
+            "agent-1",
+            AuditAction::MemoryTrace,
+            "semantic_mode=hybrid semantic_candidates=1 shared_candidates=1 selected_fused_recall_count=1",
+            payload.to_string(),
+        );
+
+        let restored = AuditLog::with_db(Arc::clone(&db));
+        let entries = restored.recent(1);
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(entries[0].action, AuditAction::MemoryTrace));
+        assert_eq!(entries[0].outcome, payload.to_string());
     }
 }

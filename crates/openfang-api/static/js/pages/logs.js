@@ -1,8 +1,9 @@
 // OpenFang Logs Page — Real-time log viewer (SSE streaming + polling fallback) + Audit Trail tab
 'use strict';
 
-function logsPage() {
+function logsPage(pageName) {
   return {
+    pageName: pageName || 'logs',
     tab: 'live',
     // -- Live logs state --
     entries: [],
@@ -26,6 +27,93 @@ function logsPage() {
     filterAction: '',
     auditLoading: false,
     auditLoadError: '',
+
+    // -- Memory trace inspection state --
+    memoryTraceAgentFilter: '',
+    memoryTraceModeFilter: '',
+    memoryTraceSourceFilter: '',
+    memoryTraceTextFilter: '',
+    memoryTracePinnedOnly: false,
+    memoryTracePins: [],
+    expandedMemoryTraceSeqs: {},
+    expandedMemoryTracePayloadSeqs: {},
+    memoryTraceCompareSeqs: [],
+    copiedMemoryTraceToken: '',
+    _copiedMemoryTraceTimer: null,
+    _popStateHandler: null,
+
+    initLogsPage: function() {
+      this.loadPersistedMemoryTracePins();
+      this.applyLogsUrlState();
+      this._popStateHandler = function() {
+        this.applyLogsUrlState();
+      }.bind(this);
+      window.addEventListener('popstate', this._popStateHandler);
+      this.startStreaming();
+    },
+
+    applyLogsUrlState: function() {
+      var params = new URLSearchParams(window.location.search || '');
+      if (this.isStandaloneMemoryTracePage()) {
+        this.tab = 'memory';
+      } else {
+        var logsTab = params.get('logs_tab');
+        if (logsTab === 'live' || logsTab === 'memory' || logsTab === 'audit') {
+          this.tab = logsTab;
+        }
+      }
+      this.memoryTraceAgentFilter = params.get('mt_agent') || '';
+      this.memoryTraceModeFilter = params.get('mt_mode') || '';
+      this.memoryTraceSourceFilter = params.get('mt_source') || '';
+      this.memoryTraceTextFilter = params.get('mt_q') || '';
+      this.memoryTracePinnedOnly = params.get('mt_pinned') === '1';
+      this.memoryTraceCompareSeqs = this.parseMemoryTraceCompareSeqs(params.get('mt_compare'));
+    },
+
+    parseMemoryTraceCompareSeqs: function(raw) {
+      if (!raw) return [];
+      return raw
+        .split(',')
+        .map(function(part) { return Number(String(part).trim()); })
+        .filter(function(seq) { return Number.isFinite(seq) && seq > 0; })
+        .slice(0, 2);
+    },
+
+    buildLogsUrl: function() {
+      var url = new URL(window.location.href);
+      url.hash = this.pageName || 'logs';
+      if (this.isStandaloneMemoryTracePage()) {
+        url.searchParams.delete('logs_tab');
+      } else {
+        url.searchParams.set('logs_tab', this.tab);
+      }
+      if (this.memoryTraceAgentFilter) url.searchParams.set('mt_agent', this.memoryTraceAgentFilter);
+      else url.searchParams.delete('mt_agent');
+      if (this.memoryTraceModeFilter) url.searchParams.set('mt_mode', this.memoryTraceModeFilter);
+      else url.searchParams.delete('mt_mode');
+      if (this.memoryTraceSourceFilter) url.searchParams.set('mt_source', this.memoryTraceSourceFilter);
+      else url.searchParams.delete('mt_source');
+      if (this.memoryTraceTextFilter) url.searchParams.set('mt_q', this.memoryTraceTextFilter);
+      else url.searchParams.delete('mt_q');
+      if (this.memoryTracePinnedOnly) url.searchParams.set('mt_pinned', '1');
+      else url.searchParams.delete('mt_pinned');
+      if (this.memoryTraceCompareSeqs.length) url.searchParams.set('mt_compare', this.memoryTraceCompareSeqs.join(','));
+      else url.searchParams.delete('mt_compare');
+      return url;
+    },
+
+    syncLogsUrlState: function() {
+      window.history.replaceState({}, '', this.buildLogsUrl().toString());
+    },
+
+    setLogsTab: function(tab) {
+      if (this.isStandaloneMemoryTracePage() && tab !== 'memory') return;
+      this.tab = tab;
+      if (tab === 'audit' && !this.auditEntries.length && !this.auditLoading) {
+        this.loadAudit();
+      }
+      this.syncLogsUrlState();
+    },
 
     startStreaming: function() {
       var self = this;
@@ -96,7 +184,7 @@ function logsPage() {
       this.fetchLogs();
       if (this._pollTimer) clearInterval(this._pollTimer);
       this._pollTimer = setInterval(function() {
-        if (self.autoRefresh && !self.hovering && self.tab === 'live' && !self.streamPaused) {
+        if (self.autoRefresh && !self.hovering && (self.tab === 'live' || self.tab === 'memory') && !self.streamPaused) {
           self.fetchLogs();
         }
       }, 2000);
@@ -151,6 +239,409 @@ function logsPage() {
       return 'info';
     },
 
+    isMemoryTrace: function(entry) {
+      return !!(entry && entry.action === 'MemoryTrace' && entry.payload && typeof entry.payload === 'object');
+    },
+
+    memoryTracePayload: function(entry) {
+      return this.isMemoryTrace(entry) ? entry.payload : null;
+    },
+
+    memoryTraceSummary: function(entry) {
+      var payload = this.memoryTracePayload(entry);
+      if (!payload) return [];
+      return [
+        String(payload.semantic_mode || 'unknown'),
+        String(payload.semantic_candidates || 0) + ' semantic',
+        String(payload.shared_candidates || 0) + ' shared',
+        String(payload.maintenance_signals || 0) + ' maintenance',
+        String(payload.attention_signals || 0) + ' attention',
+        String(payload.session_summaries || 0) + ' session',
+        String((payload.selected_fused_recall || []).length) + ' selected'
+      ];
+    },
+
+    memoryTraceSelectedRecall: function(entry) {
+      var payload = this.memoryTracePayload(entry);
+      if (!payload || !Array.isArray(payload.selected_fused_recall)) return [];
+      return payload.selected_fused_recall.slice(0, 3);
+    },
+
+    memoryTraceOverflowCount: function(entry) {
+      var payload = this.memoryTracePayload(entry);
+      if (!payload || !Array.isArray(payload.selected_fused_recall)) return 0;
+      return Math.max(payload.selected_fused_recall.length - 3, 0);
+    },
+
+    memoryTraceMeta: function(recall) {
+      if (!recall) return '';
+      var weight = typeof recall.source_weight === 'number' ? recall.source_weight.toFixed(3) : '?';
+      var score = typeof recall.fused_score === 'number' ? recall.fused_score.toFixed(5) : '?';
+      return '#' + recall.selected_rank + ' ' + recall.source + ' r' + recall.source_rank + ' · w=' + weight + ' · t=' + recall.tie_break_priority + ' · score=' + score;
+    },
+
+    memoryTraceAllRecall: function(entry) {
+      var payload = this.memoryTracePayload(entry);
+      return payload && Array.isArray(payload.selected_fused_recall) ? payload.selected_fused_recall : [];
+    },
+
+    memoryTracePayloadJson: function(entry) {
+      if (!this.isMemoryTrace(entry)) return '';
+      return JSON.stringify(entry.payload || {}, null, 2);
+    },
+
+    previewText: function(value, limit) {
+      if (!value) return '';
+      var text = String(value);
+      if (text.length <= limit) return text;
+      return text.slice(0, Math.max(limit - 1, 1)) + '…';
+    },
+
+    auditOutcomePreview: function(entry) {
+      if (this.isMemoryTrace(entry)) return '';
+      return this.previewText(entry && entry.outcome ? entry.outcome : '', 160);
+    },
+
+    memoryTraceRecallSourceClass: function(recall) {
+      if (!recall || !recall.source) return 'memory-trace-source-unknown';
+      return recall.source === 'shared' ? 'memory-trace-source-shared' : 'memory-trace-source-semantic';
+    },
+
+    isStandaloneMemoryTracePage: function() {
+      return this.pageName === 'memory-trace';
+    },
+
+    memoryTracePinStorageKey: function() {
+      return 'openfang.memoryTracePins.v1';
+    },
+
+    normalizeMemoryTraceSnapshot: function(entry) {
+      if (!this.isMemoryTrace(entry)) return null;
+      return {
+        action: 'MemoryTrace',
+        seq: Number(entry.seq) || 0,
+        timestamp: entry.timestamp || '',
+        agent_id: entry.agent_id || '',
+        detail: entry.detail || '',
+        payload: entry.payload || {}
+      };
+    },
+
+    loadPersistedMemoryTracePins: function() {
+      try {
+        var raw = window.localStorage ? window.localStorage.getItem(this.memoryTracePinStorageKey()) : '';
+        if (!raw) {
+          this.memoryTracePins = [];
+          return;
+        }
+        var parsed = JSON.parse(raw);
+        if (!Array.isArray(parsed)) {
+          this.memoryTracePins = [];
+          return;
+        }
+        this.memoryTracePins = parsed
+          .map(function(entry) { return this.normalizeMemoryTraceSnapshot(entry); }.bind(this))
+          .filter(Boolean)
+          .slice(0, 24);
+      } catch (e) {
+        this.memoryTracePins = [];
+      }
+    },
+
+    persistMemoryTracePins: function() {
+      try {
+        if (!window.localStorage) return;
+        window.localStorage.setItem(this.memoryTracePinStorageKey(), JSON.stringify(this.memoryTracePins.slice(0, 24)));
+      } catch (e) {
+        // Ignore localStorage failures.
+      }
+    },
+
+    memoryTraceEntryBySeq: function(seq) {
+      if (!seq) return null;
+      var live = this.entries.find(function(entry) { return entry && entry.seq === seq; }) || null;
+      if (live) return live;
+      return this.memoryTracePins.find(function(entry) { return entry && entry.seq === seq; }) || null;
+    },
+
+    isMemoryTracePinned: function(entry) {
+      return !!(entry && this.memoryTracePins.some(function(pin) { return pin && pin.seq === entry.seq; }));
+    },
+
+    toggleMemoryTracePinned: function(entry) {
+      var snapshot = this.normalizeMemoryTraceSnapshot(entry);
+      var pins;
+      if (!snapshot) return;
+      if (this.isMemoryTracePinned(snapshot)) {
+        pins = this.memoryTracePins.filter(function(pin) { return pin && pin.seq !== snapshot.seq; });
+      } else {
+        pins = [snapshot].concat(this.memoryTracePins.filter(function(pin) { return pin && pin.seq !== snapshot.seq; }));
+      }
+      this.memoryTracePins = pins.slice(0, 24);
+      this.persistMemoryTracePins();
+      if (this.memoryTracePinnedOnly) this.syncLogsUrlState();
+    },
+
+    clearMemoryTracePins: function() {
+      this.memoryTracePins = [];
+      this.persistMemoryTracePins();
+      if (this.memoryTracePinnedOnly) this.syncLogsUrlState();
+    },
+
+    toggleMemoryTracePinnedOnly: function() {
+      this.memoryTracePinnedOnly = !this.memoryTracePinnedOnly;
+      this.syncLogsUrlState();
+    },
+
+    get memoryTracePinnedEntries() {
+      var self = this;
+      return this.memoryTracePins
+        .map(function(pin) { return self.memoryTraceEntryBySeq(pin.seq) || pin; })
+        .filter(Boolean)
+        .sort(function(a, b) {
+          return String(b.timestamp || '').localeCompare(String(a.timestamp || ''));
+        });
+    },
+
+    get memoryTracePinnedCountLabel() {
+      return this.memoryTracePinnedEntries.length + ' pinned traces';
+    },
+
+    memoryTraceAgentOptions: function() {
+      var seen = {};
+      var options = [];
+      this.entries.forEach(function(entry) {
+        if (!entry || !entry.agent_id || !entry.payload || seen[entry.agent_id]) return;
+        seen[entry.agent_id] = true;
+        options.push({ id: entry.agent_id, label: entry.agent_id });
+      });
+      options.sort(function(a, b) {
+        return a.label.localeCompare(b.label);
+      });
+      return options;
+    },
+
+    memoryTraceMatchesFilters: function(entry) {
+      if (!this.isMemoryTrace(entry)) return false;
+      var payload = entry.payload || {};
+      if (this.memoryTraceAgentFilter && entry.agent_id !== this.memoryTraceAgentFilter) return false;
+      if (this.memoryTraceModeFilter && payload.semantic_mode !== this.memoryTraceModeFilter) return false;
+      if (this.memoryTraceSourceFilter) {
+        var recalls = Array.isArray(payload.selected_fused_recall) ? payload.selected_fused_recall : [];
+        var hasSource = recalls.some(function(recall) { return recall && recall.source === this.memoryTraceSourceFilter; }.bind(this));
+        if (!hasSource) return false;
+      }
+      if (this.memoryTraceTextFilter) {
+        var haystack = (
+          (entry.detail || '') + ' ' +
+          (entry.agent_id || '') + ' ' +
+          JSON.stringify(payload || {})
+        ).toLowerCase();
+        if (haystack.indexOf(this.memoryTraceTextFilter.toLowerCase()) === -1) return false;
+      }
+      if (this.memoryTracePinnedOnly && !this.isMemoryTracePinned(entry)) return false;
+      return true;
+    },
+
+    get filteredMemoryTraceEntries() {
+      var self = this;
+      return this.entries
+        .filter(function(entry) { return self.memoryTraceMatchesFilters(entry); })
+        .slice()
+        .reverse();
+    },
+
+    get memoryTraceCountLabel() {
+      return this.filteredMemoryTraceEntries.length + ' of ' + this.entries.filter(this.isMemoryTrace).length + ' traces';
+    },
+
+    isMemoryTraceExpanded: function(entry) {
+      return !!(entry && this.expandedMemoryTraceSeqs[entry.seq]);
+    },
+
+    toggleMemoryTraceExpanded: function(entry) {
+      if (!entry) return;
+      if (this.expandedMemoryTraceSeqs[entry.seq]) {
+        delete this.expandedMemoryTraceSeqs[entry.seq];
+      } else {
+        this.expandedMemoryTraceSeqs[entry.seq] = true;
+      }
+      this.expandedMemoryTraceSeqs = Object.assign({}, this.expandedMemoryTraceSeqs);
+    },
+
+    isMemoryTracePayloadExpanded: function(entry) {
+      return !!(entry && this.expandedMemoryTracePayloadSeqs[entry.seq]);
+    },
+
+    toggleMemoryTracePayload: function(entry) {
+      if (!entry) return;
+      if (this.expandedMemoryTracePayloadSeqs[entry.seq]) {
+        delete this.expandedMemoryTracePayloadSeqs[entry.seq];
+      } else {
+        this.expandedMemoryTracePayloadSeqs[entry.seq] = true;
+      }
+      this.expandedMemoryTracePayloadSeqs = Object.assign({}, this.expandedMemoryTracePayloadSeqs);
+    },
+
+    memoryTraceVisibleRecall: function(entry) {
+      var payload = this.memoryTracePayload(entry);
+      var recalls = payload && Array.isArray(payload.selected_fused_recall) ? payload.selected_fused_recall : [];
+      return this.isMemoryTraceExpanded(entry) ? recalls : recalls.slice(0, 2);
+    },
+
+    memoryTraceHiddenRecallCount: function(entry) {
+      var payload = this.memoryTracePayload(entry);
+      var recalls = payload && Array.isArray(payload.selected_fused_recall) ? payload.selected_fused_recall : [];
+      return Math.max(recalls.length - this.memoryTraceVisibleRecall(entry).length, 0);
+    },
+
+    clearMemoryTraceFilters: function() {
+      this.memoryTraceAgentFilter = '';
+      this.memoryTraceModeFilter = '';
+      this.memoryTraceSourceFilter = '';
+      this.memoryTraceTextFilter = '';
+      this.memoryTracePinnedOnly = false;
+      this.syncLogsUrlState();
+    },
+
+    copyMemoryTraceText: async function(text, token) {
+      if (!text) return;
+      try {
+        await navigator.clipboard.writeText(text);
+        this.copiedMemoryTraceToken = token;
+        if (this._copiedMemoryTraceTimer) clearTimeout(this._copiedMemoryTraceTimer);
+        this._copiedMemoryTraceTimer = setTimeout(function() {
+          this.copiedMemoryTraceToken = '';
+        }.bind(this), 1800);
+        OpenFangToast.success('Copied to clipboard');
+      } catch(e) {
+        OpenFangToast.error('Copy failed');
+      }
+    },
+
+    copyMemoryTracePayload: function(entry) {
+      if (!this.isMemoryTrace(entry)) return;
+      var payload = JSON.stringify(entry.payload || {}, null, 2);
+      return this.copyMemoryTraceText(payload, 'payload-' + entry.seq);
+    },
+
+    copyMemoryTraceRecall: function(entry, recall) {
+      if (!recall) return;
+      return this.copyMemoryTraceText(recall.rendered || '', 'recall-' + entry.seq + '-' + recall.selected_rank);
+    },
+
+    copyMemoryTraceAllRecalls: function(entry) {
+      var text = this.memoryTraceAllRecall(entry)
+        .map(function(recall) { return recall && recall.rendered ? recall.rendered : ''; })
+        .filter(Boolean)
+        .join('\n\n');
+      return this.copyMemoryTraceText(text, 'all-recall-' + entry.seq);
+    },
+
+    exportMemoryTraces: function() {
+      var traces = this.filteredMemoryTraceEntries.map(function(entry) {
+        return {
+          seq: entry.seq,
+          timestamp: entry.timestamp,
+          agent_id: entry.agent_id,
+          detail: entry.detail,
+          payload: entry.payload
+        };
+      });
+      var blob = new Blob([JSON.stringify(traces, null, 2)], { type: 'application/json' });
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement('a');
+      a.href = url;
+      a.download = 'openfang-memory-traces-' + new Date().toISOString().slice(0, 10) + '.json';
+      a.click();
+      URL.revokeObjectURL(url);
+    },
+
+    copyMemoryTraceLink: function() {
+      return this.copyMemoryTraceText(this.buildLogsUrl().toString(), 'memory-link');
+    },
+
+    memoryTraceCompareSlot: function(entry) {
+      if (!entry) return 0;
+      var index = this.memoryTraceCompareSeqs.indexOf(entry.seq);
+      return index >= 0 ? index + 1 : 0;
+    },
+
+    memoryTraceCompareButtonLabel: function(entry) {
+      var slot = this.memoryTraceCompareSlot(entry);
+      if (slot === 1) return 'Compared A';
+      if (slot === 2) return 'Compared B';
+      return this.memoryTraceCompareSeqs.length < 2 ? 'Add Compare' : 'Replace Compare';
+    },
+
+    toggleMemoryTraceCompare: function(entry) {
+      if (!entry) return;
+      var seqs = this.memoryTraceCompareSeqs.slice();
+      var index = seqs.indexOf(entry.seq);
+      if (index >= 0) {
+        seqs.splice(index, 1);
+      } else {
+        if (seqs.length >= 2) seqs.shift();
+        seqs.push(entry.seq);
+      }
+      this.memoryTraceCompareSeqs = seqs;
+      this.syncLogsUrlState();
+    },
+
+    clearMemoryTraceCompare: function() {
+      this.memoryTraceCompareSeqs = [];
+      this.syncLogsUrlState();
+    },
+
+    get memoryTraceCompareEntries() {
+      var self = this;
+      return this.memoryTraceCompareSeqs
+        .map(function(seq) {
+          return self.memoryTraceEntryBySeq(seq);
+        })
+        .filter(Boolean);
+    },
+
+    memoryTraceRecallIdentity: function(recall) {
+      if (!recall) return '';
+      return String(recall.source || 'unknown') + '|' + String(recall.rendered || '');
+    },
+
+    memoryTraceCompareRecalls: function(fromEntry, toEntry) {
+      var target = {};
+      this.memoryTraceAllRecall(toEntry).forEach(function(recall) {
+        target[this.memoryTraceRecallIdentity(recall)] = true;
+      }.bind(this));
+      return this.memoryTraceAllRecall(fromEntry).filter(function(recall) {
+        return !!target[this.memoryTraceRecallIdentity(recall)];
+      }.bind(this));
+    },
+
+    memoryTraceCompareOnlyRecalls: function(fromEntry, otherEntry) {
+      var other = {};
+      this.memoryTraceAllRecall(otherEntry).forEach(function(recall) {
+        other[this.memoryTraceRecallIdentity(recall)] = true;
+      }.bind(this));
+      return this.memoryTraceAllRecall(fromEntry).filter(function(recall) {
+        return !other[this.memoryTraceRecallIdentity(recall)];
+      }.bind(this));
+    },
+
+    memoryTraceCompareSharedRecalls: function() {
+      if (this.memoryTraceCompareEntries.length < 2) return [];
+      return this.memoryTraceCompareRecalls(this.memoryTraceCompareEntries[0], this.memoryTraceCompareEntries[1]);
+    },
+
+    memoryTraceCompareOnlyARecalls: function() {
+      if (this.memoryTraceCompareEntries.length < 2) return [];
+      return this.memoryTraceCompareOnlyRecalls(this.memoryTraceCompareEntries[0], this.memoryTraceCompareEntries[1]);
+    },
+
+    memoryTraceCompareOnlyBRecalls: function() {
+      if (this.memoryTraceCompareEntries.length < 2) return [];
+      return this.memoryTraceCompareOnlyRecalls(this.memoryTraceCompareEntries[1], this.memoryTraceCompareEntries[0]);
+    },
+
     get filteredEntries() {
       var self = this;
       var levelF = this.levelFilter;
@@ -158,7 +649,7 @@ function logsPage() {
       return this.entries.filter(function(e) {
         if (levelF && self.classifyLevel(e.action) !== levelF) return false;
         if (textF) {
-          var haystack = ((e.action || '') + ' ' + (e.detail || '') + ' ' + (e.agent_id || '')).toLowerCase();
+          var haystack = ((e.action || '') + ' ' + (e.detail || '') + ' ' + (e.outcome || '') + ' ' + (e.agent_id || '') + ' ' + JSON.stringify(e.payload || '')).toLowerCase();
           if (haystack.indexOf(textF) === -1) return false;
         }
         return true;
@@ -227,7 +718,8 @@ function logsPage() {
         'ToolInvoke': 'Tool Used', 'ToolResult': 'Tool Completed', 'AgentMessage': 'Message',
         'NetworkAccess': 'Network Access', 'ShellExec': 'Shell Command', 'FileAccess': 'File Access',
         'MemoryAccess': 'Memory Access', 'AuthAttempt': 'Login Attempt', 'AuthSuccess': 'Login Success',
-        'AuthFailure': 'Login Failed', 'CapabilityDenied': 'Permission Denied', 'RateLimited': 'Rate Limited'
+        'AuthFailure': 'Login Failed', 'CapabilityDenied': 'Permission Denied', 'RateLimited': 'Rate Limited',
+        'MemoryTrace': 'Memory Trace'
       };
       return map[action] || action.replace(/([A-Z])/g, ' $1').trim();
     },
@@ -248,8 +740,13 @@ function logsPage() {
     },
 
     destroy: function() {
+      if (this._popStateHandler) {
+        window.removeEventListener('popstate', this._popStateHandler);
+        this._popStateHandler = null;
+      }
       if (this._eventSource) { this._eventSource.close(); this._eventSource = null; }
       if (this._pollTimer) { clearInterval(this._pollTimer); this._pollTimer = null; }
+      if (this._copiedMemoryTraceTimer) { clearTimeout(this._copiedMemoryTraceTimer); this._copiedMemoryTraceTimer = null; }
     }
   };
 }

@@ -557,12 +557,10 @@ impl SessionStore {
                 MessageContent::Blocks(blocks) => {
                     for block in blocks {
                         match block {
-                            ContentBlock::Text { text } => {
+                            ContentBlock::Text { text, .. } => {
                                 text_parts.push(text.clone());
                             }
-                            ContentBlock::ToolUse {
-                                id, name, input, ..
-                            } => {
+                            ContentBlock::ToolUse { id, name, input, .. } => {
                                 tool_parts.push(serde_json::json!({
                                     "type": "tool_use",
                                     "id": id,
@@ -587,9 +585,10 @@ impl SessionStore {
                                 text_parts.push(format!("[image: {media_type}]"));
                             }
                             ContentBlock::Thinking { thinking } => {
-                                // Safely truncate to 200 characters, not bytes
-                                let truncated: String = thinking.chars().take(200).collect();
-                                text_parts.push(format!("[thinking: {}]", truncated));
+                                text_parts.push(format!(
+                                    "[thinking: {}]",
+                                    openfang_types::truncate_str(thinking, 200)
+                                ));
                             }
                             ContentBlock::Unknown => {}
                         }

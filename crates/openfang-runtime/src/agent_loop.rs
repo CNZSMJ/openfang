@@ -4,8 +4,9 @@
 //! calling the LLM, executing tool calls, and saving the conversation.
 
 use crate::auth_cooldown::{CooldownVerdict, ProviderCooldown};
-use crate::context_budget::{apply_context_guard, truncate_tool_result_dynamic, ContextBudget};
-use crate::context_overflow::{recover_from_overflow, RecoveryStage};
+use crate::audit::AuditAction;
+use crate::context_budget::{ContextBudget, apply_context_guard, truncate_tool_result_dynamic};
+use crate::context_overflow::{RecoveryStage, recover_from_overflow};
 use crate::embedding::EmbeddingDriver;
 use crate::kernel_handle::KernelHandle;
 use crate::llm_driver::{CompletionRequest, LlmDriver, LlmError, StreamEvent};
@@ -14,23 +15,22 @@ use crate::loop_guard::{LoopGuard, LoopGuardConfig, LoopGuardVerdict};
 use crate::mcp::McpConnection;
 use crate::tool_runner;
 use crate::web_search::WebToolsContext;
-use openfang_memory::session::Session;
 use openfang_memory::MemorySubstrate;
+use openfang_memory::session::Session;
 use openfang_skills::registry::SkillRegistry;
 use openfang_types::agent::AgentId;
 use openfang_types::agent::AgentManifest;
 use openfang_types::error::{OpenFangError, OpenFangResult};
 use openfang_types::memory::{
-    Memory, MemoryFilter, MemoryFreshness, MemoryLifecycleState, MemorySource,
-    select_governed_memory_prompt_candidates_for_query,
-    summarize_memory_cleanup_for_orchestration,
-    summarize_governed_memory_orchestration_for_query,
+    Memory, MemoryContextRecallMode, MemoryFilter, MemorySource, PromptMemoryContextBuildOptions,
+    PromptMemoryContextTrace, build_prompt_memory_context,
+    build_prompt_memory_context_trace_telemetry, render_prompt_memory_context_trace,
 };
 use openfang_types::message::{
     ContentBlock, Message, MessageContent, Role, StopReason, TokenUsage,
 };
 use openfang_types::tool::{ToolCall, ToolDefinition};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
@@ -76,8 +76,7 @@ const MAX_BLOCK_TEXT_LOG_CHARS: usize = 1_500;
 /// Strip a provider prefix from a model ID before sending to the API.
 ///
 /// Many models are stored as `provider/org/model` (e.g. `openrouter/google/gemini-2.5-flash`)
-/// but the upstream API expects just `org/model`. This also handles special routers
-/// like `openrouter/auto` → `auto`.
+/// but the upstream API expects just `org/model` (e.g. `google/gemini-2.5-flash`).
 pub fn strip_provider_prefix(model: &str, provider: &str) -> String {
     let slash_prefix = format!("{}/", provider);
     let colon_prefix = format!("{}:", provider);
@@ -92,263 +91,6 @@ pub fn strip_provider_prefix(model: &str, provider: &str) -> String {
 
 /// Default context window size (tokens) for token-based trimming.
 const DEFAULT_CONTEXT_WINDOW: usize = 200_000;
-
-fn format_recalled_memory_fragments(
-    memories: &[openfang_types::memory::MemoryFragment],
-) -> Vec<String> {
-    let mut seen = HashSet::new();
-
-    memories
-        .iter()
-        .filter_map(|memory| {
-            let content = memory.content.trim();
-            if content.is_empty() {
-                return None;
-            }
-
-            let label = memory
-                .metadata
-                .get("key")
-                .and_then(|value| value.as_str())
-                .map(|key| format!("[{key}] "))
-                .or_else(|| {
-                    let scope = memory.scope.trim();
-                    (!scope.is_empty()).then(|| format!("[{scope}] "))
-                })
-                .unwrap_or_default();
-
-            let rendered = format!("{label}{}", openfang_types::truncate_str(content, 320));
-            if seen.insert(rendered.clone()) {
-                Some(rendered)
-            } else {
-                None
-            }
-        })
-        .take(5)
-        .collect()
-}
-
-#[cfg(test)]
-fn load_recent_session_summaries(
-    memory: &MemorySubstrate,
-    agent_id: AgentId,
-    limit: usize,
-) -> Vec<String> {
-    load_recent_session_summaries_from_entries(&memory.list_kv(agent_id).unwrap_or_default(), limit)
-}
-
-fn load_recent_session_summaries_from_entries(
-    entries: &[(String, serde_json::Value)],
-    limit: usize,
-) -> Vec<String> {
-    let mut summaries: Vec<(String, String)> = entries
-        .iter()
-        .filter_map(|(key, value)| {
-            if !key.starts_with("session_") {
-                return None;
-            }
-
-            let rendered = match value {
-                serde_json::Value::String(text) => text.clone(),
-                other => serde_json::to_string(&other).ok()?,
-            };
-
-            let rendered = rendered.trim();
-            if rendered.is_empty() {
-                return None;
-            }
-
-            Some((
-                key.clone(),
-                format!(
-                    "{}: {}",
-                    key,
-                    openfang_types::truncate_str(rendered, 320)
-                ),
-            ))
-        })
-        .collect();
-
-    summaries.sort_by(|a, b| b.0.cmp(&a.0));
-    summaries
-        .into_iter()
-        .take(limit)
-        .map(|(_, summary)| summary)
-        .collect()
-}
-
-fn render_memory_freshness(freshness: &MemoryFreshness) -> &'static str {
-    match freshness {
-        MemoryFreshness::Rolling => "rolling",
-        MemoryFreshness::Durable => "durable",
-        MemoryFreshness::Archival => "archival",
-    }
-}
-
-fn render_memory_lifecycle_state(state: MemoryLifecycleState) -> &'static str {
-    match state {
-        MemoryLifecycleState::Active => "active",
-        MemoryLifecycleState::Stale => "stale",
-        MemoryLifecycleState::Expired => "expired",
-    }
-}
-
-fn format_governed_memory_candidates(
-    user_message: &str,
-    entries: &[(String, serde_json::Value)],
-    limit: usize,
-) -> Vec<String> {
-    let mut seen = HashSet::new();
-
-    select_governed_memory_prompt_candidates_for_query(
-        entries,
-        chrono::Utc::now(),
-        limit,
-        Some(user_message),
-    )
-        .into_iter()
-        .filter_map(|candidate| {
-            let rendered_value = match candidate.value {
-                serde_json::Value::String(text) => text,
-                other => serde_json::to_string(&other).ok()?,
-            };
-            let rendered_value = rendered_value.trim();
-            if rendered_value.is_empty() {
-                return None;
-            }
-
-            let mut qualifiers = vec![
-                format!("kind={}", candidate.metadata.kind),
-                format!(
-                    "freshness={}",
-                    render_memory_freshness(&candidate.metadata.freshness)
-                ),
-                format!(
-                    "lifecycle={}",
-                    render_memory_lifecycle_state(candidate.lifecycle.state)
-                ),
-            ];
-            if !candidate.metadata.tags.is_empty() {
-                qualifiers.push(format!("tags={}", candidate.metadata.tags.join(",")));
-            }
-            if candidate.lifecycle.promotion_candidate {
-                qualifiers.push("promotion_candidate".to_string());
-            }
-
-            let rendered = format!(
-                "[{}] ({}) {}",
-                candidate.key,
-                qualifiers.join(", "),
-                openfang_types::truncate_str(rendered_value, 240)
-            );
-
-            if seen.insert(rendered.clone()) {
-                Some(rendered)
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
-fn format_governed_memory_orchestration_signals(
-    user_message: &str,
-    entries: &[(String, serde_json::Value)],
-    limit_per_bucket: usize,
-) -> Vec<String> {
-    let snapshot = summarize_governed_memory_orchestration_for_query(
-        entries,
-        chrono::Utc::now(),
-        limit_per_bucket,
-        Some(user_message),
-    );
-    let mut rendered = Vec::new();
-
-    for signal in snapshot.stale_review {
-        let mut qualifiers = vec![
-            format!("kind={}", signal.metadata.kind),
-            format!("review_at={}", signal.lifecycle.review_at.to_rfc3339()),
-        ];
-        if let Some(expires_at) = signal.lifecycle.expires_at {
-            qualifiers.push(format!("expires_at={}", expires_at.to_rfc3339()));
-        }
-        if !signal.metadata.tags.is_empty() {
-            qualifiers.push(format!("tags={}", signal.metadata.tags.join(",")));
-        }
-        rendered.push(format!(
-            "Review stale memory before reuse: [{}] ({})",
-            signal.key,
-            qualifiers.join(", ")
-        ));
-    }
-
-    for signal in snapshot.promotion_candidates {
-        let mut qualifiers = vec![
-            format!("kind={}", signal.metadata.kind),
-            format!(
-                "freshness={}",
-                render_memory_freshness(&signal.metadata.freshness)
-            ),
-            format!(
-                "lifecycle={}",
-                render_memory_lifecycle_state(signal.lifecycle.state)
-            ),
-        ];
-        if !signal.metadata.tags.is_empty() {
-            qualifiers.push(format!("tags={}", signal.metadata.tags.join(",")));
-        }
-        rendered.push(format!(
-            "Consider promoting to MEMORY.md: [{}] ({})",
-            signal.key,
-            qualifiers.join(", ")
-        ));
-    }
-
-    rendered
-}
-
-fn format_memory_cleanup_orchestration_signals(
-    entries: &[(String, serde_json::Value)],
-    limit_per_bucket: usize,
-) -> Vec<String> {
-    let snapshot = summarize_memory_cleanup_for_orchestration(entries, limit_per_bucket);
-    let mut rendered = Vec::new();
-
-    for signal in snapshot.legacy_repairs {
-        match signal.action {
-            openfang_types::memory::MemoryCleanupAction::MigrateLegacyKey => rendered.push(
-                format!(
-                    "Run memory_cleanup before reuse: migrate legacy key [{}] to [{}]",
-                    signal.key,
-                    signal.canonical_key.unwrap_or_else(|| "unknown".to_string())
-                ),
-            ),
-            openfang_types::memory::MemoryCleanupAction::DeleteLegacyKey => rendered.push(
-                format!(
-                    "Run memory_cleanup before reuse: delete duplicate legacy key [{}]",
-                    signal.key
-                ),
-            ),
-            _ => {}
-        }
-    }
-
-    for signal in snapshot.metadata_repairs {
-        rendered.push(format!(
-            "Run memory_cleanup to backfill governed metadata for [{}]",
-            signal.key
-        ));
-    }
-
-    for signal in snapshot.orphan_metadata {
-        rendered.push(format!(
-            "Run memory_cleanup to remove orphan metadata sidecar [{}]",
-            signal.metadata_key.unwrap_or(signal.key)
-        ));
-    }
-
-    rendered
-}
 
 fn load_governed_memory_entries(
     memory: &MemorySubstrate,
@@ -433,6 +175,7 @@ pub async fn run_agent_loop(
     hooks: Option<&crate::hooks::HookRegistry>,
     context_window_tokens: Option<usize>,
     process_manager: Option<&crate::process_manager::ProcessManager>,
+    user_content_blocks: Option<Vec<ContentBlock>>,
 ) -> OpenFangResult<AgentLoopResult> {
     run_agent_loop_with_session_message(
         manifest,
@@ -456,6 +199,7 @@ pub async fn run_agent_loop(
         hooks,
         context_window_tokens,
         process_manager,
+        user_content_blocks,
     )
     .await
 }
@@ -484,6 +228,7 @@ pub async fn run_agent_loop_with_session_message(
     hooks: Option<&crate::hooks::HookRegistry>,
     context_window_tokens: Option<usize>,
     process_manager: Option<&crate::process_manager::ProcessManager>,
+    user_content_blocks: Option<Vec<ContentBlock>>,
 ) -> OpenFangResult<AgentLoopResult> {
     info!(agent = %manifest.name, "Starting agent loop");
 
@@ -494,61 +239,82 @@ pub async fn run_agent_loop_with_session_message(
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
 
-    // Recall relevant memories — prefer vector similarity search when embedding driver is available
-    let _memories = if let Some(emb) = embedding_driver {
+    // Recall relevant memories — prefer hybrid recall when an embedding driver is available
+    let (semantic_recall_mode, _memories) = if let Some(emb) = embedding_driver {
         match emb.embed_one(user_message).await {
             Ok(query_vec) => {
-                debug!("Using vector recall (dims={})", query_vec.len());
-                memory
-                    .recall_with_embedding_async(
-                        user_message,
-                        5,
-                        Some(MemoryFilter {
-                            agent_id: Some(session.agent_id),
-                            ..Default::default()
-                        }),
-                        Some(&query_vec),
-                    )
-                    .await
-                    .unwrap_or_default()
+                debug!("Using hybrid recall (dims={})", query_vec.len());
+                (
+                    MemoryContextRecallMode::Hybrid,
+                    memory
+                        .recall_with_embedding_async(
+                            user_message,
+                            5,
+                            Some(MemoryFilter {
+                                agent_id: Some(session.agent_id),
+                                ..Default::default()
+                            }),
+                            Some(&query_vec),
+                        )
+                        .await
+                        .unwrap_or_default(),
+                )
             }
             Err(e) => {
-                warn!("Embedding recall failed, falling back to text search: {e}");
-                memory
-                    .recall(
-                        user_message,
-                        5,
-                        Some(MemoryFilter {
-                            agent_id: Some(session.agent_id),
-                            ..Default::default()
-                        }),
-                    )
-                    .await
-                    .unwrap_or_default()
+                warn!("Embedding recall failed, falling back to text-only search: {e}");
+                (
+                    MemoryContextRecallMode::TextOnly,
+                    memory
+                        .recall(
+                            user_message,
+                            5,
+                            Some(MemoryFilter {
+                                agent_id: Some(session.agent_id),
+                                ..Default::default()
+                            }),
+                        )
+                        .await
+                        .unwrap_or_default(),
+                )
             }
         }
     } else {
-        memory
-            .recall(
-                user_message,
-                5,
-                Some(MemoryFilter {
-                    agent_id: Some(session.agent_id),
-                    ..Default::default()
-                }),
-            )
-            .await
-            .unwrap_or_default()
+        (
+            MemoryContextRecallMode::TextOnly,
+            memory
+                .recall(
+                    user_message,
+                    5,
+                    Some(MemoryFilter {
+                        agent_id: Some(session.agent_id),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap_or_default(),
+        )
     };
     let structured_entries = memory.list_kv(session.agent_id).unwrap_or_default();
     let governed_entries = load_governed_memory_entries(memory, kernel.as_ref(), session.agent_id);
-    let memory_context_msg = crate::prompt_builder::build_memory_context_message(
-        &format_recalled_memory_fragments(&_memories),
-        &format_memory_cleanup_orchestration_signals(&governed_entries, 2),
-        &format_governed_memory_orchestration_signals(user_message, &governed_entries, 2),
-        &format_governed_memory_candidates(user_message, &governed_entries, 4),
-        &load_recent_session_summaries_from_entries(&structured_entries, 3),
+    let memory_context = build_prompt_memory_context(
+        user_message,
+        semantic_recall_mode,
+        &_memories,
+        &governed_entries,
+        &structured_entries,
+        &PromptMemoryContextBuildOptions::default(),
+        chrono::Utc::now(),
     );
+    let memory_context_msg =
+        crate::prompt_builder::build_memory_context_message(&memory_context);
+    emit_prompt_memory_context_trace(
+        workspace_root,
+        &manifest.name,
+        session.agent_id,
+        kernel.as_ref(),
+        &memory_context.trace,
+    )
+    .await;
 
     // Fire BeforePromptBuild hook
     let agent_id_str = session.agent_id.0.to_string();
@@ -570,7 +336,13 @@ pub async fn run_agent_loop_with_session_message(
     let system_prompt = manifest.model.system_prompt.clone();
 
     // Add the user message to session history.
-    session.messages.push(session_user_message);
+    // When content blocks are provided (e.g. text + image from a channel),
+    // use multimodal message format so the LLM receives the image for vision.
+    if let Some(blocks) = user_content_blocks {
+        session.messages.push(Message::user_with_blocks(blocks));
+    } else {
+        session.messages.push(session_user_message);
+    }
 
     // Build the messages for the LLM, filtering system messages
     // System prompt goes into the separate `system` field
@@ -615,6 +387,10 @@ pub async fn run_agent_loop_with_session_message(
             "Trimming old messages to prevent context overflow"
         );
         trim_messages_for_prepended_context(&mut messages, prepended_messages.len());
+        // Re-validate after trimming: the drain may have split a ToolUse/ToolResult
+        // pair across the cut boundary, leaving orphaned blocks that cause the LLM
+        // to return empty responses (input_tokens=0).
+        messages = crate::session_repair::validate_and_repair(&messages);
     }
     if !prepended_messages.is_empty() {
         messages.splice(0..0, prepended_messages);
@@ -668,8 +444,12 @@ pub async fn run_agent_loop_with_session_message(
         debug!(iteration, "Agent loop iteration");
 
         // Context overflow recovery pipeline (replaces emergency_trim_messages)
-        let recovery =
-            recover_from_overflow(&mut messages, &system_prompt, tool_runner.visible_tools(), ctx_window);
+        let recovery = recover_from_overflow(
+            &mut messages,
+            &system_prompt,
+            tool_runner.visible_tools(),
+            ctx_window,
+        );
         if recovery == RecoveryStage::FinalError {
             warn!("Context overflow unrecoverable — suggest /reset or /compact");
         }
@@ -712,7 +492,10 @@ pub async fn run_agent_loop_with_session_message(
         // Log LLM Output
         let output_log = format!(
             "Response: {}\nTool Calls: {:?}\nStop Reason: {:?}\nUsage: {:?}",
-            response.text(), response.tool_calls, response.stop_reason, response.usage
+            response.text(),
+            response.tool_calls,
+            response.stop_reason,
+            response.usage
         );
         log_llm_event(workspace_root, "OUTPUT", &api_model, &output_log).await;
 
@@ -726,8 +509,7 @@ pub async fn run_agent_loop_with_session_message(
             StopReason::EndTurn | StopReason::StopSequence
         ) && response.tool_calls.is_empty()
         {
-            let recovered =
-                recover_text_tool_calls(&response.text(), tool_runner.visible_tools());
+            let recovered = recover_text_tool_calls(&response.text(), tool_runner.visible_tools());
             if !recovered.is_empty() {
                 info!(
                     count = recovered.len(),
@@ -742,7 +524,7 @@ pub async fn run_agent_loop_with_session_message(
                         id: tc.id.clone(),
                         name: tc.name.clone(),
                         input: tc.input.clone(),
-                        thought_signature: tc.thought_signature.clone(),
+                        provider_metadata: None,
                     });
                 }
                 response.content = new_blocks;
@@ -782,14 +564,30 @@ pub async fn run_agent_loop_with_session_message(
                     });
                 }
 
-                // One-shot retry: if the very first LLM call returns empty text
-                // with no tool use, try once more before accepting the empty result.
-                // This catches transient LLM hiccups (overload, empty stream, etc.).
-                if text.trim().is_empty() && iteration == 0 && response.tool_calls.is_empty() {
-                    warn!(agent = %manifest.name, "Empty response on first call, retrying once");
-                    messages.push(Message::assistant("[no response]".to_string()));
-                    messages.push(Message::user("Please provide your response.".to_string()));
-                    continue;
+                // One-shot retry: if the LLM returns empty text with no tool use,
+                // try once more before accepting the empty result.
+                // Triggers on first call OR when input_tokens=0 (silently failed request).
+                if text.trim().is_empty() && response.tool_calls.is_empty() {
+                    let is_silent_failure =
+                        response.usage.input_tokens == 0 && response.usage.output_tokens == 0;
+                    if iteration == 0 || is_silent_failure {
+                        warn!(
+                            agent = %manifest.name,
+                            iteration,
+                            input_tokens = response.usage.input_tokens,
+                            output_tokens = response.usage.output_tokens,
+                            silent_failure = is_silent_failure,
+                            "Empty response, retrying once"
+                        );
+                        // Re-validate messages before retry — the history may have
+                        // broken tool_use/tool_result pairs that caused the failure.
+                        if is_silent_failure {
+                            messages = crate::session_repair::validate_and_repair(&messages);
+                        }
+                        messages.push(Message::assistant("[no response]".to_string()));
+                        messages.push(Message::user("Please provide your response.".to_string()));
+                        continue;
+                    }
                 }
 
                 // Guard against empty response — covers both iteration 0 and post-tool cycles
@@ -1059,10 +857,13 @@ pub async fn run_agent_loop_with_session_message(
                 }
 
                 // Detect approval denials and inject guidance to prevent infinite retry loops
-                let denial_count = tool_result_blocks.iter().filter(|b| {
-                    matches!(b, ContentBlock::ToolResult { content, is_error: true, .. }
+                let denial_count = tool_result_blocks
+                    .iter()
+                    .filter(|b| {
+                        matches!(b, ContentBlock::ToolResult { content, is_error: true, .. }
                         if content.contains("requires human approval and was denied"))
-                }).count();
+                    })
+                    .count();
                 if denial_count > 0 {
                     tool_result_blocks.push(ContentBlock::Text {
                         text: format!(
@@ -1071,13 +872,15 @@ pub async fn run_agent_loop_with_session_message(
                              wanted to do and that it requires their approval.]",
                             denial_count
                         ),
+                        provider_metadata: None,
                     });
                 }
 
                 // Detect tool errors and inject guidance to prevent fabrication
-                let error_count = tool_result_blocks.iter().filter(|b| {
-                    matches!(b, ContentBlock::ToolResult { is_error: true, .. })
-                }).count();
+                let error_count = tool_result_blocks
+                    .iter()
+                    .filter(|b| matches!(b, ContentBlock::ToolResult { is_error: true, .. }))
+                    .count();
                 let non_denial_errors = error_count.saturating_sub(denial_count);
                 if non_denial_errors > 0 {
                     tool_result_blocks.push(ContentBlock::Text {
@@ -1088,6 +891,7 @@ pub async fn run_agent_loop_with_session_message(
                              alternatives instead of making up data.]",
                             non_denial_errors
                         ),
+                        provider_metadata: None,
                     });
                 }
 
@@ -1263,7 +1067,11 @@ async fn call_with_retry(
             Err(e) => {
                 // Use classifier for smarter error handling
                 let raw_error = e.to_string();
-                let classified = llm_errors::classify_error(&raw_error, None);
+                let status = match &e {
+                    LlmError::Api { status, .. } => Some(*status),
+                    _ => None,
+                };
+                let classified = llm_errors::classify_error(&raw_error, status);
                 warn!(
                     category = ?classified.category,
                     retryable = classified.is_retryable,
@@ -1373,7 +1181,11 @@ async fn stream_with_retry(
             }
             Err(e) => {
                 let raw_error = e.to_string();
-                let classified = llm_errors::classify_error(&raw_error, None);
+                let status = match &e {
+                    LlmError::Api { status, .. } => Some(*status),
+                    _ => None,
+                };
+                let classified = llm_errors::classify_error(&raw_error, status);
                 warn!(
                     category = ?classified.category,
                     retryable = classified.is_retryable,
@@ -1429,6 +1241,7 @@ pub async fn run_agent_loop_streaming(
     hooks: Option<&crate::hooks::HookRegistry>,
     context_window_tokens: Option<usize>,
     process_manager: Option<&crate::process_manager::ProcessManager>,
+    user_content_blocks: Option<Vec<ContentBlock>>,
 ) -> OpenFangResult<AgentLoopResult> {
     info!(agent = %manifest.name, "Starting streaming agent loop");
 
@@ -1439,61 +1252,82 @@ pub async fn run_agent_loop_streaming(
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
 
-    // Recall relevant memories — prefer vector similarity search when embedding driver is available
-    let _memories = if let Some(emb) = embedding_driver {
+    // Recall relevant memories — prefer hybrid recall when an embedding driver is available
+    let (semantic_recall_mode, _memories) = if let Some(emb) = embedding_driver {
         match emb.embed_one(user_message).await {
             Ok(query_vec) => {
-                debug!("Using vector recall (streaming, dims={})", query_vec.len());
-                memory
-                    .recall_with_embedding_async(
-                        user_message,
-                        5,
-                        Some(MemoryFilter {
-                            agent_id: Some(session.agent_id),
-                            ..Default::default()
-                        }),
-                        Some(&query_vec),
-                    )
-                    .await
-                    .unwrap_or_default()
+                debug!("Using hybrid recall (streaming, dims={})", query_vec.len());
+                (
+                    MemoryContextRecallMode::Hybrid,
+                    memory
+                        .recall_with_embedding_async(
+                            user_message,
+                            5,
+                            Some(MemoryFilter {
+                                agent_id: Some(session.agent_id),
+                                ..Default::default()
+                            }),
+                            Some(&query_vec),
+                        )
+                        .await
+                        .unwrap_or_default(),
+                )
             }
             Err(e) => {
-                warn!("Embedding recall failed (streaming), falling back to text search: {e}");
-                memory
-                    .recall(
-                        user_message,
-                        5,
-                        Some(MemoryFilter {
-                            agent_id: Some(session.agent_id),
-                            ..Default::default()
-                        }),
-                    )
-                    .await
-                    .unwrap_or_default()
+                warn!("Embedding recall failed (streaming), falling back to text-only search: {e}");
+                (
+                    MemoryContextRecallMode::TextOnly,
+                    memory
+                        .recall(
+                            user_message,
+                            5,
+                            Some(MemoryFilter {
+                                agent_id: Some(session.agent_id),
+                                ..Default::default()
+                            }),
+                        )
+                        .await
+                        .unwrap_or_default(),
+                )
             }
         }
     } else {
-        memory
-            .recall(
-                user_message,
-                5,
-                Some(MemoryFilter {
-                    agent_id: Some(session.agent_id),
-                    ..Default::default()
-                }),
-            )
-            .await
-            .unwrap_or_default()
+        (
+            MemoryContextRecallMode::TextOnly,
+            memory
+                .recall(
+                    user_message,
+                    5,
+                    Some(MemoryFilter {
+                        agent_id: Some(session.agent_id),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap_or_default(),
+        )
     };
     let structured_entries = memory.list_kv(session.agent_id).unwrap_or_default();
     let governed_entries = load_governed_memory_entries(memory, kernel.as_ref(), session.agent_id);
-    let memory_context_msg = crate::prompt_builder::build_memory_context_message(
-        &format_recalled_memory_fragments(&_memories),
-        &format_memory_cleanup_orchestration_signals(&governed_entries, 2),
-        &format_governed_memory_orchestration_signals(user_message, &governed_entries, 2),
-        &format_governed_memory_candidates(user_message, &governed_entries, 4),
-        &load_recent_session_summaries_from_entries(&structured_entries, 3),
+    let memory_context = build_prompt_memory_context(
+        user_message,
+        semantic_recall_mode,
+        &_memories,
+        &governed_entries,
+        &structured_entries,
+        &PromptMemoryContextBuildOptions::default(),
+        chrono::Utc::now(),
     );
+    let memory_context_msg =
+        crate::prompt_builder::build_memory_context_message(&memory_context);
+    emit_prompt_memory_context_trace(
+        workspace_root,
+        &manifest.name,
+        session.agent_id,
+        kernel.as_ref(),
+        &memory_context.trace,
+    )
+    .await;
 
     // Fire BeforePromptBuild hook
     let agent_id_str = session.agent_id.0.to_string();
@@ -1514,8 +1348,14 @@ pub async fn run_agent_loop_streaming(
     // to keep the system prompt stable for provider prompt caching.
     let system_prompt = manifest.model.system_prompt.clone();
 
-    // Add the user message to session history
-    session.messages.push(Message::user(user_message));
+    // Add the user message to session history.
+    // When content blocks are provided (e.g. text + image from a channel),
+    // use multimodal message format so the LLM receives the image for vision.
+    if let Some(blocks) = user_content_blocks {
+        session.messages.push(Message::user_with_blocks(blocks));
+    } else {
+        session.messages.push(Message::user(user_message));
+    }
 
     let llm_messages: Vec<Message> = session
         .messages
@@ -1556,6 +1396,10 @@ pub async fn run_agent_loop_streaming(
             "Trimming old messages to prevent context overflow (streaming)"
         );
         trim_messages_for_prepended_context(&mut messages, prepended_messages.len());
+        // Re-validate after trimming: the drain may have split a ToolUse/ToolResult
+        // pair across the cut boundary, leaving orphaned blocks that cause the LLM
+        // to return empty responses (input_tokens=0).
+        messages = crate::session_repair::validate_and_repair(&messages);
     }
     if !prepended_messages.is_empty() {
         messages.splice(0..0, prepended_messages);
@@ -1655,9 +1499,15 @@ pub async fn run_agent_loop_streaming(
         let input_log = format_llm_input_log(&system_prompt, &messages);
         log_llm_event(workspace_root, "INPUT", &api_model, &input_log).await;
 
-        // Notify phase: Streaming (streaming variant always streams)
+        // Notify phase: on first iteration emit Streaming; on subsequent
+        // iterations (after tool execution) emit Thinking so the UI shows
+        // "Thinking..." instead of overwriting streamed text with "streaming".
         if let Some(cb) = on_phase {
-            cb(LoopPhase::Streaming);
+            if iteration == 0 {
+                cb(LoopPhase::Streaming);
+            } else {
+                cb(LoopPhase::Thinking);
+            }
         }
 
         // Stream LLM call with retry, error classification, and circuit breaker
@@ -1674,7 +1524,10 @@ pub async fn run_agent_loop_streaming(
         // Log LLM Output (streaming)
         let output_log = format!(
             "Response (concatenated): {}\nTool Calls: {:?}\nStop Reason: {:?}\nUsage: {:?}",
-            response.text(), response.tool_calls, response.stop_reason, response.usage
+            response.text(),
+            response.tool_calls,
+            response.stop_reason,
+            response.usage
         );
         log_llm_event(workspace_root, "OUTPUT", &api_model, &output_log).await;
 
@@ -1687,8 +1540,7 @@ pub async fn run_agent_loop_streaming(
             StopReason::EndTurn | StopReason::StopSequence
         ) && response.tool_calls.is_empty()
         {
-            let recovered =
-                recover_text_tool_calls(&response.text(), tool_runner.visible_tools());
+            let recovered = recover_text_tool_calls(&response.text(), tool_runner.visible_tools());
             if !recovered.is_empty() {
                 info!(
                     count = recovered.len(),
@@ -1702,7 +1554,7 @@ pub async fn run_agent_loop_streaming(
                         id: tc.id.clone(),
                         name: tc.name.clone(),
                         input: tc.input.clone(),
-                        thought_signature: tc.thought_signature.clone(),
+                        provider_metadata: None,
                     });
                 }
                 response.content = new_blocks;
@@ -1741,13 +1593,30 @@ pub async fn run_agent_loop_streaming(
                     });
                 }
 
-                // One-shot retry: if the very first LLM call returns empty text
-                // with no tool use, try once more before accepting the empty result.
-                if text.trim().is_empty() && iteration == 0 && response.tool_calls.is_empty() {
-                    warn!(agent = %manifest.name, "Empty response on first call (streaming), retrying once");
-                    messages.push(Message::assistant("[no response]".to_string()));
-                    messages.push(Message::user("Please provide your response.".to_string()));
-                    continue;
+                // One-shot retry: if the LLM returns empty text with no tool use,
+                // try once more before accepting the empty result.
+                // Triggers on first call OR when input_tokens=0 (silently failed request).
+                if text.trim().is_empty() && response.tool_calls.is_empty() {
+                    let is_silent_failure =
+                        response.usage.input_tokens == 0 && response.usage.output_tokens == 0;
+                    if iteration == 0 || is_silent_failure {
+                        warn!(
+                            agent = %manifest.name,
+                            iteration,
+                            input_tokens = response.usage.input_tokens,
+                            output_tokens = response.usage.output_tokens,
+                            silent_failure = is_silent_failure,
+                            "Empty response (streaming), retrying once"
+                        );
+                        // Re-validate messages before retry — the history may have
+                        // broken tool_use/tool_result pairs that caused the failure.
+                        if is_silent_failure {
+                            messages = crate::session_repair::validate_and_repair(&messages);
+                        }
+                        messages.push(Message::assistant("[no response]".to_string()));
+                        messages.push(Message::user("Please provide your response.".to_string()));
+                        continue;
+                    }
                 }
 
                 // Guard against empty response — covers both iteration 0 and post-tool cycles
@@ -2027,10 +1896,13 @@ pub async fn run_agent_loop_streaming(
                 }
 
                 // Detect approval denials and inject guidance to prevent infinite retry loops
-                let denial_count = tool_result_blocks.iter().filter(|b| {
-                    matches!(b, ContentBlock::ToolResult { content, is_error: true, .. }
+                let denial_count = tool_result_blocks
+                    .iter()
+                    .filter(|b| {
+                        matches!(b, ContentBlock::ToolResult { content, is_error: true, .. }
                         if content.contains("requires human approval and was denied"))
-                }).count();
+                    })
+                    .count();
                 if denial_count > 0 {
                     tool_result_blocks.push(ContentBlock::Text {
                         text: format!(
@@ -2039,13 +1911,15 @@ pub async fn run_agent_loop_streaming(
                              wanted to do and that it requires their approval.]",
                             denial_count
                         ),
+                        provider_metadata: None,
                     });
                 }
 
                 // Detect tool errors and inject guidance to prevent fabrication
-                let error_count = tool_result_blocks.iter().filter(|b| {
-                    matches!(b, ContentBlock::ToolResult { is_error: true, .. })
-                }).count();
+                let error_count = tool_result_blocks
+                    .iter()
+                    .filter(|b| matches!(b, ContentBlock::ToolResult { is_error: true, .. }))
+                    .count();
                 let non_denial_errors = error_count.saturating_sub(denial_count);
                 if non_denial_errors > 0 {
                     tool_result_blocks.push(ContentBlock::Text {
@@ -2056,6 +1930,7 @@ pub async fn run_agent_loop_streaming(
                              alternatives instead of making up data.]",
                             non_denial_errors
                         ),
+                        provider_metadata: None,
                     });
                 }
 
@@ -2146,15 +2021,28 @@ pub async fn run_agent_loop_streaming(
     Err(OpenFangError::MaxIterationsExceeded(max_iterations))
 }
 
-/// Recover tool calls that LLMs (Groq/Llama, DeepSeek) output as plain text
-/// instead of the proper `tool_calls` API field.
+/// Recover tool calls that LLMs output as plain text instead of the proper
+/// `tool_calls` API field. Covers Groq/Llama, DeepSeek, Qwen, and Ollama models.
 ///
-/// Parses patterns like `<function=tool_name>{"key":"value"}</function>` from
-/// the model's text output, validates tool names against the available tools,
-/// and returns synthetic `ToolCall` entries.
-fn recover_text_tool_calls(text: &str, visible_tools: &[ToolDefinition]) -> Vec<ToolCall> {
+/// Supported patterns:
+/// 1. `<function=tool_name>{"key":"value"}</function>`
+/// 2. `<function>tool_name{"key":"value"}</function>`
+/// 3. `<tool>tool_name{"key":"value"}</tool>`
+/// 4. Markdown code blocks containing `tool_name {"key":"value"}`
+/// 5. Backtick-wrapped `tool_name {"key":"value"}`
+/// 6. `[TOOL_CALL]...[/TOOL_CALL]` blocks (JSON or arrow syntax) — issue #354
+/// 7. `<tool_call>{"name":"tool","arguments":{...}}</tool_call>` — Qwen3, issue #332
+/// 8. Bare JSON `{"name":"tool","arguments":{...}}` objects (last resort, only if no tags found)
+/// 9. `<function name="tool" parameters="{...}" />` — XML attribute style (Groq/Llama)
+/// 10. `<|plugin|>...<|endofblock|>` — Qwen/ChatGLM thinking-model format
+/// 11. `Action: tool\nAction Input: {"key":"value"}` — ReAct-style (LM Studio, GPT-OSS)
+/// 12. `tool_name\n{"key":"value"}` — bare name + JSON on next line (Llama 4 Scout)
+/// 13. `<tool_use>{"name":"tool","arguments":{...}}</tool_use>` — Llama 3.1+ variant
+///
+/// Validates tool names against available tools and returns synthetic `ToolCall` entries.
+fn recover_text_tool_calls(text: &str, available_tools: &[ToolDefinition]) -> Vec<ToolCall> {
     let mut calls = Vec::new();
-    let tool_names: Vec<&str> = visible_tools.iter().map(|t| t.name.as_str()).collect();
+    let tool_names: Vec<&str> = available_tools.iter().map(|t| t.name.as_str()).collect();
 
     // Pattern 1: <function=TOOL_NAME>JSON_BODY</function>
     let mut search_from = 0;
@@ -2204,7 +2092,6 @@ fn recover_text_tool_calls(text: &str, visible_tools: &[ToolDefinition]) -> Vec<
             id: format!("recovered_{}", uuid::Uuid::new_v4()),
             name: tool_name.to_string(),
             input,
-            thought_signature: None,
         });
     }
 
@@ -2268,7 +2155,6 @@ fn recover_text_tool_calls(text: &str, visible_tools: &[ToolDefinition]) -> Vec<
             id: format!("recovered_{}", uuid::Uuid::new_v4()),
             name: tool_name.to_string(),
             input,
-            thought_signature: None,
         });
     }
 
@@ -2315,7 +2201,6 @@ fn recover_text_tool_calls(text: &str, visible_tools: &[ToolDefinition]) -> Vec<
             id: format!("recovered_{}", uuid::Uuid::new_v4()),
             name: tool_name.to_string(),
             input,
-            thought_signature: None,
         });
     }
 
@@ -2348,7 +2233,6 @@ fn recover_text_tool_calls(text: &str, visible_tools: &[ToolDefinition]) -> Vec<
                                         id: format!("recovered_{}", uuid::Uuid::new_v4()),
                                         name: potential_tool.to_string(),
                                         input,
-                                        thought_signature: None,
                                     });
                                 }
                             }
@@ -2396,12 +2280,326 @@ fn recover_text_tool_calls(text: &str, visible_tools: &[ToolDefinition]) -> Vec<
                                 id: format!("recovered_{}", uuid::Uuid::new_v4()),
                                 name: potential_tool.to_string(),
                                 input,
-                                thought_signature: None,
                             });
                         }
                     }
                 }
             }
+        }
+    }
+
+    // Pattern 6: [TOOL_CALL]...[/TOOL_CALL] blocks (Ollama models like Qwen, issue #354)
+    // Handles both JSON args and custom `{tool => "name", args => {--key "value"}}` syntax.
+    search_from = 0;
+    while let Some(start) = text[search_from..].find("[TOOL_CALL]") {
+        let abs_start = search_from + start;
+        let after_tag = abs_start + "[TOOL_CALL]".len();
+
+        let Some(close_offset) = text[after_tag..].find("[/TOOL_CALL]") else {
+            search_from = after_tag;
+            continue;
+        };
+        let inner = text[after_tag..after_tag + close_offset].trim();
+        search_from = after_tag + close_offset + "[/TOOL_CALL]".len();
+
+        // Try standard JSON first: {"name":"tool","arguments":{...}}
+        if let Some((tool_name, input)) = parse_json_tool_call_object(inner, &tool_names) {
+            if !calls
+                .iter()
+                .any(|c| c.name == tool_name && c.input == input)
+            {
+                info!(
+                    tool = tool_name.as_str(),
+                    "Recovered tool call from [TOOL_CALL] block (JSON)"
+                );
+                calls.push(ToolCall {
+                    id: format!("recovered_{}", uuid::Uuid::new_v4()),
+                    name: tool_name,
+                    input,
+                });
+            }
+            continue;
+        }
+
+        // Custom arrow syntax: {tool => "name", args => {--key "value"}}
+        if let Some((tool_name, input)) = parse_arrow_syntax_tool_call(inner, &tool_names) {
+            if !calls
+                .iter()
+                .any(|c| c.name == tool_name && c.input == input)
+            {
+                info!(
+                    tool = tool_name.as_str(),
+                    "Recovered tool call from [TOOL_CALL] block (arrow syntax)"
+                );
+                calls.push(ToolCall {
+                    id: format!("recovered_{}", uuid::Uuid::new_v4()),
+                    name: tool_name,
+                    input,
+                });
+            }
+        }
+    }
+
+    // Pattern 7: <tool_call>JSON</tool_call> (Qwen3 models on Ollama, issue #332)
+    search_from = 0;
+    while let Some(start) = text[search_from..].find("<tool_call>") {
+        let abs_start = search_from + start;
+        let after_tag = abs_start + "<tool_call>".len();
+
+        let Some(close_offset) = text[after_tag..].find("</tool_call>") else {
+            search_from = after_tag;
+            continue;
+        };
+        let inner = text[after_tag..after_tag + close_offset].trim();
+        search_from = after_tag + close_offset + "</tool_call>".len();
+
+        if let Some((tool_name, input)) = parse_json_tool_call_object(inner, &tool_names) {
+            if !calls
+                .iter()
+                .any(|c| c.name == tool_name && c.input == input)
+            {
+                info!(
+                    tool = tool_name.as_str(),
+                    "Recovered tool call from <tool_call> block"
+                );
+                calls.push(ToolCall {
+                    id: format!("recovered_{}", uuid::Uuid::new_v4()),
+                    name: tool_name,
+                    input,
+                });
+            }
+        }
+    }
+
+    // Pattern 9: <function name="tool" parameters="{...}" /> — XML attribute style
+    // Groq/Llama sometimes emit self-closing XML with name/parameters attributes.
+    // The parameters value is HTML-entity-escaped JSON (&quot; etc.).
+    {
+        use regex_lite::Regex;
+        // Match both self-closing <function ... /> and <function ...></function>
+        let re =
+            Regex::new(r#"<function\s+name="([^"]+)"\s+parameters="([^"]*)"[^/]*/?>"#).unwrap();
+        for caps in re.captures_iter(text) {
+            let tool_name = caps.get(1).unwrap().as_str();
+            let raw_params = caps.get(2).unwrap().as_str();
+
+            if !tool_names.contains(&tool_name) {
+                warn!(
+                    tool = tool_name,
+                    "XML-attribute tool call for unknown tool — skipping"
+                );
+                continue;
+            }
+
+            // Unescape HTML entities (&quot; &amp; &lt; &gt; &apos;)
+            let unescaped = raw_params
+                .replace("&quot;", "\"")
+                .replace("&amp;", "&")
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&apos;", "'");
+
+            let input: serde_json::Value = match serde_json::from_str(&unescaped) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(tool = tool_name, error = %e, "Failed to parse XML-attribute tool call params — skipping");
+                    continue;
+                }
+            };
+
+            if calls
+                .iter()
+                .any(|c| c.name == tool_name && c.input == input)
+            {
+                continue;
+            }
+
+            info!(
+                tool = tool_name,
+                "Recovered XML-attribute tool call → synthetic ToolUse"
+            );
+            calls.push(ToolCall {
+                id: format!("recovered_{}", uuid::Uuid::new_v4()),
+                name: tool_name.to_string(),
+                input,
+            });
+        }
+    }
+
+    // Pattern 10: <|plugin|>...<|endofblock|> (Qwen/ChatGLM thinking-model format)
+    search_from = 0;
+    while let Some(start) = text[search_from..].find("<|plugin|>") {
+        let abs_start = search_from + start;
+        let after_tag = abs_start + "<|plugin|>".len();
+
+        let close_tag = "<|endofblock|>";
+        let Some(close_offset) = text[after_tag..].find(close_tag) else {
+            search_from = after_tag;
+            continue;
+        };
+        let inner = text[after_tag..after_tag + close_offset].trim();
+        search_from = after_tag + close_offset + close_tag.len();
+
+        if let Some((tool_name, input)) = parse_json_tool_call_object(inner, &tool_names) {
+            if !calls
+                .iter()
+                .any(|c| c.name == tool_name && c.input == input)
+            {
+                info!(
+                    tool = tool_name.as_str(),
+                    "Recovered tool call from <|plugin|> block"
+                );
+                calls.push(ToolCall {
+                    id: format!("recovered_{}", uuid::Uuid::new_v4()),
+                    name: tool_name,
+                    input,
+                });
+            }
+        }
+    }
+
+    // Pattern 11: Action: tool_name\nAction Input: {JSON} (ReAct-style, LM Studio / GPT-OSS)
+    {
+        let lines: Vec<&str> = text.lines().collect();
+        let mut i = 0;
+        while i < lines.len() {
+            let line = lines[i].trim();
+            if let Some(tool_part) = line
+                .strip_prefix("Action:")
+                .or_else(|| line.strip_prefix("action:"))
+            {
+                let tool_name = tool_part.trim();
+                if tool_names.contains(&tool_name) {
+                    // Look for "Action Input:" on the next line(s)
+                    if i + 1 < lines.len() {
+                        let next = lines[i + 1].trim();
+                        if let Some(json_part) = next
+                            .strip_prefix("Action Input:")
+                            .or_else(|| next.strip_prefix("action input:"))
+                            .or_else(|| next.strip_prefix("action_input:"))
+                        {
+                            let json_str = json_part.trim();
+                            if let Ok(input) = serde_json::from_str::<serde_json::Value>(json_str) {
+                                if !calls
+                                    .iter()
+                                    .any(|c| c.name == tool_name && c.input == input)
+                                {
+                                    info!(
+                                        tool = tool_name,
+                                        "Recovered tool call from Action/Action Input pattern"
+                                    );
+                                    calls.push(ToolCall {
+                                        id: format!("recovered_{}", uuid::Uuid::new_v4()),
+                                        name: tool_name.to_string(),
+                                        input,
+                                    });
+                                }
+                            }
+                            i += 2;
+                            continue;
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+
+    // Pattern 12: tool_name\n{"key":"value"} — bare name + JSON on next line (Llama 4 Scout)
+    {
+        let lines: Vec<&str> = text.lines().collect();
+        for i in 0..lines.len().saturating_sub(1) {
+            let name_line = lines[i].trim();
+            // Tool name must be a single word matching a known tool
+            if name_line.contains(' ') || name_line.contains('{') || name_line.is_empty() {
+                continue;
+            }
+            if !tool_names.contains(&name_line) {
+                continue;
+            }
+            // Next line must be valid JSON
+            let json_line = lines[i + 1].trim();
+            if !json_line.starts_with('{') {
+                continue;
+            }
+            if let Ok(input) = serde_json::from_str::<serde_json::Value>(json_line) {
+                if !calls
+                    .iter()
+                    .any(|c| c.name == name_line && c.input == input)
+                {
+                    info!(
+                        tool = name_line,
+                        "Recovered tool call from name+JSON line pair"
+                    );
+                    calls.push(ToolCall {
+                        id: format!("recovered_{}", uuid::Uuid::new_v4()),
+                        name: name_line.to_string(),
+                        input,
+                    });
+                }
+            }
+        }
+    }
+
+    // Pattern 13: <tool_use>JSON</tool_use> (Llama 3.1+ variant)
+    search_from = 0;
+    while let Some(start) = text[search_from..].find("<tool_use>") {
+        let abs_start = search_from + start;
+        let after_tag = abs_start + "<tool_use>".len();
+
+        let Some(close_offset) = text[after_tag..].find("</tool_use>") else {
+            search_from = after_tag;
+            continue;
+        };
+        let inner = text[after_tag..after_tag + close_offset].trim();
+        search_from = after_tag + close_offset + "</tool_use>".len();
+
+        if let Some((tool_name, input)) = parse_json_tool_call_object(inner, &tool_names) {
+            if !calls
+                .iter()
+                .any(|c| c.name == tool_name && c.input == input)
+            {
+                info!(
+                    tool = tool_name.as_str(),
+                    "Recovered tool call from <tool_use> block"
+                );
+                calls.push(ToolCall {
+                    id: format!("recovered_{}", uuid::Uuid::new_v4()),
+                    name: tool_name,
+                    input,
+                });
+            }
+        }
+    }
+
+    // Pattern 8: Bare JSON tool call objects in text (common Ollama fallback)
+    // Matches: {"name":"tool_name","arguments":{"key":"value"}} not already inside tags
+    // Only try this if no calls were found by tag-based patterns, to avoid false positives.
+    if calls.is_empty() {
+        // Scan for JSON objects that look like tool calls
+        let mut scan_from = 0;
+        while let Some(brace_start) = text[scan_from..].find('{') {
+            let abs_brace = scan_from + brace_start;
+            // Try to parse a JSON object starting here
+            if let Some((tool_name, input)) =
+                try_parse_bare_json_tool_call(&text[abs_brace..], &tool_names)
+            {
+                if !calls
+                    .iter()
+                    .any(|c| c.name == tool_name && c.input == input)
+                {
+                    info!(
+                        tool = tool_name.as_str(),
+                        "Recovered tool call from bare JSON object in text"
+                    );
+                    calls.push(ToolCall {
+                        id: format!("recovered_{}", uuid::Uuid::new_v4()),
+                        name: tool_name,
+                        input,
+                    });
+                }
+            }
+            scan_from = abs_brace + 1;
         }
     }
 
@@ -2474,7 +2672,7 @@ fn format_blocks_for_log(blocks: &[ContentBlock]) -> String {
     let mut lines = Vec::with_capacity(blocks.len());
     for (idx, block) in blocks.iter().enumerate() {
         let line = match block {
-            ContentBlock::Text { text } => format!(
+            ContentBlock::Text { text, .. } => format!(
                 "- block[{idx}] text: {}",
                 truncate_for_log(text, MAX_BLOCK_TEXT_LOG_CHARS)
             ),
@@ -2482,7 +2680,9 @@ fn format_blocks_for_log(blocks: &[ContentBlock]) -> String {
                 "- block[{idx}] image: media_type={media_type}, base64_chars={}",
                 data.len()
             ),
-            ContentBlock::ToolUse { id, name, input, .. } => format!(
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => format!(
                 "- block[{idx}] tool_use: id={id}, name={name}, input={}",
                 truncate_for_log(&input.to_string(), MAX_BLOCK_TEXT_LOG_CHARS)
             ),
@@ -2574,10 +2774,17 @@ async fn log_llm_event(
     };
 
     let header = match event_type {
-        "INPUT" => format!("\n{}\n[{}] >>> INPUT (Model: {})\n{}\n", separator, timestamp, model, sub_separator),
+        "INPUT" => format!(
+            "\n{}\n[{}] >>> INPUT (Model: {})\n{}\n",
+            separator, timestamp, model, sub_separator
+        ),
+        "MEMORY_TRACE" => format!("\n[{}] *** MEMORY TRACE\n{}\n", timestamp, sub_separator),
         "OUTPUT" => format!("\n[{}] <<< OUTPUT\n{}\n", timestamp, sub_separator),
         "TOOL_RESULT" => format!("\n[{}] === TOOL RESULT\n{}\n", timestamp, sub_separator),
-        _ => format!("\n[{}] EVENT: {}\n{}\n", timestamp, event_type, sub_separator),
+        _ => format!(
+            "\n[{}] EVENT: {}\n{}\n",
+            timestamp, event_type, sub_separator
+        ),
     };
 
     if let Err(e) = write!(file, "{}{}", header, display_content) {
@@ -2585,7 +2792,11 @@ async fn log_llm_event(
     }
 
     if truncated {
-        let _ = write!(file, "\n[... CONTENT TRUNCATED AT {} CHARS ...]\n", max_chars);
+        let _ = write!(
+            file,
+            "\n[... CONTENT TRUNCATED AT {} CHARS ...]\n",
+            max_chars
+        );
     }
 
     if event_type == "TOOL_RESULT" || event_type == "OUTPUT" {
@@ -2593,6 +2804,281 @@ async fn log_llm_event(
     } else {
         let _ = writeln!(file);
     }
+}
+
+async fn emit_prompt_memory_context_trace(
+    workspace_root: Option<&Path>,
+    agent_name: &str,
+    agent_id: AgentId,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    trace: &PromptMemoryContextTrace,
+) {
+    if let Some(telemetry) = build_prompt_memory_context_trace_telemetry(trace) {
+        let selected_fused_recall = serde_json::to_string(&telemetry.selected_fused_recall)
+            .unwrap_or_else(|_| "[]".to_string());
+        info!(
+            agent = %agent_name,
+            agent_id = %agent_id,
+            semantic_mode = telemetry.semantic_mode.as_str(),
+            semantic_candidates = telemetry.semantic_candidates,
+            shared_candidates = telemetry.shared_candidates,
+            maintenance_signals = telemetry.maintenance_signals,
+            attention_signals = telemetry.attention_signals,
+            session_summaries = telemetry.session_summaries,
+            selected_fused_recall_count = telemetry.selected_fused_recall.len(),
+            selected_fused_recall = %selected_fused_recall,
+            "Prompt memory context trace"
+        );
+        if let Some(kernel) = kernel {
+            let detail = format!(
+                "semantic_mode={} semantic_candidates={} shared_candidates={} maintenance_signals={} attention_signals={} session_summaries={} selected_fused_recall_count={}",
+                telemetry.semantic_mode.as_str(),
+                telemetry.semantic_candidates,
+                telemetry.shared_candidates,
+                telemetry.maintenance_signals,
+                telemetry.attention_signals,
+                telemetry.session_summaries,
+                telemetry.selected_fused_recall.len(),
+            );
+            let outcome =
+                serde_json::to_string(&telemetry).unwrap_or_else(|_| "{}".to_string());
+            if let Err(error) = kernel.record_audit_event(
+                &agent_id.to_string(),
+                AuditAction::MemoryTrace,
+                &detail,
+                &outcome,
+            ) {
+                warn!(agent_id = %agent_id, error = %error, "Failed to record memory trace audit event");
+            }
+        }
+    }
+
+    if let Some(memory_trace) = render_prompt_memory_context_trace(trace) {
+        log_llm_event(workspace_root, "MEMORY_TRACE", "", &memory_trace).await;
+    }
+}
+
+/// Parse a JSON object that represents a tool call.
+/// Supports formats:
+/// - `{"name":"tool","arguments":{"key":"value"}}`
+/// - `{"name":"tool","parameters":{"key":"value"}}`
+/// - `{"function":"tool","arguments":{"key":"value"}}`
+/// - `{"tool":"tool_name","args":{"key":"value"}}`
+fn parse_json_tool_call_object(
+    text: &str,
+    tool_names: &[&str],
+) -> Option<(String, serde_json::Value)> {
+    let obj: serde_json::Value = serde_json::from_str(text).ok()?;
+    let obj = obj.as_object()?;
+
+    // Extract tool name from various field names
+    let name = obj
+        .get("name")
+        .or_else(|| obj.get("function"))
+        .or_else(|| obj.get("tool"))
+        .and_then(|v| v.as_str())?;
+
+    if !tool_names.contains(&name) {
+        return None;
+    }
+
+    // Extract arguments from various field names
+    let args = obj
+        .get("arguments")
+        .or_else(|| obj.get("parameters"))
+        .or_else(|| obj.get("args"))
+        .or_else(|| obj.get("input"))
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
+
+    // If arguments is a string (some models stringify it), try to parse it
+    let args = if let Some(s) = args.as_str() {
+        serde_json::from_str(s).unwrap_or(serde_json::json!({}))
+    } else {
+        args
+    };
+
+    Some((name.to_string(), args))
+}
+
+/// Parse the custom arrow syntax used by some Ollama models:
+/// `{tool => "name", args => {--key "value"}}` or `{tool => "name", args => {"key":"value"}}`
+fn parse_arrow_syntax_tool_call(
+    text: &str,
+    tool_names: &[&str],
+) -> Option<(String, serde_json::Value)> {
+    // Extract tool name: look for `tool => "name"` or `tool=>"name"`
+    let tool_marker_pos = text.find("tool")?;
+    let after_tool = &text[tool_marker_pos + 4..];
+    // Skip whitespace and `=>`
+    let after_arrow = after_tool.trim_start();
+    let after_arrow = after_arrow.strip_prefix("=>")?;
+    let after_arrow = after_arrow.trim_start();
+
+    // Extract quoted tool name
+    let tool_name = if let Some(stripped) = after_arrow.strip_prefix('"') {
+        let end_quote = stripped.find('"')?;
+        &stripped[..end_quote]
+    } else {
+        // Unquoted: take until comma, whitespace, or '}'
+        let end = after_arrow
+            .find(|c: char| c == ',' || c == '}' || c.is_whitespace())
+            .unwrap_or(after_arrow.len());
+        &after_arrow[..end]
+    };
+
+    if tool_name.is_empty() || !tool_names.contains(&tool_name) {
+        return None;
+    }
+
+    // Extract args: look for `args => {` or `args=>{`
+    let args_value = if let Some(args_pos) = text.find("args") {
+        let after_args = &text[args_pos + 4..];
+        let after_args = after_args.trim_start();
+        let after_args = after_args.strip_prefix("=>")?;
+        let after_args = after_args.trim_start();
+
+        if after_args.starts_with('{') {
+            // Try standard JSON parse first
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(after_args) {
+                v
+            } else {
+                // Parse `--key "value"` / `--key value` style args
+                parse_dash_dash_args(after_args)
+            }
+        } else {
+            serde_json::json!({})
+        }
+    } else {
+        serde_json::json!({})
+    };
+
+    Some((tool_name.to_string(), args_value))
+}
+
+/// Parse `{--key "value", --flag}` or `{--command "ls -F /"}` style arguments
+/// into a JSON object.
+fn parse_dash_dash_args(text: &str) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+
+    // Strip outer braces — find matching close brace
+    let inner = if text.starts_with('{') {
+        let mut depth = 0;
+        let mut end = text.len();
+        for (i, c) in text.char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        text[1..end].trim()
+    } else {
+        text.trim()
+    };
+
+    // Parse --key "value" or --key value pairs
+    let mut remaining = inner;
+    while let Some(dash_pos) = remaining.find("--") {
+        remaining = &remaining[dash_pos + 2..];
+
+        // Extract key: runs until whitespace, '=', '"', or end
+        let key_end = remaining
+            .find(|c: char| c.is_whitespace() || c == '=' || c == '"')
+            .unwrap_or(remaining.len());
+        let key = &remaining[..key_end];
+        if key.is_empty() {
+            continue;
+        }
+        remaining = &remaining[key_end..];
+        remaining = remaining.trim_start();
+
+        // Skip optional '='
+        if remaining.starts_with('=') {
+            remaining = remaining[1..].trim_start();
+        }
+
+        // Extract value
+        if remaining.starts_with('"') {
+            // Quoted value — find closing quote
+            if let Some(end_quote) = remaining[1..].find('"') {
+                let value = &remaining[1..1 + end_quote];
+                map.insert(
+                    key.to_string(),
+                    serde_json::Value::String(value.to_string()),
+                );
+                remaining = &remaining[2 + end_quote..];
+            } else {
+                // Unclosed quote — take rest
+                let value = &remaining[1..];
+                map.insert(
+                    key.to_string(),
+                    serde_json::Value::String(value.to_string()),
+                );
+                break;
+            }
+        } else {
+            // Unquoted value — take until next --, comma, }, or end
+            let val_end = remaining
+                .find([',', '}'])
+                .or_else(|| remaining.find("--"))
+                .unwrap_or(remaining.len());
+            let value = remaining[..val_end].trim();
+            if !value.is_empty() {
+                map.insert(
+                    key.to_string(),
+                    serde_json::Value::String(value.to_string()),
+                );
+            } else {
+                // Flag with no value — set to true
+                map.insert(key.to_string(), serde_json::Value::Bool(true));
+            }
+            remaining = &remaining[val_end..];
+        }
+
+        // Skip comma separator
+        remaining = remaining.trim_start();
+        if remaining.starts_with(',') {
+            remaining = remaining[1..].trim_start();
+        }
+    }
+
+    serde_json::Value::Object(map)
+}
+
+/// Try to parse a bare JSON object as a tool call.
+/// The JSON must have a "name"/"function"/"tool" field matching a known tool.
+fn try_parse_bare_json_tool_call(
+    text: &str,
+    tool_names: &[&str],
+) -> Option<(String, serde_json::Value)> {
+    // Find the end of this JSON object by counting braces
+    let mut depth = 0;
+    let mut end = 0;
+    for (i, c) in text.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = i + 1;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    if end == 0 {
+        return None;
+    }
+
+    parse_json_tool_call_object(&text[..end], tool_names)
 }
 
 #[cfg(test)]
@@ -2609,6 +3095,14 @@ mod tests {
     }
     use crate::llm_driver::{CompletionResponse, LlmError};
     use async_trait::async_trait;
+    use openfang_types::memory::{
+        MemoryContextRecallMode, MemoryContextSource, MemoryFreshness, PromptMemoryContextBuildOptions,
+        PromptMemoryContextTrace, build_prompt_memory_context,
+        rank_governed_memory_context_candidates_for_query,
+        rank_semantic_memory_context_candidates, render_governed_memory_orchestration_signals_for_query,
+        render_memory_cleanup_orchestration_signals, render_prompt_memory_context_trace,
+        render_recent_session_summaries_from_entries,
+    };
     use openfang_types::tool::ToolCall;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -2625,7 +3119,7 @@ mod tests {
 
     #[test]
     fn test_dynamic_truncate_short_unchanged() {
-        use crate::context_budget::{truncate_tool_result_dynamic, ContextBudget};
+        use crate::context_budget::{ContextBudget, truncate_tool_result_dynamic};
         let budget = ContextBudget::new(200_000);
         let short = "Hello, world!";
         assert_eq!(truncate_tool_result_dynamic(short, &budget), short);
@@ -2633,7 +3127,7 @@ mod tests {
 
     #[test]
     fn test_dynamic_truncate_over_limit() {
-        use crate::context_budget::{truncate_tool_result_dynamic, ContextBudget};
+        use crate::context_budget::{ContextBudget, truncate_tool_result_dynamic};
         let budget = ContextBudget::new(200_000);
         let long = "x".repeat(budget.per_result_cap() + 10_000);
         let result = truncate_tool_result_dynamic(&long, &budget);
@@ -2643,7 +3137,7 @@ mod tests {
 
     #[test]
     fn test_dynamic_truncate_newline_boundary() {
-        use crate::context_budget::{truncate_tool_result_dynamic, ContextBudget};
+        use crate::context_budget::{ContextBudget, truncate_tool_result_dynamic};
         // Small budget to force truncation
         let budget = ContextBudget::new(1_000);
         let content = (0..200)
@@ -2658,7 +3152,7 @@ mod tests {
     }
 
     #[test]
-    fn test_format_recalled_memory_fragments_deduplicates_and_labels() {
+    fn test_rank_semantic_memory_context_candidates_deduplicates_and_labels() {
         let agent_id = AgentId::new();
         let mut metadata = HashMap::new();
         metadata.insert(
@@ -2680,14 +3174,141 @@ mod tests {
             scope: "preferences".to_string(),
         };
 
-        let rendered = format_recalled_memory_fragments(&[memory.clone(), memory]);
+        let rendered = rank_semantic_memory_context_candidates(&[memory.clone(), memory], 5);
         assert_eq!(rendered.len(), 1);
-        assert!(rendered[0].contains("[pref.editor]"));
-        assert!(rendered[0].contains("rustfmt"));
+        assert!(rendered[0].rendered.starts_with("Semantic memory "));
+        assert!(rendered[0].rendered.contains("[pref.editor]"));
+        assert!(rendered[0].rendered.contains("rustfmt"));
     }
 
     #[test]
-    fn test_load_recent_session_summaries_prefers_latest_keys() {
+    fn test_build_prompt_memory_context_interleaves_semantic_and_shared_memory() {
+        let now = chrono::Utc::now();
+        let agent_id = AgentId::new();
+        let semantic_memory = openfang_types::memory::MemoryFragment {
+            id: openfang_types::memory::MemoryId::new(),
+            agent_id,
+            content: "Use concise summaries first.".to_string(),
+            embedding: None,
+            metadata: HashMap::from([(
+                "key".to_string(),
+                serde_json::Value::String("pref.reply.style".to_string()),
+            )]),
+            source: openfang_types::memory::MemorySource::UserProvided,
+            confidence: 1.0,
+            created_at: now,
+            accessed_at: now,
+            access_count: 0,
+            scope: "preferences".to_string(),
+        };
+        let governed_metadata = openfang_types::memory::MemoryRecordMetadata {
+            schema_version: openfang_types::memory::MEMORY_METADATA_SCHEMA_VERSION,
+            key: "project.alpha.status".to_string(),
+            namespace: "project".to_string(),
+            kind: "project_state".to_string(),
+            tags: vec!["project".to_string(), "alpha".to_string()],
+            freshness: MemoryFreshness::Rolling,
+            source: "memory_store_tool".to_string(),
+            updated_at: now,
+        };
+        let entries = vec![
+            (
+                "project.alpha.status".to_string(),
+                serde_json::json!("Alpha launch is blocked on QA signoff."),
+            ),
+            (
+                openfang_types::memory::memory_metadata_key("project.alpha.status").unwrap(),
+                serde_json::to_value(&governed_metadata).unwrap(),
+            ),
+        ];
+
+        let rendered = build_prompt_memory_context(
+            "What is blocking the alpha launch?",
+            MemoryContextRecallMode::Hybrid,
+            &[semantic_memory],
+            &entries,
+            &[],
+            &PromptMemoryContextBuildOptions::default(),
+            now,
+        );
+
+        assert_eq!(rendered.recalled_memories.len(), 2);
+        assert!(rendered.recalled_memories[0].starts_with("Shared memory [project.alpha.status]"));
+        assert!(rendered.recalled_memories[1].starts_with("Semantic memory "));
+        assert_eq!(rendered.trace.semantic_candidates, 1);
+        assert_eq!(rendered.trace.shared_candidates, 1);
+        assert_eq!(rendered.trace.fused_candidates.len(), 2);
+        assert_eq!(
+            rendered.trace.fused_candidates[0].source,
+            MemoryContextSource::Shared
+        );
+        assert!(rendered.trace.fused_candidates[0].source_weight > 1.0);
+        assert_eq!(
+            rendered.trace.fused_candidates[1].source,
+            MemoryContextSource::Semantic
+        );
+    }
+
+    #[test]
+    fn test_render_prompt_memory_context_trace_includes_source_counts_and_selected_ranks() {
+        let trace = PromptMemoryContextTrace {
+            semantic_mode: MemoryContextRecallMode::Hybrid,
+            semantic_candidates: 2,
+            shared_candidates: 1,
+            fused_candidates: vec![
+                openfang_types::memory::FusedMemoryContextCandidate {
+                    rendered: "Semantic memory [episodic] waiver code".to_string(),
+                    source: MemoryContextSource::Semantic,
+                    source_weight: 1.0,
+                    fused_score: 0.01639,
+                    source_rank: 0,
+                    tie_break_priority: 3,
+                },
+                openfang_types::memory::FusedMemoryContextCandidate {
+                    rendered: "Shared memory [project.alpha.status] qa signoff".to_string(),
+                    source: MemoryContextSource::Shared,
+                    source_weight: 1.32,
+                    fused_score: 0.01613,
+                    source_rank: 0,
+                    tie_break_priority: 0,
+                },
+            ],
+            maintenance_signals: 2,
+            attention_signals: 1,
+            session_summaries: 1,
+        };
+
+        let rendered = render_prompt_memory_context_trace(&trace).unwrap();
+
+        assert!(rendered.contains("semantic_mode=hybrid"));
+        assert!(rendered.contains("semantic_candidates=2"));
+        assert!(rendered.contains("shared_candidates=1"));
+        assert!(rendered.contains("maintenance_signals=2"));
+        assert!(rendered.contains("attention_signals=1"));
+        assert!(rendered.contains("session_summaries=1"));
+        assert!(rendered.contains("1. source=semantic source_rank=1 source_weight=1.000"));
+        assert!(rendered.contains("tie_break_priority=3"));
+        assert!(rendered.contains("2. source=shared source_rank=1 source_weight=1.320"));
+        assert!(rendered.contains("tie_break_priority=0"));
+    }
+
+    #[test]
+    fn test_render_prompt_memory_context_trace_omitted_when_all_sources_empty() {
+        let trace = PromptMemoryContextTrace {
+            semantic_mode: MemoryContextRecallMode::TextOnly,
+            semantic_candidates: 0,
+            shared_candidates: 0,
+            fused_candidates: Vec::new(),
+            maintenance_signals: 0,
+            attention_signals: 0,
+            session_summaries: 0,
+        };
+
+        assert!(render_prompt_memory_context_trace(&trace).is_none());
+    }
+
+    #[test]
+    fn test_render_recent_session_summaries_prefers_latest_keys() {
         let memory = openfang_memory::MemorySubstrate::open_in_memory(0.01).unwrap();
         let agent_id = AgentId::new();
         memory
@@ -2712,14 +3333,15 @@ mod tests {
             )
             .unwrap();
 
-        let summaries = load_recent_session_summaries(&memory, agent_id, 1);
+        let summaries =
+            render_recent_session_summaries_from_entries(&memory.list_kv(agent_id).unwrap(), 1);
         assert_eq!(summaries.len(), 1);
         assert!(summaries[0].contains("session_2026-03-12_beta"));
         assert!(summaries[0].contains("Newest summary"));
     }
 
     #[test]
-    fn test_format_governed_memory_candidates_surfaces_lifecycle_and_tags() {
+    fn test_rank_governed_memory_context_candidates_surfaces_lifecycle_and_tags() {
         let now = chrono::Utc::now();
         let themed_metadata = openfang_types::memory::MemoryRecordMetadata {
             schema_version: openfang_types::memory::MEMORY_METADATA_SCHEMA_VERSION,
@@ -2757,23 +3379,26 @@ mod tests {
             ),
         ];
 
-        let rendered = format_governed_memory_candidates(
-            "What is the editor theme and ui preference?",
+        let rendered = rank_governed_memory_context_candidates_for_query(
             &entries,
+            now,
             5,
+            Some("What is the editor theme and ui preference?"),
         );
 
         assert_eq!(rendered.len(), 1);
-        assert!(rendered[0].contains("[pref.editor.theme]"));
-        assert!(rendered[0].contains("kind=preference"));
-        assert!(rendered[0].contains("freshness=durable"));
-        assert!(rendered[0].contains("lifecycle=active"));
-        assert!(rendered[0].contains("tags=profile,ui"));
-        assert!(rendered[0].contains("promotion_candidate"));
+        assert!(rendered[0].rendered.starts_with("Shared memory "));
+        assert!(rendered[0].rendered.contains("[pref.editor.theme]"));
+        assert!(rendered[0].rendered.contains("kind=preference"));
+        assert!(rendered[0].rendered.contains("freshness=durable"));
+        assert!(rendered[0].rendered.contains("lifecycle=active"));
+        assert!(rendered[0].rendered.contains("tags=profile,ui"));
+        assert!(rendered[0].rendered.contains("promotion_candidate"));
+        assert!(rendered[0].source_weight > 1.0);
     }
 
     #[test]
-    fn test_format_governed_memory_candidates_query_prioritizes_matching_project_entry() {
+    fn test_rank_governed_memory_context_candidates_query_prioritizes_matching_project_entry() {
         let now = chrono::Utc::now();
         let pref_metadata = openfang_types::memory::MemoryRecordMetadata {
             schema_version: openfang_types::memory::MEMORY_METADATA_SCHEMA_VERSION,
@@ -2814,19 +3439,22 @@ mod tests {
             ),
         ];
 
-        let rendered = format_governed_memory_candidates(
-            "What is the alpha project status?",
+        let rendered = rank_governed_memory_context_candidates_for_query(
             &entries,
+            now,
             2,
+            Some("What is the alpha project status?"),
         );
 
         assert_eq!(rendered.len(), 2);
-        assert!(rendered[0].contains("[project.alpha.status]"));
-        assert!(rendered[1].contains("[pref.editor.theme]"));
+        assert!(rendered[0].rendered.starts_with("Shared memory "));
+        assert!(rendered[0].rendered.contains("[project.alpha.status]"));
+        assert!(rendered[0].source_weight > rendered[1].source_weight);
+        assert!(rendered[1].rendered.contains("[pref.editor.theme]"));
     }
 
     #[test]
-    fn test_format_governed_memory_orchestration_signals_surfaces_review_and_promotion() {
+    fn test_render_governed_memory_orchestration_signals_surfaces_review_and_promotion() {
         let now = chrono::Utc::now();
         let stale_project = openfang_types::memory::MemoryRecordMetadata {
             schema_version: openfang_types::memory::MEMORY_METADATA_SCHEMA_VERSION,
@@ -2867,10 +3495,11 @@ mod tests {
             ),
         ];
 
-        let rendered = format_governed_memory_orchestration_signals(
-            "What is the alpha project status and ui preference?",
+        let rendered = render_governed_memory_orchestration_signals_for_query(
             &entries,
+            now,
             2,
+            Some("What is the alpha project status and ui preference?"),
         );
 
         assert_eq!(rendered.len(), 2);
@@ -2881,12 +3510,9 @@ mod tests {
     }
 
     #[test]
-    fn test_format_memory_cleanup_orchestration_signals_surfaces_maintenance_actions() {
+    fn test_render_memory_cleanup_orchestration_signals_surfaces_maintenance_actions() {
         let entries = vec![
-            (
-                "legacy_theme".to_string(),
-                serde_json::json!("solarized"),
-            ),
+            ("legacy_theme".to_string(), serde_json::json!("solarized")),
             (
                 "project.alpha.note".to_string(),
                 serde_json::json!("Alpha note"),
@@ -2906,7 +3532,7 @@ mod tests {
             ),
         ];
 
-        let rendered = format_memory_cleanup_orchestration_signals(&entries, 2);
+        let rendered = render_memory_cleanup_orchestration_signals(&entries, 2);
 
         assert_eq!(rendered.len(), 3);
         assert!(rendered[0].contains("Run memory_cleanup before reuse"));
@@ -2926,7 +3552,10 @@ mod tests {
         trim_messages_for_prepended_context(&mut messages, 2);
 
         assert_eq!(messages.len(), MAX_HISTORY_MESSAGES - 2);
-        assert_eq!(messages.first().unwrap().content.text_content(), "message 2");
+        assert_eq!(
+            messages.first().unwrap().content.text_content(),
+            "message 2"
+        );
         assert_eq!(
             messages.last().unwrap().content.text_content(),
             format!("message {}", MAX_HISTORY_MESSAGES - 1)
@@ -2990,14 +3619,13 @@ mod tests {
                         id: "tool_1".to_string(),
                         name: "fake_tool".to_string(),
                         input: serde_json::json!({"query": "test"}),
-                        thought_signature: None,
+                        provider_metadata: None,
                     }],
                     stop_reason: StopReason::ToolUse,
                     tool_calls: vec![ToolCall {
                         id: "tool_1".to_string(),
                         name: "fake_tool".to_string(),
                         input: serde_json::json!({"query": "test"}),
-                        thought_signature: None,
                     }],
                     usage: TokenUsage {
                         input_tokens: 10,
@@ -3053,6 +3681,7 @@ mod tests {
             Ok(CompletionResponse {
                 content: vec![ContentBlock::Text {
                     text: "Hello from the agent!".to_string(),
+                    provider_metadata: None,
                 }],
                 stop_reason: StopReason::EndTurn,
                 tool_calls: vec![],
@@ -3099,6 +3728,7 @@ mod tests {
             None, // hooks
             None, // context_window_tokens
             None, // process_manager
+            None, // user_content_blocks
         )
         .await
         .expect("Loop should complete without error");
@@ -3151,6 +3781,7 @@ mod tests {
             None, // hooks
             None, // context_window_tokens
             None, // process_manager
+            None, // user_content_blocks
         )
         .await
         .expect("Loop should complete without error");
@@ -3203,6 +3834,7 @@ mod tests {
             None, // hooks
             None, // context_window_tokens
             None, // process_manager
+            None, // user_content_blocks
         )
         .await
         .expect("Loop should complete without error");
@@ -3248,6 +3880,7 @@ mod tests {
             None, // hooks
             None, // context_window_tokens
             None, // process_manager
+            None, // user_content_blocks
         )
         .await
         .expect("Streaming loop should complete without error");
@@ -3301,6 +3934,7 @@ mod tests {
                 Ok(CompletionResponse {
                     content: vec![ContentBlock::Text {
                         text: "Recovered after retry!".to_string(),
+                        provider_metadata: None,
                     }],
                     stop_reason: StopReason::EndTurn,
                     tool_calls: vec![],
@@ -3370,6 +4004,7 @@ mod tests {
             None,
             None, // context_window_tokens
             None, // process_manager
+            None, // user_content_blocks
         )
         .await
         .expect("Loop should recover via retry");
@@ -3416,6 +4051,7 @@ mod tests {
             None,
             None, // context_window_tokens
             None, // process_manager
+            None, // user_content_blocks
         )
         .await
         .expect("Loop should complete with fallback");
@@ -3470,6 +4106,7 @@ mod tests {
             None, // hooks
             None, // context_window_tokens
             None, // process_manager
+            None, // user_content_blocks
         )
         .await
         .expect("Streaming loop should complete without error");
@@ -3811,9 +4448,472 @@ mod tests {
             input_schema: serde_json::json!({}),
         }];
         // Same call in both function tag and tool tag — should only appear once
-        let text = r#"<function=exec>{"command":"ls"}</function> <tool>exec{"command":"ls"}</tool>"#;
+        let text =
+            r#"<function=exec>{"command":"ls"}</function> <tool>exec{"command":"ls"}</tool>"#;
         let calls = recover_text_tool_calls(text, &tools);
         assert_eq!(calls.len(), 1);
+    }
+
+    // --- Pattern 6: [TOOL_CALL]...[/TOOL_CALL] tests (issue #354) ---
+
+    #[test]
+    fn test_recover_tool_call_block_json() {
+        let tools = vec![ToolDefinition {
+            name: "shell_exec".into(),
+            description: "Execute shell command".into(),
+            input_schema: serde_json::json!({}),
+            defer_loading: false,
+        }];
+        let text = "[TOOL_CALL]\n{\"name\": \"shell_exec\", \"arguments\": {\"command\": \"ls -la\"}}\n[/TOOL_CALL]";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell_exec");
+        assert_eq!(calls[0].input["command"], "ls -la");
+    }
+
+    #[test]
+    fn test_recover_tool_call_block_arrow_syntax() {
+        let tools = vec![ToolDefinition {
+            name: "shell_exec".into(),
+            description: "Execute shell command".into(),
+            input_schema: serde_json::json!({}),
+            defer_loading: false,
+        }];
+        // Exact format from issue #354
+        let text = "[TOOL_CALL]\n{tool => \"shell_exec\", args => {\n--command \"ls -F /\"\n}}\n[/TOOL_CALL]";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell_exec");
+        assert_eq!(calls[0].input["command"], "ls -F /");
+    }
+
+    #[test]
+    fn test_recover_tool_call_block_unknown_tool() {
+        let tools = vec![ToolDefinition {
+            name: "shell_exec".into(),
+            description: "Execute".into(),
+            input_schema: serde_json::json!({}),
+            defer_loading: false,
+        }];
+        let text = "[TOOL_CALL]\n{\"name\": \"hack_system\", \"arguments\": {\"cmd\": \"rm -rf /\"}}\n[/TOOL_CALL]";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn test_recover_tool_call_block_multiple() {
+        let tools = vec![
+            ToolDefinition {
+                name: "shell_exec".into(),
+                description: "Execute".into(),
+                input_schema: serde_json::json!({}),
+                defer_loading: false,
+            },
+            ToolDefinition {
+                name: "file_read".into(),
+                description: "Read".into(),
+                input_schema: serde_json::json!({}),
+                defer_loading: false,
+            },
+        ];
+        let text = "[TOOL_CALL]\n{\"name\": \"shell_exec\", \"arguments\": {\"command\": \"ls\"}}\n[/TOOL_CALL]\nSome text.\n[TOOL_CALL]\n{\"name\": \"file_read\", \"arguments\": {\"path\": \"/tmp/test.txt\"}}\n[/TOOL_CALL]";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "shell_exec");
+        assert_eq!(calls[1].name, "file_read");
+    }
+
+    #[test]
+    fn test_recover_tool_call_block_unclosed() {
+        let tools = vec![ToolDefinition {
+            name: "shell_exec".into(),
+            description: "Execute".into(),
+            input_schema: serde_json::json!({}),
+            defer_loading: false,
+        }];
+        // Unclosed [TOOL_CALL] — pattern 6 skips it, but pattern 8 (bare JSON)
+        // still finds the valid JSON tool call object.
+        let text = "[TOOL_CALL]\n{\"name\": \"shell_exec\", \"arguments\": {\"command\": \"ls\"}}";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 1, "Bare JSON fallback should recover this");
+        assert_eq!(calls[0].name, "shell_exec");
+    }
+
+    // --- Pattern 7: <tool_call>JSON</tool_call> tests (Qwen3, issue #332) ---
+
+    #[test]
+    fn test_recover_tool_call_xml_basic() {
+        let tools = vec![ToolDefinition {
+            name: "shell_exec".into(),
+            description: "Execute".into(),
+            input_schema: serde_json::json!({}),
+            defer_loading: false,
+        }];
+        let text = "<tool_call>\n{\"name\": \"shell_exec\", \"arguments\": {\"command\": \"ls -la\"}}\n</tool_call>";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell_exec");
+        assert_eq!(calls[0].input["command"], "ls -la");
+    }
+
+    #[test]
+    fn test_recover_tool_call_xml_with_surrounding_text() {
+        let tools = vec![ToolDefinition {
+            name: "web_search".into(),
+            description: "Search".into(),
+            input_schema: serde_json::json!({}),
+            defer_loading: false,
+        }];
+        let text = "I'll search for that.\n\n<tool_call>\n{\"name\": \"web_search\", \"arguments\": {\"query\": \"rust async\"}}\n</tool_call>\n\nLet me get results.";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "web_search");
+        assert_eq!(calls[0].input["query"], "rust async");
+    }
+
+    #[test]
+    fn test_recover_tool_call_xml_function_field() {
+        let tools = vec![ToolDefinition {
+            name: "file_read".into(),
+            description: "Read".into(),
+            input_schema: serde_json::json!({}),
+            defer_loading: false,
+        }];
+        let text = "<tool_call>{\"function\": \"file_read\", \"arguments\": {\"path\": \"/etc/hosts\"}}</tool_call>";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "file_read");
+    }
+
+    #[test]
+    fn test_recover_tool_call_xml_parameters_field() {
+        let tools = vec![ToolDefinition {
+            name: "web_fetch".into(),
+            description: "Fetch".into(),
+            input_schema: serde_json::json!({}),
+            defer_loading: false,
+        }];
+        let text = "<tool_call>{\"name\": \"web_fetch\", \"parameters\": {\"url\": \"https://example.com\"}}</tool_call>";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "web_fetch");
+        assert_eq!(calls[0].input["url"], "https://example.com");
+    }
+
+    #[test]
+    fn test_recover_tool_call_xml_stringified_args() {
+        let tools = vec![ToolDefinition {
+            name: "shell_exec".into(),
+            description: "Execute".into(),
+            input_schema: serde_json::json!({}),
+            defer_loading: false,
+        }];
+        let text = "<tool_call>{\"name\": \"shell_exec\", \"arguments\": \"{\\\"command\\\": \\\"pwd\\\"}\"}</tool_call>";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell_exec");
+        assert_eq!(calls[0].input["command"], "pwd");
+    }
+
+    #[test]
+    fn test_recover_tool_call_xml_unknown_tool() {
+        let tools = vec![ToolDefinition {
+            name: "shell_exec".into(),
+            description: "Execute".into(),
+            input_schema: serde_json::json!({}),
+            defer_loading: false,
+        }];
+        let text = "<tool_call>{\"name\": \"hack_system\", \"arguments\": {\"cmd\": \"rm -rf /\"}}</tool_call>";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn test_recover_tool_call_xml_multiple() {
+        let tools = vec![
+            ToolDefinition {
+                name: "shell_exec".into(),
+                description: "Execute".into(),
+                input_schema: serde_json::json!({}),
+                defer_loading: false,
+            },
+            ToolDefinition {
+                name: "web_search".into(),
+                description: "Search".into(),
+                input_schema: serde_json::json!({}),
+                defer_loading: false,
+            },
+        ];
+        let text = "<tool_call>{\"name\": \"shell_exec\", \"arguments\": {\"command\": \"ls\"}}</tool_call>\n<tool_call>{\"name\": \"web_search\", \"arguments\": {\"query\": \"rust\"}}</tool_call>";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "shell_exec");
+        assert_eq!(calls[1].name, "web_search");
+    }
+
+    // --- Pattern 8: Bare JSON tool call object tests ---
+
+    #[test]
+    fn test_recover_bare_json_tool_call() {
+        let tools = vec![ToolDefinition {
+            name: "shell_exec".into(),
+            description: "Execute".into(),
+            input_schema: serde_json::json!({}),
+            defer_loading: false,
+        }];
+        let text =
+            "I'll run that: {\"name\": \"shell_exec\", \"arguments\": {\"command\": \"ls -la\"}}";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell_exec");
+        assert_eq!(calls[0].input["command"], "ls -la");
+    }
+
+    #[test]
+    fn test_recover_bare_json_no_false_positive() {
+        let tools = vec![ToolDefinition {
+            name: "shell_exec".into(),
+            description: "Execute".into(),
+            input_schema: serde_json::json!({}),
+            defer_loading: false,
+        }];
+        let text = "The config looks like {\"debug\": true, \"level\": \"info\"}";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn test_recover_bare_json_skipped_when_tags_found() {
+        let tools = vec![ToolDefinition {
+            name: "shell_exec".into(),
+            description: "Execute".into(),
+            input_schema: serde_json::json!({}),
+            defer_loading: false,
+        }];
+        let text = "<function=shell_exec>{\"command\":\"ls\"}</function> {\"name\": \"shell_exec\", \"arguments\": {\"command\": \"pwd\"}}";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].input["command"], "ls");
+    }
+
+    // --- Pattern 9: XML-attribute style <function name="..." parameters="..." /> ---
+
+    #[test]
+    fn test_recover_xml_attribute_basic() {
+        let tools = vec![ToolDefinition {
+            name: "web_search".into(),
+            description: "Search".into(),
+            input_schema: serde_json::json!({}),
+            defer_loading: false,
+        }];
+        let text = r#"<function name="web_search" parameters="{&quot;query&quot;: &quot;best crypto 2024&quot;}" />"#;
+        let calls = recover_text_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "web_search");
+        assert_eq!(calls[0].input["query"], "best crypto 2024");
+    }
+
+    #[test]
+    fn test_recover_xml_attribute_unknown_tool() {
+        let tools = vec![ToolDefinition {
+            name: "web_search".into(),
+            description: "Search".into(),
+            input_schema: serde_json::json!({}),
+            defer_loading: false,
+        }];
+        let text = r#"<function name="unknown_tool" parameters="{&quot;x&quot;: 1}" />"#;
+        let calls = recover_text_tool_calls(text, &tools);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn test_recover_xml_attribute_non_selfclosing() {
+        let tools = vec![ToolDefinition {
+            name: "shell_exec".into(),
+            description: "Execute".into(),
+            input_schema: serde_json::json!({}),
+            defer_loading: false,
+        }];
+        let text = r#"<function name="shell_exec" parameters="{&quot;command&quot;: &quot;ls&quot;}"></function>"#;
+        let calls = recover_text_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell_exec");
+    }
+
+    // --- Pattern 10: <|plugin|>...<|endofblock|> tests ---
+
+    #[test]
+    fn test_recover_plugin_block() {
+        let tools = vec![ToolDefinition {
+            name: "web_search".into(),
+            description: "Search".into(),
+            input_schema: serde_json::json!({}),
+            defer_loading: false,
+        }];
+        let text = "<|plugin|>\n{\"name\": \"web_search\", \"arguments\": {\"query\": \"rust\"}}\n<|endofblock|>";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "web_search");
+        assert_eq!(calls[0].input["query"], "rust");
+    }
+
+    #[test]
+    fn test_recover_plugin_block_unknown_tool() {
+        let tools = vec![ToolDefinition {
+            name: "web_search".into(),
+            description: "Search".into(),
+            input_schema: serde_json::json!({}),
+            defer_loading: false,
+        }];
+        let text =
+            "<|plugin|>\n{\"name\": \"hack\", \"arguments\": {\"cmd\": \"rm\"}}\n<|endofblock|>";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert!(calls.is_empty());
+    }
+
+    // --- Pattern 11: Action/Action Input tests ---
+
+    #[test]
+    fn test_recover_action_input() {
+        let tools = vec![ToolDefinition {
+            name: "web_search".into(),
+            description: "Search".into(),
+            input_schema: serde_json::json!({}),
+            defer_loading: false,
+        }];
+        let text = "Action: web_search\nAction Input: {\"query\": \"rust programming\"}";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "web_search");
+        assert_eq!(calls[0].input["query"], "rust programming");
+    }
+
+    #[test]
+    fn test_recover_action_input_unknown_tool() {
+        let tools = vec![ToolDefinition {
+            name: "web_search".into(),
+            description: "Search".into(),
+            input_schema: serde_json::json!({}),
+            defer_loading: false,
+        }];
+        let text = "Action: unknown_tool\nAction Input: {\"key\": \"value\"}";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert!(calls.is_empty());
+    }
+
+    // --- Pattern 12: name + JSON on next line tests ---
+
+    #[test]
+    fn test_recover_name_json_nextline() {
+        let tools = vec![ToolDefinition {
+            name: "shell_exec".into(),
+            description: "Execute".into(),
+            input_schema: serde_json::json!({}),
+            defer_loading: false,
+        }];
+        let text = "shell_exec\n{\"command\": \"ls -la\"}";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell_exec");
+        assert_eq!(calls[0].input["command"], "ls -la");
+    }
+
+    #[test]
+    fn test_recover_name_json_nextline_unknown() {
+        let tools = vec![ToolDefinition {
+            name: "shell_exec".into(),
+            description: "Execute".into(),
+            input_schema: serde_json::json!({}),
+            defer_loading: false,
+        }];
+        let text = "unknown_tool\n{\"command\": \"ls\"}";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert!(calls.is_empty());
+    }
+
+    // --- Pattern 13: <tool_use> tests ---
+
+    #[test]
+    fn test_recover_tool_use_block() {
+        let tools = vec![ToolDefinition {
+            name: "web_search".into(),
+            description: "Search".into(),
+            input_schema: serde_json::json!({}),
+            defer_loading: false,
+        }];
+        let text =
+            "<tool_use>{\"name\": \"web_search\", \"arguments\": {\"query\": \"test\"}}</tool_use>";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "web_search");
+    }
+
+    #[test]
+    fn test_recover_tool_use_block_unknown() {
+        let tools = vec![ToolDefinition {
+            name: "web_search".into(),
+            description: "Search".into(),
+            input_schema: serde_json::json!({}),
+            defer_loading: false,
+        }];
+        let text = "<tool_use>{\"name\": \"hack\", \"arguments\": {\"cmd\": \"rm\"}}</tool_use>";
+        let calls = recover_text_tool_calls(text, &tools);
+        assert!(calls.is_empty());
+    }
+
+    // --- Helper function tests ---
+
+    #[test]
+    fn test_parse_dash_dash_args_basic() {
+        let result = parse_dash_dash_args("{--command \"ls -F /\"}");
+        assert_eq!(result["command"], "ls -F /");
+    }
+
+    #[test]
+    fn test_parse_dash_dash_args_multiple() {
+        let result = parse_dash_dash_args("{--file \"test.txt\", --verbose}");
+        assert_eq!(result["file"], "test.txt");
+        assert_eq!(result["verbose"], true);
+    }
+
+    #[test]
+    fn test_parse_dash_dash_args_unquoted_value() {
+        let result = parse_dash_dash_args("{--count 5}");
+        assert_eq!(result["count"], "5");
+    }
+
+    #[test]
+    fn test_parse_json_tool_call_object_standard() {
+        let tool_names = vec!["shell_exec"];
+        let result = parse_json_tool_call_object(
+            "{\"name\": \"shell_exec\", \"arguments\": {\"command\": \"ls\"}}",
+            &tool_names,
+        );
+        assert!(result.is_some());
+        let (name, args) = result.unwrap();
+        assert_eq!(name, "shell_exec");
+        assert_eq!(args["command"], "ls");
+    }
+
+    #[test]
+    fn test_parse_json_tool_call_object_function_field() {
+        let tool_names = vec!["web_fetch"];
+        let result = parse_json_tool_call_object(
+            "{\"function\": \"web_fetch\", \"parameters\": {\"url\": \"https://x.com\"}}",
+            &tool_names,
+        );
+        assert!(result.is_some());
+        let (name, args) = result.unwrap();
+        assert_eq!(name, "web_fetch");
+        assert_eq!(args["url"], "https://x.com");
+    }
+
+    #[test]
+    fn test_parse_json_tool_call_object_unknown_tool() {
+        let tool_names = vec!["shell_exec"];
+        let result =
+            parse_json_tool_call_object("{\"name\": \"unknown\", \"arguments\": {}}", &tool_names);
+        assert!(result.is_none());
     }
 
     // --- End-to-end integration test: text-as-tool-call recovery through agent loop ---
@@ -3845,6 +4945,7 @@ mod tests {
                 Ok(CompletionResponse {
                     content: vec![ContentBlock::Text {
                         text: r#"Let me search for that. <function=web_search>{"query":"rust async"}</function>"#.to_string(),
+                        provider_metadata: None,
                     }],
                     stop_reason: StopReason::EndTurn,
                     tool_calls: vec![], // BUG: no tool_calls!
@@ -3858,6 +4959,7 @@ mod tests {
                 Ok(CompletionResponse {
                     content: vec![ContentBlock::Text {
                         text: "Based on the search results, Rust async is great!".to_string(),
+                        provider_metadata: None,
                     }],
                     stop_reason: StopReason::EndTurn,
                     tool_calls: vec![],
@@ -3920,6 +5022,7 @@ mod tests {
             None, // hooks
             None, // context_window_tokens
             None, // process_manager
+            None, // user_content_blocks
         )
         .await
         .expect("Agent loop should complete");
@@ -3986,6 +5089,7 @@ mod tests {
             None,
             None,
             None,
+            None, // user_content_blocks
         )
         .await
         .expect("Normal loop should complete");
@@ -4048,6 +5152,7 @@ mod tests {
             None, // hooks
             None, // context_window_tokens
             None, // process_manager
+            None, // user_content_blocks
         )
         .await
         .expect("Streaming loop should complete");

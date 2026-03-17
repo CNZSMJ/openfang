@@ -9,7 +9,7 @@
 
 ## 当前阶段
 
-- `phase-2-embedding-hybrid-retrieval`
+- `phase-2-embedding-hybrid-retrieval (completed)`
 
 ## 基线分支
 
@@ -17,11 +17,11 @@
 
 ## 当前工作分支
 
-- `memory-governance`
+- `phase2-embedding-hybrid-retrieval`
 
 ## 当前 worktree 路径
 
-- `/Users/huangjiahao/workspace/openfang-0.1.0/memory-governance`
+- `/Users/huangjiahao/workspace/openfang-0.1.0/phase2-embedding-hybrid-retrieval`
 
 ## 设计文档
 
@@ -30,7 +30,7 @@
 
 ## 当前目标
 
-- 在 `memory-governance` 分支上开始 Phase 2，围绕 governed shared memory 设计并落地 embedding / hybrid retrieval 的接线顺序与验证路径。
+- 完成 `phase-2-embedding-hybrid-retrieval` 收口，并为下一阶段 `prompt architecture` 的 attention governance / section arbitration 做切换准备。
 
 ## 已完成
 
@@ -179,23 +179,568 @@
     - 由于 legacy bucket 当前限制为 2，prompt-time signal 中优先显示的是两条既有 shared legacy bare key；本次注入的 `maintenance_signal_legacy_probe` 则通过 cleanup audit 被验证命中
     - verifier 的真实回复明确说明 shared memory 在复用前需要治理，并点名 backfill metadata / orphan sidecar 删除；`/api/budget` 中 `daily_spend` 从 `0.12500442` 增到 `0.13069252`，`/api/budget/agents` 中新增 verifier agent 花费 `0.005688100000000001`
     - maintenance probes 已通过 sqlite 直接删除，临时 verifier agent 已删除，daemon 已按流程停止
+  - 已完成 Phase 2 第一批 hybrid recall 落地：
+    - `openfang-memory::semantic` 的 `recall_with_embedding` 已从“向量召回失败时退回 text search”升级为真正的 hybrid recall：并行计算 text rank 与 vector rank，再用 RRF 融合排序
+    - hybrid recall 现在会保留未嵌入但 text 命中的 memory fragment，不再像原先 vector-only 分支那样天然丢失 `embedding = NULL` 的候选
+    - `openfang-runtime::agent_loop` 的 streaming / non-streaming 两条主路径都已改为显式记录 `Using hybrid recall`，embedding 失败时退回 `text-only search`
+    - 新增/更新单测覆盖：
+      - exact keyword 命中但无 embedding 的 memory 仍可被 hybrid recall 拉回前列
+      - mixed embedded / non-embedded 结果仍保留非 embedding 记录作为尾部候选，不回归旧行为
+  - 已完成本轮验证：
+    - `cargo build --workspace --lib`
+    - `cargo test --workspace`
+    - `cargo clippy --workspace --all-targets -- -D warnings`
+    - live hybrid recall 验证通过：
+      - 本机 Ollama 在线，`/api/tags` 返回 `qwen3-embedding:4b` 与 `qwen3-embedding:0.6b`
+      - `~/.openfang/config.toml` 的 `[memory]` 已确认使用 `embedding_provider = "ollama"` 与 `embedding_model = "qwen3-embedding:0.6b"`
+      - 真实 `assistant` message 后，`~/.openfang/workspaces/assistant/logs/llm.log` 的 `Relevant recalled memories` 中出现 `ZXCV9001-HTEST-20260315` probe，证明 recall 注入真实进入 prompt
+      - 进一步创建临时 `hybrid-live-verifier-20260315` agent，先写入 `TEXTONLY-PROBE-20260315` probe，再通过 sqlite 将对应 `memories.embedding` 显式置空、删除该 agent 的 `sessions` / `canonical_sessions`
+      - 在上述“fresh session + embedding = NULL”条件下，真实 `/api/agents/{id}/message` 仍返回 `TEXTONLY-PROBE-20260315 is the accounts receivable override code.`
+      - 同一轮 verifier 的 `llm.log` 中 `Relevant recalled memories` 明确包含 `TEXTONLY-PROBE-20260315` probe，证明 text arm 已真实接线，而不是只剩向量召回
+      - live 验证期间 `/api/budget` 的 `daily_spend` 从 `0.09705190000000001` 增到 `0.12042470000000001`
+      - 临时 verifier agent、其 DB 行与 workspace 已在验证后清理；daemon 已按流程停止
+  - 已完成 Phase 2 第二批 governed+semantic prompt-time fusion 落地：
+    - `openfang-runtime::agent_loop` 现在会把 semantic recalled fragments 与 governed shared memory candidates 先各自 query-time 排序，再用等权 RRF 融成同一组 `Relevant recalled memories`
+    - `openfang-runtime::prompt_builder` 不再单独输出 `Governed memory candidates` 区段；governed shared memory 现在以 `Shared memory [...]` 形式进入同一 recall section，semantic 片段则显式标记为 `Semantic memory [...]`
+    - governance attention / maintenance 两类 orchestration signal 仍保持独立区段，没有因为 recall 融合而丢失动作提示
+    - 新增/更新单测覆盖：
+      - semantic 与 shared governed candidate 会按 RRF 进入同一 recall 列表
+      - memory context message 只保留 fused recall section，不再保留旧的 governed-only section
+  - 已完成本轮补充验证：
+    - `cargo build --workspace --lib`
+    - `cargo test --workspace`
+    - `cargo clippy --workspace --all-targets -- -D warnings`
+    - live governed+semantic fusion 验证通过：
+      - 临时创建 `hybrid-fusion-verifier-20260315` agent，并通过 memory API 写入 `project.alpha.fusion_status` shared governed probe
+      - 第一轮真实消息注入 `SEMANTIC-FUSION-PROBE-20260315`，第二轮询问 `What is blocking the alpha launch, and what is the onboarding waiver code?`
+      - 真实回复同时返回 shared governed probe 对应的 `QA signoff` blocker 与 semantic probe 对应的 `SEMANTIC-FUSION-PROBE-20260315`
+      - verifier 的 `~/.openfang/workspaces/hybrid-fusion-verifier-20260315/logs/llm.log` 中，第二轮只出现一份 `Relevant recalled memories`，并同时包含：
+        - `Semantic memory [episodic] ... SEMANTIC-FUSION-PROBE-20260315 ...`
+        - `Shared memory [project.alpha.fusion_status] ... ALPHA-FUSION-BLOCKER-20260315 ...`
+      - 同一份 log 中未再出现 `Governed memory candidates` 旧区段，证明 governed candidate 已真实并入统一 recall section
+      - `/api/budget` 中 `daily_spend` 增至 `0.1228381`
+      - 临时 verifier agent、其 workspace、共享 probe 与关联 DB rows 已在验证后清理；daemon 已按流程停止
+  - 已完成 Phase 2 第三批 unified recall observability 落地：
+    - `openfang-runtime::agent_loop` 现在会在每轮真正写入 `INPUT` 前，额外向 agent workspace 的 `llm.log` 写一条 `*** MEMORY TRACE`
+    - `MEMORY_TRACE` 当前会显式暴露：
+      - `semantic_mode=hybrid|text_only`
+      - `semantic_candidates`
+      - `shared_candidates`
+      - `maintenance_signals`
+      - `attention_signals`
+      - `session_summaries`
+      - `selected_fused_recall` 明细，包括 `source=semantic|shared`、`source_rank` 与 `fused_score`
+    - 这样后续 live 验证不再只能通过读 prompt 里的 `Relevant recalled memories` 反推来源，而是可以直接从日志判断 unified recall 的命中来源与排序
+    - 新增单测覆盖：
+      - memory trace 会输出 source counts 与 fused recall rank 明细
+      - 空 trace 不会写出无意义日志
+  - 已完成本轮 observability 补充验证：
+    - `cargo build --workspace --lib`
+    - `cargo test --workspace`
+    - `cargo clippy --workspace --all-targets -- -D warnings`
+    - `cargo build -p openfang-cli`
+    - live `MEMORY_TRACE` 验证通过：
+      - 临时创建 `memory-trace-verifier-2-20260315` agent，并通过 memory API 写入 `project.alpha.trace_status` shared governed probe
+      - 第一轮真实消息注入 `TRACE-SEMANTIC-20260315`，第二轮询问 `What is blocking the alpha launch and what is the device unlock phrase?`
+      - verifier 的 `~/.openfang/workspaces/memory-trace-verifier-2-20260315/logs/llm.log` 中出现新的 `*** MEMORY TRACE` 区段，明确包含：
+        - `semantic_mode=hybrid`
+        - `semantic_candidates=1`
+        - `shared_candidates=1`
+        - `selected_fused_recall`
+        - `source=semantic source_rank=1 ... TRACE-SEMANTIC-20260315 ...`
+      - `source=shared source_rank=1 ... TRACE-BLOCKER-20260315 ...`
+      - 同一轮真实回复同时返回 device unlock phrase 与 alpha launch blocker，说明 trace 与真实 recall consumption 对齐
+      - `/api/budget` 中 `daily_spend` 增至 `0.1262184`
+      - 临时 verifier agent、其 workspace、共享 probe 与关联 DB rows 已在验证后清理；daemon 已按流程停止
+  - 已完成 Phase 2 第四批 shared fusion helper / source-weight 落地：
+    - `openfang-types::memory` 现在新增统一的 prompt-time fusion helper：
+      - `select_governed_memory_prompt_candidates_for_query_with_fusion`
+      - `fuse_ranked_memory_context_candidates`
+      - `MemoryContextSource` / `RankedMemoryContextCandidate` / `FusedMemoryContextCandidate`
+    - governed shared memory 不再只输出内部排序结果；query profile / lifecycle / promotion candidate 现在会被显式折算为 `source_weight` 与 `tie_break_priority`
+    - `openfang-runtime::agent_loop` 不再本地维护 “等权 RRF + semantic 优先” 的融合规则，而是改为消费 `openfang-types` 下沉出的共享 helper；runtime 只负责 semantic/shared candidate 的渲染与 `MEMORY_TRACE` 记录
+    - `MEMORY_TRACE` 的 `selected_fused_recall` 明细现已扩展为：
+      - `source`
+      - `source_rank`
+      - `source_weight`
+      - `tie_break_priority`
+      - `fused_score`
+    - 新增/更新单测覆盖：
+      - governed query-matching active candidate 会拿到显式 fusion metadata
+      - weighted shared candidate 可以在跨源融合里稳定压过同 rank 的 semantic candidate
+      - runtime trace 与 governed candidate 渲染会暴露新的 weight / tie-break 信息
+  - 已完成本轮 source-weight / helper 下沉验证：
+    - `cargo build --workspace --lib`
+    - `cargo test --workspace`
+    - `cargo clippy --workspace --all-targets -- -D warnings`
+    - `cargo build -p openfang-cli`
+    - live shared-weighted fusion 验证通过：
+      - 临时创建 `memory-weight-verifier-20260315` agent，并通过 memory API 写入 `project.alpha.weight_status` shared governed probe
+      - 第一轮真实消息注入 `WEIGHT-SEMANTIC-20260315`，第二轮询问 `What is the alpha project status and what is the device unlock phrase?`
+      - 真实回复同时返回 shared probe 对应的 `Alpha launch is blocked on QA signoff.` 与 semantic probe 对应的 `WEIGHT-SEMANTIC-20260315`
+      - verifier 的 `~/.openfang/workspaces/memory-weight-verifier-20260315/logs/llm.log` 中，第二轮 `*** MEMORY TRACE` 明确包含：
+        - `1. source=shared source_rank=1 source_weight=1.485 tie_break_priority=1 fused_score=0.02434 ... WEIGHT-SHARED-20260315 ...`
+      - `2. source=semantic source_rank=1 source_weight=1.000 tie_break_priority=3 fused_score=0.01639 ... WEIGHT-SEMANTIC-20260315 ...`
+      - 这证明 shared governed candidate 已不再只是和 semantic 等权并列，而是会按 query-aware weight / tie-break 在 unified recall 中真实前置
+      - `/api/budget` 中 `daily_spend` 从 `0.11647460000000001` 增到 `0.12132120000000002`，`/api/budget/agents` 中 verifier agent 花费为 `0.004846600000000001`
+      - 临时 verifier agent、其 workspace、共享 probe 与关联 DB rows 已在验证后清理；daemon 已按流程停止
+  - 已完成 Phase 2 第五批 fused memory context helper 再下沉：
+    - `openfang-types::memory` 新增统一的跨源 recall composition helper：
+      - `MemoryContextFusionResult`
+      - `rank_semantic_memory_context_candidates`
+      - `rank_governed_memory_context_candidates_for_query`
+      - `build_fused_memory_context_for_query`
+    - semantic memory 的 prompt-time 渲染与去重不再由 runtime 私有实现，已与 governed shared candidate 一起下沉到共享层
+    - governed shared memory 的渲染继续复用上一轮显式 `source_weight` / `tie_break_priority` 规则；runtime 现在直接消费 fused result，而不是自己重新拼 semantic/shared recall
+    - `render_memory_freshness` 与 `render_memory_lifecycle_state` 已提升为 `openfang-types::memory` 的共享导出，供 runtime orchestration / trace 复用
+    - `openfang-runtime::agent_loop` 现在主要保留：
+      - `MEMORY_TRACE` 记录
+      - orchestration signal 组装
+      - prompt 注入
+    - 新增/更新单测覆盖：
+      - semantic candidate 去重与标签渲染改为覆盖共享 helper
+      - governed candidate 的 lifecycle / tag / query-prioritization 改为覆盖共享 helper
+      - fused memory context helper 会稳定返回 shared-first 的跨源融合结果
+  - 已完成本轮 fused memory context helper 验证：
+    - `cargo build --workspace --lib`
+    - `cargo test --workspace`
+    - `cargo clippy --workspace --all-targets -- -D warnings`
+    - `cargo build -p openfang-cli`
+    - live shared helper downshift 验证通过：
+      - 临时创建 `memory-context-helper-verifier-20260315-171345` agent，并通过 memory API 写入 `project.alpha.helper_downshift_status` shared governed probe
+      - 第一轮真实消息注入 `HELPER-DOWNSHIFT-SEMANTIC-20260315-171345`，随后执行 `POST /api/agents/{id}/session/reset` 清空会话上下文，再二次询问 `What is blocking the alpha launch, and what is the onboarding waiver code?`
+      - 第二轮真实回复同时返回 shared probe 对应的 `QA signoff` blocker 与 semantic probe 对应的 `HELPER-DOWNSHIFT-SEMANTIC-20260315-171345`
+      - verifier 的 `~/.openfang/workspaces/memory-context-helper-verifier-20260315-171345/logs/llm.log` 中，第二轮 `*** MEMORY TRACE` 明确包含：
+        - `1. source=shared source_rank=1 source_weight=1.559 tie_break_priority=0 fused_score=0.02556 ... HELPER-DOWNSHIFT-SHARED-20260315-171345 ...`
+      - `2. source=semantic source_rank=1 source_weight=1.000 tie_break_priority=3 fused_score=0.01639 ... HELPER-DOWNSHIFT-SEMANTIC-20260315-171345 ...`
+      - 同一轮 `Relevant recalled memories` 也同时出现 shared / semantic 两条条目，说明 helper 下沉后真实 prompt 注入没有断线
+      - `/api/budget` 中 `daily_spend` 从 `0.11647460000000001` 增到 `0.12204940000000002`，`/api/budget/agents` 中 verifier agent 花费为 `0.0055748`
+      - 临时 verifier agent、其 workspace、共享 probe 与关联 DB rows 已在验证后清理；daemon 已按流程停止
+  - 已完成 Phase 2 第六批 prompt memory context contract 收口：
+    - `openfang-types::memory` 现在新增统一的 prompt-time memory payload / trace contract：
+      - `MemoryContextRecallMode`
+      - `PromptMemoryContextBuildOptions`
+      - `PromptMemoryContextTrace`
+      - `PromptMemoryContext`
+    - 共享层现在会直接负责：
+      - semantic/shared fused recall 选择
+      - `Governance maintenance signals` 文本渲染
+      - `Governance attention signals` 文本渲染
+      - `Recent session summaries` 文本渲染
+      - `Relevant recalled memories` message block 组装
+      - `*** MEMORY TRACE` payload 渲染
+    - `openfang-runtime::agent_loop` 不再本地维护 recall trace schema、memory context message 文本、attention/maintenance signal 文本或 session summary 格式化，而是直接消费 `build_prompt_memory_context` 与 `render_prompt_memory_context_trace`
+    - `openfang-runtime::prompt_builder` 的 `build_memory_context_message` 现在退化成对共享 helper 的薄封装，不再自己持有 memory section 编排语义
+    - 新增/更新单测覆盖：
+      - runtime 侧 shared payload 集成仍能保持 shared-first 的 fused recall
+      - trace 渲染改为覆盖共享 trace contract
+      - session summary / attention signal / maintenance signal 渲染改为覆盖共享 helper
+  - 已完成本轮 prompt memory context contract 验证：
+    - `cargo build --workspace --lib`
+    - `cargo test --workspace`
+    - `cargo clippy --workspace --all-targets -- -D warnings`
+    - `cargo build -p openfang-cli`
+    - live shared payload smoke 验证通过：
+      - 临时创建 `memory-shared-smoke-20260315-182011` agent，查询 `What is the debug contract alpha status?`
+      - verifier 的 `llm.log` 中同时出现：
+        - `*** MEMORY TRACE`
+        - `Relevant recalled memories`
+        - `Shared memory [project.alpha.debug_contract_status] ... debug alpha status`
+      - trace 明确记录 `source=shared source_rank=1 source_weight=1.485 tie_break_priority=1 fused_score=0.02434 ...`
+      - 真实回复直接基于记忆上下文复述 `project.alpha.debug_contract_status`
+    - live semantic reset smoke 验证通过：
+      - 临时创建 `memory-contract-verifier-20260315-181753` agent，先写入语义 probe `CONTRACT-SEM-20260315-181753`，再 `POST /api/agents/{id}/session/reset`
+      - reset 后第二轮真实回复仍返回 `CONTRACT-SEM-20260315-181753`
+      - verifier 的 `llm.log` 中第二轮 `*** MEMORY TRACE` 与 `Relevant recalled memories` 都明确包含该 semantic probe
+    - live 验证期间 `/api/budget` 的 `daily_spend` 从 `0.11647460000000001` 增到 `0.1223772`
+    - 临时 smoke verifier、其 workspace 与关联 DB rows 已在验证后清理；daemon 已按流程停止
+  - 已完成 Phase 2 第七批 structured memory trace telemetry 导出：
+    - `openfang-types::memory` 新增统一的 structured trace payload：
+      - `PromptMemoryContextTraceSelectedRecall`
+      - `PromptMemoryContextTraceTelemetry`
+      - `build_prompt_memory_context_trace_telemetry`
+    - `render_prompt_memory_context_trace` 现在改为复用同一份 telemetry helper 组装 `llm.log` 文本，避免文本 trace 与结构化字段再次漂移
+    - `openfang-runtime::agent_loop` 新增统一的 `emit_prompt_memory_context_trace`：
+      - 两条主路径都通过同一个 helper 发 trace
+      - 保留原有 `llm.log` 的 `*** MEMORY TRACE`
+      - 同时新增 `tracing::info!` 结构化字段：
+        - `semantic_mode`
+        - `semantic_candidates`
+        - `shared_candidates`
+        - `maintenance_signals`
+        - `attention_signals`
+        - `session_summaries`
+        - `selected_fused_recall_count`
+        - `selected_fused_recall`（JSON）
+    - 新增/更新单测覆盖：
+      - `PromptMemoryContextTraceTelemetry` 会保留 selected rank / source rank / weight / tie-break metadata
+      - 空 trace 会同时被 telemetry helper 与文本 trace renderer 正确省略
+  - 已完成本轮 structured trace telemetry 验证：
+    - `cargo build --workspace --lib`
+    - `cargo test --workspace`
+    - `cargo clippy --workspace --all-targets -- -D warnings`
+    - `cargo build -p openfang-cli`
+    - live structured telemetry smoke 验证通过：
+      - 在隔离的 `OPENFANG_HOME=/tmp/openfang-memory-trace-live` 上，以 `127.0.0.1:4210` 启动临时 daemon，并把 stdout/stderr 重定向到 `/tmp/openfang-memory-trace-live/daemon.log`
+      - 临时创建 `memory-trace-telemetry-verifier-20260316b` agent，通过 memory API 写入 shared probe `project.alpha.telemetry_status_b = TRACE-SHARED-20260316B ...`
+      - 第一轮真实消息写入 semantic probe `TRACE-SEM-20260316B device unlock phrase`，随后执行 `POST /api/agents/{id}/session/reset`
+      - 第二轮真实询问 `What is the alpha telemetry status, and what is the device unlock phrase?`，回复同时返回 shared blocker 与 semantic phrase
+      - `/tmp/openfang-memory-trace-live/daemon.log` 中真实出现：
+        - `INFO openfang_runtime::agent_loop: Prompt memory context trace ...`
+        - `semantic_mode="hybrid" semantic_candidates=2 shared_candidates=2 ...`
+        - `selected_fused_recall=[{"selected_rank":1,"source":"shared",...,"rendered":"... TRACE-SHARED-20260316B ..."},{"selected_rank":4,"source":"semantic",...,"rendered":"... TRACE-SEM-20260316B ..."}]`
+      - 同一 verifier 的 `llm.log` 中仍保留：
+        - `*** MEMORY TRACE`
+        - `Relevant recalled memories`
+        - shared / semantic 两条 probe
+      - 隔离 daemon 的 `/api/budget` 中 `daily_spend = 0.013873200000000002`；`/api/budget/agents` 中两个临时 verifier agent 的 `daily_cost_usd` 分别为 `0.006641800000000001` 与 `0.007231400000000001`
+      - 验证完成后，临时 daemon、agent、workspace、shared probe 与整个 `/tmp/openfang-memory-trace-live` home 已清理
+  - 已完成 Phase 2 第八批 memory trace audit / inspection surface 接线：
+    - `openfang-runtime::audit::AuditAction` 新增 `MemoryTrace`
+    - `KernelHandle` 新增统一 `record_audit_event` bridge，runtime 可以在不依赖 kernel 内部结构的前提下把 prompt-time memory trace 写入 kernel-owned audit log
+    - `openfang-runtime::agent_loop::emit_prompt_memory_context_trace` 现在除了：
+      - `tracing::info!` 结构化字段
+      - `llm.log` 的 `*** MEMORY TRACE`
+      之外，还会追加一条 audit event：
+      - `action = MemoryTrace`
+      - `detail = semantic_mode / source counts / selected_fused_recall_count`
+      - `outcome = structured telemetry JSON`
+    - `/api/logs/stream` 现在会为 `MemoryTrace` audit entry 额外附带已解析的 `payload` 字段，而不只是原始 `detail/outcome` 字符串
+    - 新增/更新单测覆盖：
+      - `MemoryTrace` 会正确在持久化 audit log 中 roundtrip
+      - API 路由 helper 会只对 `MemoryTrace` 解析 JSON payload，其他 audit action 维持原样
+  - 已完成本轮 inspection surface 验证：
+    - `cargo build --workspace --lib`
+    - `cargo test --workspace`
+    - `cargo clippy --workspace --all-targets -- -D warnings`
+    - `cargo build -p openfang-cli`
+    - live `/api/logs/stream` verification 通过：
+      - 在隔离的 `OPENFANG_HOME=/tmp/openfang-memory-audit-live` 上，以 `127.0.0.1:4211` 启动临时 daemon
+      - 临时创建 `memory-trace-audit-stream-verifier-20260316` agent，通过 memory API 写入 shared probe `project.alpha.audit_trace_status = TRACE-AUDIT-SHARED-20260316 ...`
+      - 第一轮真实消息写入 semantic probe `TRACE-AUDIT-SEM-20260316 device unlock phrase`，随后执行 `POST /api/agents/{id}/session/reset`
+      - 第二轮真实询问 `What is the alpha launch blocker, and what is the device unlock phrase?`，回复同时返回 shared blocker 与 semantic phrase
+      - 随后 `GET /api/logs/stream?filter=memorytrace` 的 SSE backfill 中真实返回了两条 `MemoryTrace` 事件；每条 event 除了原有 `action/detail/outcome/hash/...` 外，还带有：
+        - `payload.semantic_mode`
+        - `payload.semantic_candidates`
+        - `payload.shared_candidates`
+        - `payload.selected_fused_recall[*].source`
+        - `payload.selected_fused_recall[*].source_weight`
+        - `payload.selected_fused_recall[*].fused_score`
+      - 第二条 SSE `payload` 中同时出现：
+        - shared rendered probe `TRACE-AUDIT-SHARED-20260316`
+        - semantic rendered probe `TRACE-AUDIT-SEM-20260316`
+      - 同一 verifier 的真实回复与 prompt-time recall 一致；隔离 daemon 的 `/api/budget` 中 `daily_spend = 0.007979400000000001`，`/api/budget/agents` 中 verifier `daily_cost_usd = 0.007979400000000001`
+      - 临时 daemon、agent、workspace、shared probe 与整个 `/tmp/openfang-memory-audit-live` home 已清理
+  - 已完成 Phase 2 第九批 dashboard memory trace inspection surface 接线：
+    - `/api/audit/recent` 现在与 `/api/logs/stream` 共用统一 audit-entry serializer；`MemoryTrace` 在 polling fallback 与 Audit Trail tab 中也会携带已解析的 `payload`
+    - dashboard `Logs` 页现在会把 `MemoryTrace` 当作一类一等 audit event 渲染，而不再只显示原始 `detail/outcome` 字符串：
+      - Live tab 会对 `MemoryTrace` 展示 `semantic_mode` / source counts / selected recall count 摘要 pills
+      - Live tab 会额外展开前 3 条 `selected_fused_recall`，直接显示 `source` / `source_rank` / `source_weight` / `tie_break_priority` / `fused_score` 与 recall 文本
+      - Audit Trail tab 新增 `Memory Trace` action filter，并把 Outcome 列升级为 `Outcome / Trace`
+      - Audit Trail tab 对 `MemoryTrace` 也会渲染相同的摘要与 recall 明细；非 `MemoryTrace` action 仍维持普通 outcome preview
+    - Logs 页本地 search 现在会一并搜索 `outcome` 与 `payload`，便于直接按 shared/semantic probe 文本筛查 memory trace
+    - 新增/更新单测覆盖：
+      - `audit_entry_json` 会在 `/api/audit/recent` 与 `/api/logs/stream` 两条路径上稳定附带 `payload`
+      - `MemoryTrace` JSON payload 仍只对对应 audit action 解析，不影响其他 action
+  - 已完成本轮 dashboard inspection 验证：
+    - `cargo build --workspace --lib`
+    - `cargo test --workspace`
+    - `cargo clippy --workspace --all-targets -- -D warnings`
+    - `cargo build -p openfang-cli`
+    - live dashboard memory-trace inspection verification 通过：
+      - 在隔离的 `OPENFANG_HOME=/tmp/openfang-memory-trace-dashboard-live` 上，以 `127.0.0.1:4212` 启动临时 daemon
+      - 使用隔离 daemon 自带 `assistant` agent，通过 memory API 写入 shared probe `project.alpha.dashboard_trace_status = TRACE-DASHBOARD-SHARED-20260316 ...`
+      - 第一轮真实消息写入 semantic probe `TRACE-DASHBOARD-SEM-20260316 device unlock phrase`，随后执行 `POST /api/agents/{id}/session/reset`
+      - 第二轮真实询问 `What is the alpha launch blocker, and what is the device unlock phrase?`，回复同时返回 shared blocker `QA signoff` 与 semantic phrase `TRACE-DASHBOARD-SEM-20260316 device unlock phrase`
+      - `GET /api/audit/recent?n=20` 中真实返回了两条 `MemoryTrace` entry，且第二条 entry 的 `payload` 同时包含：
+        - `semantic_mode = hybrid`
+        - `semantic_candidates = 1`
+        - `shared_candidates = 1`
+        - `selected_fused_recall[0] = shared ... TRACE-DASHBOARD-SHARED-20260316 ...`
+        - `selected_fused_recall[1] = semantic ... TRACE-DASHBOARD-SEM-20260316 ...`
+      - `GET /api/logs/stream?filter=memorytrace` 的 SSE backfill 也仍返回同样的 parsed `payload`
+      - `curl http://127.0.0.1:4212/` 的 dashboard HTML 中已出现：
+        - `Memory Trace`
+        - `Outcome / Trace`
+        - `memory-trace-pill`
+        证明 Logs 页模板与样式已真实进入服务端静态资源输出
+      - 隔离 daemon 的 `/api/budget` 中 `daily_spend = 0.0038346000000000005`，`/api/budget/agents` 中 `assistant` 的 `daily_cost_usd = 0.0038346000000000005`
+      - 验证完成后，隔离 daemon 与整个 `/tmp/openfang-memory-trace-dashboard-live` home 已清理
+  - 已完成 Phase 2 第十批 dedicated memory trace tab / filter / export 接线：
+    - dashboard `Logs` 页现在新增独立的 `Memory Trace` tab，不再只能在 `Live` / `Audit Trail` 两张通用日志表里筛 `MemoryTrace`
+    - `Memory Trace` tab 提供专门的 inspection controls：
+      - `All Agents` agent filter
+      - `All Modes` semantic-mode filter（`hybrid` / `text_only`）
+      - `All Sources` recall-source filter（`shared` / `semantic`）
+      - trace text search
+      - `Reset` / `Export JSON`
+    - `Memory Trace` tab 的每条 card 现在会渲染：
+      - 时间、agent、semantic mode
+      - 选中 recall 的 summary pills
+      - 默认前 3 条 fused recall，带 `source` pill、score/rank meta 与 recall 文本
+      - `Expand` / `Collapse`
+      - `Copy JSON` 与逐条 `Copy recall`
+    - polling fallback 现在也会在 `Memory Trace` tab 保持刷新，不再只在 `Live` tab 自动轮询，避免 SSE 降级时 dedicated trace 视图停更
+  - 已完成本轮 dedicated memory trace tab 验证：
+    - `cargo build --workspace --lib`
+    - `cargo test --workspace`
+    - `cargo clippy --workspace --all-targets -- -D warnings`
+    - `cargo build -p openfang-cli`
+    - live dedicated memory-trace-tab verification 通过：
+      - 在隔离的 `OPENFANG_HOME=/tmp/openfang-memory-trace-tab-live` 上，以 `127.0.0.1:4213` 启动临时 daemon
+      - 使用隔离 daemon 自带 `assistant` agent，通过 memory API 写入 shared probe `project.alpha.memory_tab_status = TRACE-TAB-SHARED-20260316 alpha launch blocked on QA signoff`
+      - 第一轮真实消息写入 semantic probe `TRACE-TAB-SEM-20260316 launch override phrase`，随后执行 `POST /api/agents/{id}/session/reset`
+      - 第二轮真实询问 `What is the alpha launch blocker, and what is the launch override phrase?`，回复同时返回 shared blocker `QA signoff` 与 semantic phrase `TRACE-TAB-SEM-20260316 launch override phrase`
+      - `GET /api/audit/recent?n=20` 中真实返回了两条 `MemoryTrace` entry，且第二条 entry 的 `payload` 同时包含：
+        - `semantic_mode = hybrid`
+        - `semantic_candidates = 1`
+        - `shared_candidates = 1`
+        - `selected_fused_recall[0] = shared ... TRACE-TAB-SHARED-20260316 ...`
+        - `selected_fused_recall[1] = semantic ... TRACE-TAB-SEM-20260316 ...`
+      - `curl http://127.0.0.1:4213/` 的 dashboard HTML 中已出现：
+        - `Memory Trace`
+        - `Prompt-Time Memory Trace`
+        - `All Agents`
+        - `All Modes`
+        - `All Sources`
+        - `Export JSON`
+        - `Copy JSON`
+        证明 dedicated tab 与其 controls 已真实进入服务端静态资源输出
+      - 隔离 daemon 的 `/api/budget` 中 `daily_spend = 0.0038511000000000005`，`/api/budget/agents` 中 `assistant` 的 `daily_cost_usd = 0.0038511000000000005`
+      - 验证完成后，隔离 daemon 与整个 `/tmp/openfang-memory-trace-tab-live` home 已清理
+  - 已完成 Phase 2 第十一批 memory trace compare / raw payload inspection 接线：
+    - `Logs -> Memory Trace` tab 现在支持把两条 trace 放入 compare selection，不再只能逐条目测：
+      - 每条 trace card 新增 `Add Compare` / `Compared A` / `Compared B`
+      - compare panel 会在顶部固定展示 `Trace A` / `Trace B` 的时间、agent、semantic mode 与 summary pills
+      - compare panel 会直接分桶展示：
+        - `Shared Recall`
+        - `Only In Trace A`
+        - `Only In Trace B`
+    - 每条 trace card 现在还新增：
+      - `Copy all recall`
+      - `Raw payload` 展开
+      - 已有 `Copy JSON` / 单条 `Copy recall` / `Expand` 继续保留
+    - raw payload 展开会直接渲染当前 `MemoryTrace.payload` 的 prettified JSON，便于 inspection 时对照 dashboard 摘要和真实 telemetry 字段，而不必离开页面再打 API
+    - compare 逻辑已保持纯前端 helper 形式，按 `source + rendered recall text` 做交集/差集，不需要后端再补 compare API
+  - 已完成本轮 compare / raw-payload inspection 验证：
+    - `node` 级纯前端 helper smoke 通过：
+      - 直接加载 `static/js/pages/logs.js` 并构造两条 mock `MemoryTrace`
+      - compare helper 返回：
+        - `shared = ["shared blocker"]`
+        - `onlyA = ["semantic phrase old"]`
+        - `onlyB = ["semantic phrase new"]`
+      - `memoryTraceCompareButtonLabel()` 与 payload toggle 逻辑均符合预期
+    - `cargo build --workspace --lib`
+    - `cargo test --workspace`
+    - `cargo clippy --workspace --all-targets -- -D warnings`
+    - `cargo build -p openfang-cli`
+    - live compare/raw-payload inspection verification 通过：
+      - 在隔离的 `OPENFANG_HOME=/tmp/openfang-memory-trace-compare-live` 上，以 `127.0.0.1:4214` 启动临时 daemon
+      - 使用隔离 daemon 自带 `assistant` agent，通过 memory API 写入 shared probe `project.alpha.compare_trace_status = TRACE-COMPARE-SHARED-20260317 alpha launch blocked on QA signoff`
+      - 第一轮真实消息写入 semantic phrase `TRACE-COMPARE-SEM-20260317 launch override phrase`
+      - 执行 `POST /api/agents/{id}/session/reset` 后，第二轮真实询问 `What is the alpha launch blocker, and what is the launch override phrase?`，回复同时返回：
+        - shared blocker `QA signoff`
+        - semantic phrase `TRACE-COMPARE-SEM-20260317 launch override phrase`
+      - `GET /api/audit/recent?n=20` 中真实返回两条 `MemoryTrace`，其中：
+        - 一条为 `semantic_candidates=0 shared_candidates=1 selected_fused_recall_count=1`
+        - 另一条为 `semantic_candidates=1 shared_candidates=1 session_summaries=1 selected_fused_recall_count=2`
+        - 第二条 `selected_fused_recall` 同时包含 shared probe 与 semantic trace phrase，对 compare panel 的交集/差集场景形成真实输入
+      - `curl http://127.0.0.1:4214/` 的 dashboard HTML 中已出现：
+        - `Compare Selected Traces`
+        - `Clear compare`
+        - `Shared Recall`
+        - `Only In Trace A`
+        - `Only In Trace B`
+        - `Copy all recall`
+        - `Raw Payload`
+        证明 compare/raw-payload inspection UI 已真实进入服务端静态资源输出
+      - 隔离 daemon 的 `/api/budget` 中 `daily_spend = 0.006620900000000001`，`/api/budget/agents` 中 `assistant` 的 `daily_cost_usd = 0.006620900000000001`
+      - 验证完成后，隔离 daemon 与整个 `/tmp/openfang-memory-trace-compare-live` home 已清理
+  - 已完成 Phase 2 第十二批 memory trace deep-link / shareable inspection URL 接线：
+    - `Logs -> Memory Trace` tab 现在会把当前 inspection state 写回 URL，而不再是纯内存态：
+      - `logs_tab=memory`
+      - `mt_agent=<agent-id>`
+      - `mt_mode=hybrid|text_only`
+      - `mt_source=shared|semantic`
+      - `mt_q=<trace search text>`
+      - `mt_compare=<seqA>,<seqB>`
+    - Logs 页切 tab 现在统一走 `setLogsTab()`，`Memory Trace` 的 filter / compare selection 变化会立即 `replaceState()` 回当前 URL；浏览器前进/后退也会通过 `popstate` 恢复相同的 trace inspection 状态
+    - `Memory Trace` controls 新增 `Copy Link`，可直接复制当前 tab/filter/compare 选择对应的 shareable inspection URL，便于在 dashboard 内复现同一组 trace 视图
+    - URL restore 逻辑当前有显式约束，避免把非法 compare 选择写进页面状态：
+      - `mt_compare` 最多只恢复两条正整数 `seq`
+      - 空 filter 不会污染 URL
+      - 非 `memory/audit/live` 的 tab 值会回退到默认 `live`
+  - 已完成本轮 deep-link / shareable URL 验证：
+    - `node` 级 URL-state smoke 通过：
+      - 直接加载 `static/js/pages/logs.js`
+      - 以 `?logs_tab=memory&mt_agent=agent-1&mt_mode=hybrid&mt_source=shared&mt_q=launch+blocker&mt_compare=12,34` 初始化 Logs page state
+      - `applyLogsUrlState()` 后 state 正确恢复：
+        - `tab = memory`
+        - `memoryTraceAgentFilter = agent-1`
+        - `memoryTraceModeFilter = hybrid`
+        - `memoryTraceSourceFilter = shared`
+        - `memoryTraceTextFilter = launch blocker`
+        - `memoryTraceCompareSeqs = [12, 34]`
+      - `syncLogsUrlState()` 生成的 URL 与当前 state 一致，包含 `#logs` 与全部 memory-trace query params
+    - `cargo build --workspace --lib`
+    - `cargo test --workspace`
+    - `cargo clippy --workspace --all-targets -- -D warnings`
+    - `cargo build -p openfang-cli`
+    - live deep-link/shareable-URL verification 通过：
+      - 在隔离的 `OPENFANG_HOME=/tmp/openfang-memory-trace-link-live` 上，以 `127.0.0.1:4215` 启动临时 daemon
+      - 使用隔离 daemon 自带 `assistant` agent，通过 memory API 写入 shared probe `project.alpha.link_status = { summary = "QA signoff pending", blocker = "dashboard memory trace link verification", owner = "release" }`
+      - 第一轮真实询问 `What is blocking the alpha launch?`，回复命中 shared blocker `dashboard memory trace link verification`
+      - 第二轮真实消息写入 semantic phrase `LINK-SEM-20260317-021903`，随后执行 `POST /api/agents/{id}/session/reset`
+      - 第三轮真实询问 `What is blocking the alpha launch, and what is the device unlock phrase you were told to remember?`，回复同时返回：
+        - shared blocker `dashboard memory trace link verification`
+        - semantic phrase `LINK-SEM-20260317-021903`
+      - `GET /api/audit/recent?n=30` 中真实返回了三条 `MemoryTrace` entry，且其中：
+        - `seq = 1` 为 `semantic_candidates=0 shared_candidates=1 selected_fused_recall_count=1`
+        - `seq = 3` 为 `semantic_candidates=1 shared_candidates=1 selected_fused_recall_count=2`
+        - `seq = 5` 为 `semantic_candidates=2 shared_candidates=1 session_summaries=1 selected_fused_recall_count=3`
+      - `GET /api/logs/stream?filter=memorytrace` 的 SSE backfill 也真实返回了相同的 parsed `payload`，包含 shared recall 与 `LINK-SEM-20260317-021903` semantic recall
+      - `curl http://127.0.0.1:4215/` 的 dashboard HTML 中已出现：
+        - `Copy Link`
+        - `Prompt-Time Memory Trace`
+        - `syncLogsUrlState()`
+        - `initLogsPage()`
+        - `mt_compare`
+        证明 deep-link / shareable URL wiring 已真实进入服务端静态资源输出
+      - 隔离 daemon 的 `/api/budget` 中 `daily_spend = 0.006100600000000001`，`/api/budget/agents` 中 `assistant` 的 `daily_cost_usd = 0.006100600000000001`
+      - 验证完成后，隔离 daemon 与整个 `/tmp/openfang-memory-trace-link-live` home 已清理
+  - 已完成 Phase 2 第十三批 memory trace pinning / persistent inspection workspace 接线：
+    - `Logs -> Memory Trace` 现在新增 pinned trace workspace，不再只能依赖当前 live buffer 做 inspection：
+      - 每条 trace card 新增 `Pin trace` / `Unpin trace`
+      - 顶部新增 `Pinned Traces` 面板，固定展示已持久化的 trace snapshot
+      - pinned traces 仍可直接加入 compare selection，不要求对应 trace 还留在当前流式窗口里
+    - pinned traces 当前会持久化到浏览器 `localStorage`：
+      - storage key = `openfang.memoryTracePins.v1`
+      - 保存字段为 `seq` / `timestamp` / `agent_id` / `detail` / `payload`
+      - 最多保留最近 24 条 pinned trace snapshot
+    - compare lookup 现在会优先取 live `entries`，缺失时回退到 persisted pin snapshot；这样 compare 不再严格依赖 `/api/audit/recent?n=200` 当前还能覆盖那条 trace
+    - `Memory Trace` controls 新增 pinned-only 视图切换与 pin cleanup：
+      - `Pinned only` / `All traces`
+      - `Clear pins (N)`
+      - pinned-only 状态会写回 URL 为 `mt_pinned=1`
+  - 已完成本轮 pinning / persistence 验证：
+    - `node` 级 pinned-persistence smoke 通过：
+      - 直接加载 `static/js/pages/logs.js`
+      - 构造一条 mock `MemoryTrace` 后执行 `toggleMemoryTracePinned()`
+      - fake `localStorage` 中成功写入 `openfang.memoryTracePins.v1`
+      - 第二个 `logsPage()` 实例在 `?logs_tab=memory&mt_pinned=1` 下成功恢复：
+        - `memoryTracePinnedOnly = true`
+        - `memoryTracePinnedEntries.length = 1`
+        - `memoryTraceCompareEntries[0].seq = 42`
+      - 说明 pinned snapshot restore 与 compare fallback 不依赖 live `entries`
+    - `cargo build --workspace --lib`
+    - `cargo test --workspace`
+    - `cargo clippy --workspace --all-targets -- -D warnings`
+    - `cargo build -p openfang-cli`
+    - live pinning/persistence verification 通过：
+      - 在隔离的 `OPENFANG_HOME=/tmp/openfang-memory-trace-pin-live` 上，以 `127.0.0.1:4216` 启动临时 daemon
+      - 使用隔离 daemon 自带 `assistant` agent，通过 memory API 写入 shared probe `project.alpha.pin_status = { summary = "QA signoff pending", blocker = "memory trace pinned inspection verification", owner = "release" }`
+      - 第一轮真实询问 `What is blocking the alpha launch?`，回复命中 shared blocker `memory trace pinned inspection verification`
+      - 第二轮真实消息写入 semantic phrase `PIN-SEM-20260317-023244`，随后执行 `POST /api/agents/{id}/session/reset`
+      - 第三轮真实询问 `What is blocking the alpha launch, and what is the launch override phrase you were told to remember?`，回复同时返回：
+        - shared blocker `memory trace pinned inspection verification`
+        - semantic phrase `PIN-SEM-20260317-023244`
+      - `GET /api/audit/recent?n=30` 中真实返回了三条 `MemoryTrace` entry，且其中：
+        - `seq = 1` 为 `semantic_candidates=0 shared_candidates=1 selected_fused_recall_count=1`
+        - `seq = 3` 为 `semantic_candidates=1 shared_candidates=1 selected_fused_recall_count=2`
+        - `seq = 5` 为 `semantic_candidates=2 shared_candidates=1 session_summaries=1 selected_fused_recall_count=3`
+      - `GET /api/logs/stream?filter=memorytrace` 的 SSE backfill 也真实返回了同样的 parsed `payload`，其中包含 shared probe 与 `PIN-SEM-20260317-023244` semantic recall
+      - `curl http://127.0.0.1:4216/` 的 dashboard HTML 中已出现：
+        - `Pinned Traces`
+        - `Pinned only`
+        - `Clear pins`
+        - `Pin trace`
+        - `mt_pinned`
+        - `openfang.memoryTracePins.v1`
+        证明 pinning / persistent inspection workspace 已真实进入服务端静态资源输出
+      - 隔离 daemon 的 `/api/budget` 中 `daily_spend = 0.0051612`，`/api/budget/agents` 中 `assistant` 的 `daily_cost_usd = 0.0051612`
+      - 验证完成后，隔离 daemon 与整个 `/tmp/openfang-memory-trace-pin-live` home 已清理
+  - 已完成 Phase 2 第十四批 independent memory-debug workspace 收口：
+    - dashboard 现在不再只有 `Logs -> Memory Trace` 这一条 inspection 入口，而是新增独立 `Memory Debug` page：
+      - sidebar Monitor 区新增 `Memory Debug`
+      - `#memory-trace` 成为独立 hash route
+      - 独立页面会直接固定到 `memory` inspection 模式，不再暴露 live/audit tabs
+    - `openfang-api/static/js/pages/logs.js` 现在支持按页面模式工作：
+      - `logsPage('logs')`
+      - `logsPage('memory-trace')`
+      - standalone `Memory Debug` page 下 `Copy Link` 会生成 `#memory-trace` 链接，不再携带 `logs_tab`
+    - 原先的 Memory Trace deep-link / pinning / compare / raw payload / export 能力全部保留，并被独立 workspace 复用，没有再分叉第二套 inspection 语义
+    - Logs 页仍保留原来的 `Memory Trace` tab，兼容已有 usage；独立 `Memory Debug` page 则作为 Phase 2 对 inspection surface 的正式收口入口
+  - 已完成本轮 independent memory-debug workspace 验证：
+    - `node` 级 standalone-route smoke 通过：
+      - `logsPage('memory-trace')` 在 `?mt_agent=agent-9&mt_pinned=1#memory-trace` 下会自动恢复：
+        - `tab = memory`
+        - `memoryTracePinnedOnly = true`
+      - `syncLogsUrlState()` 生成的链接保持 `#memory-trace`，并写回 `mt_agent` / `mt_pinned` / `mt_mode`，不再写 `logs_tab`
+    - `cargo build --workspace --lib`
+    - `cargo test --workspace`
+    - `cargo clippy --workspace --all-targets -- -D warnings`
+    - `cargo build -p openfang-cli`
+    - live independent-workspace verification 通过：
+      - 在隔离的 `OPENFANG_HOME=/tmp/openfang-memory-trace-workspace-live` 上，以 `127.0.0.1:4217` 启动临时 daemon
+      - 使用隔离 daemon 自带 `assistant` agent，通过 memory API 写入 shared probe `project.alpha.workspace_status = { summary = "QA signoff pending", blocker = "memory debug workspace verification", owner = "release" }`
+      - 第一轮真实询问 `What is blocking the alpha launch?`，第二轮注入 semantic phrase `WORKSPACE-SEM-20260317-024814`，随后执行 `POST /api/agents/{id}/session/reset`
+      - 第三轮真实询问 `What is blocking the alpha launch, and what is the workspace probe phrase you were told to remember?`，回复同时返回：
+        - shared blocker `memory debug workspace verification`
+        - semantic phrase `WORKSPACE-SEM-20260317-024814`
+      - `GET /api/audit/recent?n=30` 中真实返回三条 `MemoryTrace` entry，形成 shared-only / shared+semantic / shared+2 semantic 的 inspection 输入
+      - `curl http://127.0.0.1:4217/` 的 dashboard HTML 中已出现：
+        - `Memory Debug`
+        - `Open Workspace`
+        - `Open Logs`
+        - `memory-trace`
+        - `Pinned Traces`
+        - `mt_pinned`
+        证明独立 workspace 路由、导航与 memory inspection surface 已真实进入服务端静态资源输出
+      - 隔离 daemon 的 `/api/budget` 中 `daily_spend = 0.005888300000000001`，`/api/budget/agents` 中 `assistant` 的 `daily_cost_usd = 0.005888300000000001`
+      - 验证完成后，隔离 daemon 与整个 `/tmp/openfang-memory-trace-workspace-live` home 已清理
+  - 已完成 Phase 2 `embedding-hybrid-retrieval` 收口：
+    - retrieval 主链路已覆盖：
+      - semantic hybrid recall
+      - governed shared memory + semantic fusion
+      - weighted source fusion helper
+      - prompt memory context shared contract
+    - observability / telemetry 已覆盖：
+      - `llm.log` 文本 `*** MEMORY TRACE`
+      - structured tracing telemetry
+      - audit-backed `/api/logs/stream` / `/api/audit/recent`
+    - inspection surface 已覆盖：
+      - Logs/Audit inspection
+      - dedicated `Memory Trace` tab
+      - compare / raw payload / export
+      - shareable inspection URL
+      - persisted pinned trace workspace
+      - independent `Memory Debug` page
+    - Phase 2 当前不再有未收口的 retrieval / trace / inspection 缺口；后续工作转入 Phase 3 `prompt architecture`
 
 ## 进行中
 
-- 准备进入 Phase 2：embedding / hybrid retrieval 的接线边界、provider 选择、以及如何消费现有 governed metadata。
+- Phase 2 已完成。下一步切换到 `prompt architecture` 阶段，重点收口 prompt section 职责去重、attention budget 治理与跨 section 冲突仲裁。
 
 ## 下一步动作
 
-- 读取并对齐 Phase 2 设计目标：embedding provider、fallback、以及 governed metadata 在 hybrid retrieval 中的消费顺序。
-- 决定 Phase 2 的最小落地点：先接 embedding recall、还是直接做 hybrid retrieval 排序与回退。
-- 把当前 embedding 运行前提补齐后再开始 live verification；本机 `http://localhost:11434/v1/embeddings` 当前离线，会影响 Phase 2 验证路径。
+- 切换到 Phase 3 `prompt architecture`：
+  - 继续梳理 `AGENTS.md` / `USER.md` / `TOOLS.md` / `MEMORY.md` 的职责去重与模板收敛
+  - 引入 prompt attention / token budget 治理，减少跨 section 冗余和注意力漂移
+  - 明确 `USER.md` / `MEMORY.md` / KV recall / governed signals 之间的冲突优先级
+- 将 `Memory Debug` workspace 视作 Phase 2 已完成资产；后续若继续增强，只作为 Phase 3+ 的 inspection 优化，例如 timeline/diff、命名 pinned sets 或跨设备同步
 - 在切换电脑或结束一轮实质性工作前，持续更新本文件。
 
 ## 风险与阻塞
 
-- `cargo clippy --workspace --all-targets -- -D warnings` 当前仍被 `openfang-cli/src/main.rs` 中既有问题阻塞；按仓库约束，本轮未修改 `openfang-cli`。
-- 当前 embedding provider 本地端点 `http://localhost:11434/v1/embeddings` 离线，live LLM 调用期间会回退到 text search；这不阻塞本轮 KV governance 验证，但会影响 embedding recall 路径验证。
 - 当前现有 agent 的 tool-call 路径存在两类既有兼容问题：`assistant` 的 gemini path 仍有 `thought_signature` 错误，`Researcher` 的 MiniMax path 也出现了 tool-result id 不匹配；因此本轮 dashboard cleanup live LLM verification 同样改用临时无工具 MiniMax verifier agent 完成。
+- Phase 2 现在已经把 `MEMORY_TRACE` 同步到了：
+  - `llm.log` 文本 trace
+  - `tracing::info!` 结构化字段
+  - audit-backed `/api/logs/stream` `MemoryTrace` 事件
+  - dashboard `Logs -> Memory Trace` dedicated tab
+  - dashboard `Memory Debug` independent workspace
+  当前 retrieval / trace / inspection 链路已经收口；后续如果 trace 密度继续上升，timeline/diff、命名 pinned sets 与跨设备同步更像是 Phase 3+ 的 inspection 增强，而不再是 Phase 2 阻塞项。
+- 需要避免在 daemon 运行中直接用 sqlite 修改 shared memory sidecar 做复杂 live probe；这类验证更稳妥的做法仍然是 daemon 停止后做 DB 注入，或改造成 API/tool 可达路径。
 - 如果后续启动工作时不先读取本文件，分支纪律和连续性可能重新漂移。
 
 ## 验证清单
@@ -207,4 +752,4 @@
 
 ## 最后更新时间
 
-- 2026-03-14 Asia/Shanghai
+- 2026-03-17 Asia/Shanghai

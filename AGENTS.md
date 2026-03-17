@@ -15,9 +15,10 @@ cargo clippy --workspace --all-targets -- -D warnings  # Zero warnings
 ```
 
 ## Formatting Policy
-- Do not run repository-wide `cargo fmt`
-- If formatting is necessary, format only the touched files or apply minimal manual formatting
-- Default to debug builds; do not switch to release builds unless the user explicitly asks for it
+- Do not run any code formatting commands under any circumstances, including `cargo fmt`, file-scoped formatting, editor auto-format, or formatter-on-save behavior.
+- Do not perform bulk or opportunistic formatting edits; keep formatting changes out of commits unless the user explicitly requests formatting work.
+- Default to debug builds only.
+- Do not compile release binaries or run release builds, including `cargo build --release`, `cargo run --release`, or any equivalent release-profile executable build, unless the user explicitly asks for it.
 
 ## MANDATORY: Live Integration Testing
 **After implementing any new endpoint, feature, or wiring change, you MUST run live integration tests.** Unit tests alone are not enough — they can pass while the feature is actually dead code. Live tests catch:

@@ -12,9 +12,11 @@ use openfang_types::agent::AgentId;
 use openfang_types::error::{OpenFangError, OpenFangResult};
 use openfang_types::memory::{MemoryFilter, MemoryFragment, MemoryId, MemorySource};
 use rusqlite::Connection;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tracing::debug;
+
+const HYBRID_RRF_K: f32 = 60.0;
 
 /// Semantic store backed by SQLite with optional vector search.
 #[derive(Clone)]
@@ -104,14 +106,6 @@ impl SemanticStore {
             .lock()
             .map_err(|e| OpenFangError::Internal(e.to_string()))?;
 
-        // Build SQL: fetch candidates (broader than limit for vector re-ranking)
-        let fetch_limit = if query_embedding.is_some() {
-            // Fetch more candidates for vector search re-ranking
-            (limit * 10).max(100)
-        } else {
-            limit
-        };
-
         let mut sql = String::from(
             "SELECT id, agent_id, content, source, scope, confidence, metadata, created_at, accessed_at, access_count, embedding
              FROM memories WHERE deleted = 0",
@@ -153,7 +147,9 @@ impl SemanticStore {
         }
 
         sql.push_str(" ORDER BY accessed_at DESC, access_count DESC");
-        sql.push_str(&format!(" LIMIT {fetch_limit}"));
+        if query_embedding.is_none() {
+            sql.push_str(&format!(" LIMIT {limit}"));
+        }
 
         let mut stmt = conn
             .prepare(&sql)
@@ -240,29 +236,10 @@ impl SemanticStore {
             });
         }
 
-        // If we have a query embedding, re-rank by cosine similarity
-        if let Some(qe) = query_embedding {
-            fragments.sort_by(|a, b| {
-                let sim_a = a
-                    .embedding
-                    .as_deref()
-                    .map(|e| cosine_similarity(qe, e))
-                    .unwrap_or(-1.0);
-                let sim_b = b
-                    .embedding
-                    .as_deref()
-                    .map(|e| cosine_similarity(qe, e))
-                    .unwrap_or(-1.0);
-                sim_b
-                    .partial_cmp(&sim_a)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            fragments.truncate(limit);
-            debug!(
-                "Vector recall: {} results from {} candidates",
-                fragments.len(),
-                fetch_limit
-            );
+        if query_embedding.is_some() {
+            fragments = hybrid_rank_fragments(fragments, query, query_embedding, limit);
+        } else {
+            debug!("Text recall: {} results", fragments.len());
         }
 
         // Update access counts for returned memories
@@ -303,6 +280,285 @@ impl SemanticStore {
         )
         .map_err(|e| OpenFangError::Memory(e.to_string()))?;
         Ok(())
+    }
+}
+
+fn normalize_query_text(input: &str) -> String {
+    let mut normalized = String::with_capacity(input.len());
+    let mut previous_was_space = false;
+
+    for ch in input.chars() {
+        let normalized_char = if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-') {
+            ch.to_ascii_lowercase()
+        } else {
+            ' '
+        };
+
+        if normalized_char == ' ' {
+            if !previous_was_space && !normalized.is_empty() {
+                normalized.push(' ');
+            }
+            previous_was_space = true;
+        } else {
+            normalized.push(normalized_char);
+            previous_was_space = false;
+        }
+    }
+
+    normalized.trim().to_string()
+}
+
+fn query_terms(query: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    let mut seen = HashSet::new();
+
+    for term in normalize_query_text(query)
+        .split_whitespace()
+        .filter(|term| term.len() >= 2)
+    {
+        let term = term.to_string();
+        if seen.insert(term.clone()) {
+            terms.push(term);
+        }
+    }
+
+    terms
+}
+
+fn fragment_search_text(fragment: &MemoryFragment) -> String {
+    let metadata_text = serde_json::to_string(&fragment.metadata).unwrap_or_default();
+    normalize_query_text(&format!(
+        "{} {} {} {}",
+        fragment.content,
+        fragment.scope,
+        fragment.source_string(),
+        metadata_text
+    ))
+}
+
+fn text_match_score(fragment: &MemoryFragment, query: &str, query_terms: &[String]) -> usize {
+    if query.is_empty() {
+        return 0;
+    }
+
+    let haystack = fragment_search_text(fragment);
+    if haystack.is_empty() {
+        return 0;
+    }
+
+    let mut score = 0;
+    if haystack.contains(query) {
+        score += 12;
+    }
+
+    for term in query_terms {
+        if haystack.contains(term) {
+            score += 4;
+        }
+    }
+
+    score
+}
+
+fn reciprocal_rank_fusion(score: &mut f32, rank: usize) {
+    *score += 1.0 / (HYBRID_RRF_K + rank as f32 + 1.0);
+}
+
+fn append_remaining_fragments(
+    ordered: &mut Vec<usize>,
+    fragments: &[MemoryFragment],
+    limit: usize,
+) {
+    let seen: HashSet<usize> = ordered.iter().copied().collect();
+    for idx in 0..fragments.len() {
+        if seen.contains(&idx) {
+            continue;
+        }
+        ordered.push(idx);
+        if ordered.len() >= limit {
+            break;
+        }
+    }
+}
+
+fn hybrid_rank_fragments(
+    fragments: Vec<MemoryFragment>,
+    query: &str,
+    query_embedding: Option<&[f32]>,
+    limit: usize,
+) -> Vec<MemoryFragment> {
+    if limit == 0 || fragments.is_empty() {
+        return Vec::new();
+    }
+
+    let normalized_query = normalize_query_text(query);
+    let query_terms = query_terms(query);
+
+    let mut text_ranked: Vec<(usize, usize)> = fragments
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, fragment)| {
+            let score = text_match_score(fragment, &normalized_query, &query_terms);
+            (score > 0).then_some((idx, score))
+        })
+        .collect();
+    text_ranked.sort_by(|(idx_a, score_a), (idx_b, score_b)| {
+        score_b
+            .cmp(score_a)
+            .then_with(|| {
+                fragments[*idx_b]
+                    .accessed_at
+                    .cmp(&fragments[*idx_a].accessed_at)
+            })
+            .then_with(|| {
+                fragments[*idx_b]
+                    .access_count
+                    .cmp(&fragments[*idx_a].access_count)
+            })
+            .then_with(|| fragments[*idx_a].id.0.cmp(&fragments[*idx_b].id.0))
+    });
+
+    let vector_ranked: Vec<(usize, f32)> = query_embedding
+        .map(|embedding| {
+            let mut ranked: Vec<(usize, f32)> = fragments
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, fragment)| {
+                    fragment
+                        .embedding
+                        .as_deref()
+                        .and_then(|fragment_embedding| {
+                            (fragment_embedding.len() == embedding.len())
+                                .then_some((idx, cosine_similarity(embedding, fragment_embedding)))
+                        })
+                })
+                .collect();
+            ranked.sort_by(|(idx_a, score_a), (idx_b, score_b)| {
+                score_b
+                    .partial_cmp(score_a)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| {
+                        fragments[*idx_b]
+                            .accessed_at
+                            .cmp(&fragments[*idx_a].accessed_at)
+                    })
+                    .then_with(|| {
+                        fragments[*idx_b]
+                            .access_count
+                            .cmp(&fragments[*idx_a].access_count)
+                    })
+                    .then_with(|| fragments[*idx_a].id.0.cmp(&fragments[*idx_b].id.0))
+            });
+            ranked
+        })
+        .unwrap_or_default();
+
+    if text_ranked.is_empty() && vector_ranked.is_empty() {
+        return fragments.into_iter().take(limit).collect();
+    }
+
+    if text_ranked.is_empty() {
+        debug!(
+            "Vector recall: {} results from {} vector candidates",
+            limit.min(vector_ranked.len()),
+            vector_ranked.len()
+        );
+        let mut ordered: Vec<usize> = vector_ranked.into_iter().map(|(idx, _)| idx).collect();
+        append_remaining_fragments(&mut ordered, &fragments, limit);
+        return ordered
+            .into_iter()
+            .take(limit)
+            .map(|idx| fragments[idx].clone())
+            .collect();
+    }
+
+    if vector_ranked.is_empty() {
+        debug!(
+            "Text recall: {} results from {} text candidates",
+            limit.min(text_ranked.len()),
+            text_ranked.len()
+        );
+        let mut ordered: Vec<usize> = text_ranked.into_iter().map(|(idx, _)| idx).collect();
+        append_remaining_fragments(&mut ordered, &fragments, limit);
+        return ordered
+            .into_iter()
+            .take(limit)
+            .map(|idx| fragments[idx].clone())
+            .collect();
+    }
+
+    let mut fused_scores: HashMap<usize, f32> = HashMap::new();
+    let text_score_map: HashMap<usize, usize> = text_ranked.iter().copied().collect();
+    let vector_score_map: HashMap<usize, f32> = vector_ranked.iter().copied().collect();
+
+    for (rank, (idx, _)) in text_ranked.iter().enumerate() {
+        reciprocal_rank_fusion(fused_scores.entry(*idx).or_insert(0.0), rank);
+    }
+    for (rank, (idx, _)) in vector_ranked.iter().enumerate() {
+        reciprocal_rank_fusion(fused_scores.entry(*idx).or_insert(0.0), rank);
+    }
+
+    let mut ranked: Vec<(usize, f32)> = fused_scores.into_iter().collect();
+    ranked.sort_by(|(idx_a, fused_a), (idx_b, fused_b)| {
+        fused_b
+            .partial_cmp(fused_a)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                text_score_map
+                    .get(idx_b)
+                    .unwrap_or(&0)
+                    .cmp(text_score_map.get(idx_a).unwrap_or(&0))
+            })
+            .then_with(|| {
+                vector_score_map
+                    .get(idx_b)
+                    .unwrap_or(&-1.0)
+                    .partial_cmp(vector_score_map.get(idx_a).unwrap_or(&-1.0))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| {
+                fragments[*idx_b]
+                    .accessed_at
+                    .cmp(&fragments[*idx_a].accessed_at)
+            })
+            .then_with(|| {
+                fragments[*idx_b]
+                    .access_count
+                    .cmp(&fragments[*idx_a].access_count)
+            })
+            .then_with(|| fragments[*idx_a].id.0.cmp(&fragments[*idx_b].id.0))
+    });
+
+    debug!(
+        "Hybrid recall: {} results from {} text candidates and {} vector candidates",
+        limit.min(ranked.len()),
+        text_ranked.len(),
+        vector_ranked.len()
+    );
+
+    let mut ordered: Vec<usize> = ranked.into_iter().map(|(idx, _)| idx).collect();
+    append_remaining_fragments(&mut ordered, &fragments, limit);
+    ordered
+        .into_iter()
+        .take(limit)
+        .map(|idx| fragments[idx].clone())
+        .collect()
+}
+
+trait MemoryFragmentSearchView {
+    fn source_string(&self) -> &'static str;
+}
+
+impl MemoryFragmentSearchView for MemoryFragment {
+    fn source_string(&self) -> &'static str {
+        match self.source {
+            MemorySource::Conversation => "conversation",
+            MemorySource::Document => "document",
+            MemorySource::Observation => "observation",
+            MemorySource::Inference => "inference",
+            MemorySource::UserProvided => "user_provided",
+            MemorySource::System => "system",
+        }
     }
 }
 
@@ -489,6 +745,39 @@ mod tests {
         assert!(results[0].content.contains("Rust"));
         // Python memory should be last (lowest similarity)
         assert!(results[2].content.contains("Python"));
+    }
+
+    #[test]
+    fn test_hybrid_recall_surfaces_keyword_match_without_embedding() {
+        let store = setup();
+        let agent_id = AgentId::new();
+
+        store
+            .remember(
+                agent_id,
+                "Export failed with error code E123 while syncing invoices",
+                MemorySource::Conversation,
+                "episodic",
+                HashMap::new(),
+            )
+            .unwrap();
+        store
+            .remember_with_embedding(
+                agent_id,
+                "A recent sync problem affected the billing workflow",
+                MemorySource::Conversation,
+                "episodic",
+                HashMap::new(),
+                Some(&[1.0, 0.0, 0.0, 0.0]),
+            )
+            .unwrap();
+
+        let results = store
+            .recall_with_embedding("E123 export", 2, None, Some(&[1.0, 0.0, 0.0, 0.0]))
+            .unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert!(results[0].content.contains("E123"));
     }
 
     #[test]
