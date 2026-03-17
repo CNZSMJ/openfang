@@ -465,19 +465,25 @@ OpenClaw 迁移测试已更新为断言：
 - `session_*` 摘要
 - `memory/*.md`
 
-## 15. Prompt Architecture 相关但未纳入本次实现的内容
+## 15. Prompt Architecture 收口结果与剩余边界
 
-本分支中的 memory enhancement 已经和当前 prompt architecture 发生结构性衔接，但仍有一部分相邻问题没有在本次实现中解决，应该明确标为后续工作，而不是混入“当前设计已完成”：
+本分支中的 memory enhancement 在后续 Phase 3 中已经把相邻的 prompt architecture 问题一并收口，当前已完成：
 
-1. `AGENTS.md` / `USER.md` / `TOOLS.md` / `MEMORY.md` 的职责进一步去重与模板优化。
-2. system prompt 各板块的注意力预算、token 预算和优先级治理。
-3. 跨 section 冲突仲裁，例如 `USER.md`、`MEMORY.md`、KV recall 之间谁更权威。
-4. assistant 专属 `MEMORY.md` 的生成质量、维护策略和自动收敛机制。
+1. `AGENTS.md` / `TOOLS.md` / `USER.md` / `MEMORY.md` 的职责去重、authority ordering 和模板占位过滤。
+2. system prompt workspace guidance 的总预算治理与跨 section 去重。
+3. 动态 `[Memory context]` 的优先级提醒、section budget 和跨来源去重。
+4. `USER.md` / `MEMORY.md` / fused recall / governed signals / session summaries 之间的显式冲突仲裁。
+
+当前仍然不在本分支内继续推进的，是更后续的 assistant memory autoconverge 问题：
+
+1. assistant 专属 `MEMORY.md` 的生成质量与维护策略。
+2. promotion candidate 如何更自动地收敛进 `MEMORY.md`。
+3. 更细粒度、任务自适应的 token allocator / prompt packer。
 
 也就是说：
 
-- 当前实现已经解决了 memory visibility、memory discovery 和 turn-level injection。
-- 当前实现尚未完成完整的 prompt attention architecture。
+- 当前实现已经解决了 memory visibility、memory discovery、turn-level injection，以及 prompt attention governance 的第一轮收口。
+- 当前未做的是 assistant 级别的长期记忆自动收敛，而不是 prompt architecture 主链路缺失。
 
 ## 16. 风险与后续迭代优先级
 
@@ -527,27 +533,25 @@ OpenClaw 迁移测试已更新为断言：
 
 ### P2：第二阶段优化
 
-#### P2.1 Prompt 文档职责重整
+#### P2.1 Assistant 专属 `MEMORY.md` 质量与收敛
 
-`MEMORY.md` 之外，`AGENTS.md`、`USER.md`、`TOOLS.md`、`BOOTSTRAP.md`、`SOUL.md`、`IDENTITY.md` 之间仍然存在一定的职责重叠。
+Phase 3 已经把 prompt 文档职责、authority ordering 和冲突优先级收口；下一步更值得投入的是 assistant 专属 `MEMORY.md` 的生成质量、维护节奏与晋升策略。
 
-后续应进一步明确：
+#### P2.2 注意力预算的进一步细化
 
-- 哪些规则属于 system prompt 固定指令
-- 哪些属于 workspace guidance
-- 哪些属于长期记忆
-- 哪些属于一次性 bootstrap ritual
+当前已经具备：
 
-#### P2.2 注意力预算与冲突治理
+- workspace guidance authority ordering
+- workspace guidance 跨 section 去重
+- 动态 memory context priority reminder
+- recall / governance / session summary 的分段预算
+- 显式冲突优先级
 
-当前 system prompt 已有 section ordering 和字符上限，但还没有做到：
+后续若继续增强，重点不再是“有没有 attention governance”，而是：
 
 - token-aware budget
-- 跨 section 去重
 - 任务类型驱动的重排
-- 明确的冲突优先级
-
-这属于 prompt architecture 的下一阶段，而不是本次 memory enhancement 的直接目标。
+- 更细粒度的 prompt packing / truncation 策略
 
 #### P2.3 Assistant 专属 `MEMORY.md` 模板与维护策略
 
@@ -587,6 +591,7 @@ OpenClaw 迁移测试已更新为断言：
 - `crates/openfang-runtime/src/kernel_handle.rs`
 - `crates/openfang-kernel/src/kernel.rs`
 - `crates/openfang-kernel/src/wizard.rs`
+- `crates/openfang-types/src/memory.rs`
 - `crates/openfang-types/src/agent.rs`
 - `crates/openfang-types/src/tool_compat.rs`
 - `crates/openfang-migrate/src/openclaw.rs`
@@ -608,12 +613,14 @@ OpenClaw 迁移测试已更新为断言：
 4. `memory_list` 补齐了发现 key 的能力。
 5. `memory_search -> memory_list` 的兼容映射、tool profile 暴露和 wizard 提示已同步完成。
 6. 历史裁剪已修复对 prepended memory context 的破坏。
+7. prompt builder 已具备显式 `Prompt Priorities`、workspace guidance authority ordering、跨 section 去重与预算治理。
+8. 动态 memory context 已具备 priority reminder、section budget、跨来源去重与显式冲突仲裁。
 
 因此，当前实现已经完成“长期记忆可用性增强”的主体目标。
 
 下一阶段不应继续把所有问题都堆进 memory 文档，而应沿两个相对解耦的方向推进：
 
-1. memory governance / retrieval quality
-2. prompt architecture / attention governance
+1. memory governance / retrieval quality 的持续优化
+2. assistant memory autoconverge
 
 两者相关，但不应在同一轮改造里混成一个高耦合大改。

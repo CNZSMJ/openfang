@@ -1584,6 +1584,90 @@ fn cap_prompt_memory_context_text(s: &str, max_chars: usize) -> String {
     }
 }
 
+const PROMPT_MEMORY_CONTEXT_TOTAL_BUDGET: usize = 1800;
+const PROMPT_MEMORY_CONTEXT_RECALL_BUDGET: usize = 960;
+const PROMPT_MEMORY_CONTEXT_SIGNAL_BUDGET: usize = 420;
+const PROMPT_MEMORY_CONTEXT_SUMMARY_BUDGET: usize = 280;
+const PROMPT_MEMORY_CONTEXT_MIN_SECTION_BUDGET: usize = 120;
+const PROMPT_MEMORY_CONTEXT_PRIORITY_NOTE: &str = "\
+Priority reminder: current user request and workspace guidance outrank recalled memory, governance signals, and session summaries when they conflict.";
+
+fn normalize_prompt_memory_context_item(item: &str) -> String {
+    item.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn render_prompt_memory_context_section(
+    title: &str,
+    items: &[String],
+    item_limit: usize,
+    item_cap: usize,
+    section_budget: usize,
+    remaining_budget: usize,
+    seen_items: &mut HashSet<String>,
+) -> Option<String> {
+    if items.is_empty() || item_limit == 0 || section_budget == 0 || remaining_budget == 0 {
+        return None;
+    }
+
+    let allowed_budget = section_budget.min(remaining_budget);
+    let mut block = String::new();
+    let mut used_chars = 0usize;
+    let mut rendered_any = false;
+
+    for item in items.iter().take(item_limit) {
+        let normalized = normalize_prompt_memory_context_item(item);
+        if normalized.is_empty() || !seen_items.insert(normalized) {
+            continue;
+        }
+
+        let line = format!("- {}\n", cap_prompt_memory_context_text(item, item_cap));
+        let line_chars = line.chars().count();
+        let projected = title.chars().count() + 2 + used_chars + line_chars;
+        if rendered_any && projected > allowed_budget {
+            break;
+        }
+        if !rendered_any && projected > allowed_budget {
+            if allowed_budget < PROMPT_MEMORY_CONTEXT_MIN_SECTION_BUDGET {
+                return None;
+            }
+            let truncated = format!(
+                "- {}\n",
+                cap_prompt_memory_context_text(item, allowed_budget.saturating_sub(title.len() + 8))
+            );
+            block.push_str(title);
+            block.push_str(":\n");
+            block.push_str(&truncated);
+            return Some(block.trim_end().to_string());
+        }
+
+        if !rendered_any {
+            block.push_str(title);
+            block.push_str(":\n");
+            rendered_any = true;
+        }
+
+        block.push_str(&line);
+        used_chars += line_chars;
+    }
+
+    if rendered_any {
+        Some(block.trim_end().to_string())
+    } else {
+        None
+    }
+}
+
 /// Render recent `session_*` summaries for prompt-time memory context.
 pub fn render_recent_session_summaries_from_entries(
     entries: &[(String, serde_json::Value)],
@@ -1786,61 +1870,66 @@ pub fn render_prompt_memory_context_message(context: &PromptMemoryContext) -> Op
         return None;
     }
 
+    let mut remaining_budget = PROMPT_MEMORY_CONTEXT_TOTAL_BUDGET;
+    let mut blocks = Vec::new();
+    let mut seen_items = HashSet::new();
+
+    blocks.push(PROMPT_MEMORY_CONTEXT_PRIORITY_NOTE.to_string());
+    remaining_budget = remaining_budget.saturating_sub(PROMPT_MEMORY_CONTEXT_PRIORITY_NOTE.len());
+
+    if let Some(section) = render_prompt_memory_context_section(
+        "Relevant recalled memories",
+        &context.recalled_memories,
+        5,
+        280,
+        PROMPT_MEMORY_CONTEXT_RECALL_BUDGET,
+        remaining_budget,
+        &mut seen_items,
+    ) {
+        remaining_budget = remaining_budget.saturating_sub(section.chars().count());
+        blocks.push(section);
+    }
+
+    if let Some(section) = render_prompt_memory_context_section(
+        "Governance maintenance signals",
+        &context.cleanup_maintenance_signals,
+        4,
+        240,
+        PROMPT_MEMORY_CONTEXT_SIGNAL_BUDGET,
+        remaining_budget,
+        &mut seen_items,
+    ) {
+        remaining_budget = remaining_budget.saturating_sub(section.chars().count());
+        blocks.push(section);
+    }
+
+    if let Some(section) = render_prompt_memory_context_section(
+        "Governance attention signals",
+        &context.governance_attention_signals,
+        4,
+        240,
+        PROMPT_MEMORY_CONTEXT_SIGNAL_BUDGET,
+        remaining_budget,
+        &mut seen_items,
+    ) {
+        remaining_budget = remaining_budget.saturating_sub(section.chars().count());
+        blocks.push(section);
+    }
+
+    if let Some(section) = render_prompt_memory_context_section(
+        "Recent session summaries",
+        &context.recent_session_summaries,
+        3,
+        220,
+        PROMPT_MEMORY_CONTEXT_SUMMARY_BUDGET,
+        remaining_budget,
+        &mut seen_items,
+    ) {
+        blocks.push(section);
+    }
+
     let mut out = String::from("[Memory context]\n");
-
-    if !context.recalled_memories.is_empty() {
-        out.push_str("Relevant recalled memories:\n");
-        for memory in context.recalled_memories.iter().take(5) {
-            out.push_str(&format!(
-                "- {}\n",
-                cap_prompt_memory_context_text(memory, 320)
-            ));
-        }
-    }
-
-    if !context.cleanup_maintenance_signals.is_empty() {
-        if !context.recalled_memories.is_empty() {
-            out.push('\n');
-        }
-        out.push_str("Governance maintenance signals:\n");
-        for signal in context.cleanup_maintenance_signals.iter().take(4) {
-            out.push_str(&format!(
-                "- {}\n",
-                cap_prompt_memory_context_text(signal, 320)
-            ));
-        }
-    }
-
-    if !context.governance_attention_signals.is_empty() {
-        if !context.recalled_memories.is_empty() || !context.cleanup_maintenance_signals.is_empty()
-        {
-            out.push('\n');
-        }
-        out.push_str("Governance attention signals:\n");
-        for signal in context.governance_attention_signals.iter().take(4) {
-            out.push_str(&format!(
-                "- {}\n",
-                cap_prompt_memory_context_text(signal, 320)
-            ));
-        }
-    }
-
-    if !context.recent_session_summaries.is_empty() {
-        if !context.recalled_memories.is_empty()
-            || !context.cleanup_maintenance_signals.is_empty()
-            || !context.governance_attention_signals.is_empty()
-        {
-            out.push('\n');
-        }
-        out.push_str("Recent session summaries:\n");
-        for summary in context.recent_session_summaries.iter().take(3) {
-            out.push_str(&format!(
-                "- {}\n",
-                cap_prompt_memory_context_text(summary, 320)
-            ));
-        }
-    }
-
+    out.push_str(&blocks.join("\n\n"));
     Some(out.trim_end().to_string())
 }
 
@@ -2890,6 +2979,89 @@ mod tests {
 
         assert!(build_prompt_memory_context_trace_telemetry(&trace).is_none());
         assert!(render_prompt_memory_context_trace(&trace).is_none());
+    }
+
+    #[test]
+    fn test_render_prompt_memory_context_message_adds_priority_note_and_deduplicates() {
+        let message = render_prompt_memory_context_message(&PromptMemoryContext {
+            recalled_memories: vec![
+                "Shared memory [pref.reply.style] Prefer bullet lists.".to_string(),
+                "Shared memory [project.alpha.status] QA signoff pending.".to_string(),
+            ],
+            cleanup_maintenance_signals: vec![
+                "Run memory_cleanup before reuse: migrate legacy key [theme] to [general.theme]"
+                    .to_string(),
+            ],
+            governance_attention_signals: vec![
+                "Shared memory [pref.reply.style] Prefer bullet lists.".to_string(),
+                "Review stale memory before reuse: [project.alpha.status]".to_string(),
+            ],
+            recent_session_summaries: vec![
+                "Shared memory [project.alpha.status] QA signoff pending.".to_string(),
+                "Session summary: release owner waiting.".to_string(),
+            ],
+            trace: PromptMemoryContextTrace {
+                semantic_mode: MemoryContextRecallMode::Hybrid,
+                semantic_candidates: 1,
+                shared_candidates: 1,
+                fused_candidates: Vec::new(),
+                maintenance_signals: 1,
+                attention_signals: 2,
+                session_summaries: 2,
+            },
+        })
+        .unwrap();
+
+        assert!(message.contains("Priority reminder: current user request and workspace guidance outrank recalled memory"));
+        assert_eq!(
+            message
+                .matches("Shared memory [pref.reply.style] Prefer bullet lists.")
+                .count(),
+            1
+        );
+        assert_eq!(
+            message
+                .matches("Shared memory [project.alpha.status] QA signoff pending.")
+                .count(),
+            1
+        );
+        assert!(message.contains("Review stale memory before reuse"));
+        assert!(message.contains("Session summary: release owner waiting."));
+    }
+
+    #[test]
+    fn test_render_prompt_memory_context_message_respects_budget_and_drops_low_priority_overflow()
+    {
+        let message = render_prompt_memory_context_message(&PromptMemoryContext {
+            recalled_memories: (0..5)
+                .map(|idx| format!("Shared memory [project.alpha.note_{idx}] {}", "x".repeat(220)))
+                .collect(),
+            cleanup_maintenance_signals: (0..4)
+                .map(|idx| format!("Maintenance signal {idx}: {}", "y".repeat(220)))
+                .collect(),
+            governance_attention_signals: (0..4)
+                .map(|idx| format!("Attention signal {idx}: {}", "z".repeat(220)))
+                .collect(),
+            recent_session_summaries: (0..3)
+                .map(|idx| format!("Session summary {idx}: {}", "q".repeat(220)))
+                .collect(),
+            trace: PromptMemoryContextTrace {
+                semantic_mode: MemoryContextRecallMode::Hybrid,
+                semantic_candidates: 5,
+                shared_candidates: 5,
+                fused_candidates: Vec::new(),
+                maintenance_signals: 4,
+                attention_signals: 4,
+                session_summaries: 3,
+            },
+        })
+        .unwrap();
+
+        assert!(message.contains("Relevant recalled memories"));
+        assert!(message.contains("Governance maintenance signals"));
+        assert!(message.contains("Governance attention signals"));
+        assert!(message.matches("Session summary ").count() < 3);
+        assert!(message.chars().count() <= PROMPT_MEMORY_CONTEXT_TOTAL_BUDGET + 64);
     }
 
     #[test]

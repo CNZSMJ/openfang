@@ -5,6 +5,7 @@
 //! with a single, testable, ordered prompt builder.
 
 use openfang_types::memory::PromptMemoryContext;
+use std::collections::HashSet;
 
 /// Metadata for an immediately visible skill, used for prompt injection.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -84,6 +85,94 @@ pub struct PromptContext {
     pub current_date: Option<String>,
 }
 
+const FULL_WORKSPACE_GUIDANCE_BUDGET: usize = 6800;
+const MINIMAL_WORKSPACE_GUIDANCE_BUDGET: usize = 4200;
+const WORKSPACE_GUIDANCE_MIN_SLICE: usize = 160;
+
+const PROMPT_SOURCE_PRIORITY_SECTION: &str = "\
+## Prompt Priorities
+- Follow the current user request first unless it conflicts with the manifest system prompt, safety rules, or an explicit operating constraint.
+- When workspace files disagree, prefer `AGENTS.md` for operating rules, `TOOLS.md` for local environment facts, `USER.md` for standing user preferences, and `MEMORY.md` for durable historical context.
+- Treat injected recalled memory, governance signals, and session summaries as lower-priority historical hints; verify them before overriding `USER.md`, `TOOLS.md`, or the current request.
+- If two memory sources disagree, prefer the fresher, more specific, and better-governed source. Review stale lifecycle signals before reusing old memory.";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceGuidanceKind {
+    Agents,
+    Tools,
+    User,
+    Memory,
+    Soul,
+    Identity,
+}
+
+impl WorkspaceGuidanceKind {
+    fn render_order(self) -> u8 {
+        match self {
+            Self::Agents => 0,
+            Self::Tools => 1,
+            Self::User => 2,
+            Self::Memory => 3,
+            Self::Soul => 4,
+            Self::Identity => 5,
+        }
+    }
+
+    fn budget_priority(self) -> u8 {
+        match self {
+            Self::Agents => 0,
+            Self::Tools => 1,
+            Self::User => 2,
+            Self::Memory => 3,
+            Self::Soul => 4,
+            Self::Identity => 5,
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Agents => "Guidelines",
+            Self::Tools => "Local Environment",
+            Self::User => "User Preferences",
+            Self::Memory => "Long-Term Memory",
+            Self::Soul => "Tone",
+            Self::Identity => "Identity",
+        }
+    }
+
+    fn file_name(self) -> &'static str {
+        match self {
+            Self::Agents => "AGENTS.md",
+            Self::Tools => "TOOLS.md",
+            Self::User => "USER.md",
+            Self::Memory => "MEMORY.md",
+            Self::Soul => "SOUL.md",
+            Self::Identity => "IDENTITY.md",
+        }
+    }
+
+    fn max_chars(self, prompt_mode: PromptMode) -> usize {
+        match (self, prompt_mode) {
+            (Self::Agents, _) => 2800,
+            (Self::Tools, _) => 1400,
+            (Self::User, PromptMode::Full) => 1200,
+            (Self::User, PromptMode::Minimal) => 0,
+            (Self::Memory, PromptMode::Full) => 1800,
+            (Self::Memory, PromptMode::Minimal) => 1500,
+            (Self::Soul, PromptMode::Full) => 900,
+            (Self::Soul, PromptMode::Minimal) => 0,
+            (Self::Identity, PromptMode::Full) => 800,
+            (Self::Identity, PromptMode::Minimal) => 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct WorkspaceGuidanceSection {
+    kind: WorkspaceGuidanceKind,
+    content: String,
+}
+
 /// Build the complete system prompt from a `PromptContext`.
 ///
 /// Produces an ordered, multi-section prompt. Sections with no content are
@@ -147,68 +236,11 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
     // Section 8 — Operational Guidelines (always present)
     sections.push(OPERATIONAL_GUIDELINES.to_string());
 
-    // Section 9+ — Workspace guidance sections
-    if !is_minimal {
-        if let Some(section) =
-            build_workspace_file_section("Guidelines", "AGENTS.md", ctx.agents_md.as_deref(), 3200)
-        {
-            sections.push(section);
-        }
-        if let Some(section) = build_soul_section(ctx.soul_md.as_deref()) {
-            sections.push(section);
-        }
-        if let Some(section) = build_workspace_file_section(
-            "Local Environment",
-            "TOOLS.md",
-            ctx.tools_md.as_deref(),
-            1600,
-        ) {
-            sections.push(section);
-        }
-        if let Some(section) = build_identity_md_section(ctx.identity_md.as_deref()) {
-            sections.push(section);
-        }
-        if let Some(section) = build_workspace_file_section(
-            "User Preferences",
-            "USER.md",
-            ctx.user_md.as_deref(),
-            1200,
-        ) {
-            sections.push(section);
-        }
-        if let Some(section) = build_workspace_file_section(
-            "Long-Term Memory",
-            "MEMORY.md",
-            ctx.memory_md.as_deref(),
-            2400,
-        ) {
-            sections.push(section);
-        }
-    } else {
-        if let Some(section) =
-            build_workspace_file_section("Guidelines", "AGENTS.md", ctx.agents_md.as_deref(), 3200)
-        {
-            sections.push(section);
-        }
-        if let Some(section) = build_soul_section(ctx.soul_md.as_deref()) {
-            sections.push(section);
-        }
-        if let Some(section) = build_workspace_file_section(
-            "Local Environment",
-            "TOOLS.md",
-            ctx.tools_md.as_deref(),
-            1600,
-        ) {
-            sections.push(section);
-        }
-        if let Some(section) = build_workspace_file_section(
-            "Long-Term Memory",
-            "MEMORY.md",
-            ctx.memory_md.as_deref(),
-            1600,
-        ) {
-            sections.push(section);
-        }
+    sections.push(PROMPT_SOURCE_PRIORITY_SECTION.to_string());
+
+    let workspace_sections = build_workspace_guidance_sections(ctx);
+    if !workspace_sections.is_empty() {
+        sections.extend(workspace_sections);
     }
 
     // Memory Recall Protocol (always present)
@@ -441,6 +473,275 @@ These tool servers are connected in the current environment. Some of their tools
     )
 }
 
+fn build_workspace_guidance_sections(ctx: &PromptContext) -> Vec<String> {
+    let mut raw_sections = Vec::new();
+
+    if let Some(content) = sanitize_workspace_guidance_section(
+        WorkspaceGuidanceKind::Agents,
+        ctx.agents_md.as_deref(),
+    ) {
+        raw_sections.push(WorkspaceGuidanceSection {
+            kind: WorkspaceGuidanceKind::Agents,
+            content,
+        });
+    }
+    if let Some(content) = sanitize_workspace_guidance_section(
+        WorkspaceGuidanceKind::Tools,
+        ctx.tools_md.as_deref(),
+    ) {
+        raw_sections.push(WorkspaceGuidanceSection {
+            kind: WorkspaceGuidanceKind::Tools,
+            content,
+        });
+    }
+    if !ctx.prompt_mode.is_minimal() {
+        if let Some(content) = sanitize_workspace_guidance_section(
+            WorkspaceGuidanceKind::User,
+            ctx.user_md.as_deref(),
+        ) {
+            raw_sections.push(WorkspaceGuidanceSection {
+                kind: WorkspaceGuidanceKind::User,
+                content,
+            });
+        }
+    }
+    if let Some(content) = sanitize_workspace_guidance_section(
+        WorkspaceGuidanceKind::Memory,
+        ctx.memory_md.as_deref(),
+    ) {
+        raw_sections.push(WorkspaceGuidanceSection {
+            kind: WorkspaceGuidanceKind::Memory,
+            content,
+        });
+    }
+    if !ctx.prompt_mode.is_minimal() {
+        if let Some(content) = sanitize_workspace_guidance_section(
+            WorkspaceGuidanceKind::Soul,
+            ctx.soul_md.as_deref(),
+        ) {
+            raw_sections.push(WorkspaceGuidanceSection {
+                kind: WorkspaceGuidanceKind::Soul,
+                content,
+            });
+        }
+        if let Some(content) = sanitize_workspace_guidance_section(
+            WorkspaceGuidanceKind::Identity,
+            ctx.identity_md.as_deref(),
+        ) {
+            raw_sections.push(WorkspaceGuidanceSection {
+                kind: WorkspaceGuidanceKind::Identity,
+                content,
+            });
+        }
+    }
+
+    let total_budget = if ctx.prompt_mode.is_minimal() {
+        MINIMAL_WORKSPACE_GUIDANCE_BUDGET
+    } else {
+        FULL_WORKSPACE_GUIDANCE_BUDGET
+    };
+
+    let mut seen_units = HashSet::new();
+    let mut consumed = 0usize;
+    let mut accepted = Vec::new();
+
+    raw_sections.sort_by_key(|section| section.kind.budget_priority());
+
+    for raw in raw_sections {
+        let remaining_budget = total_budget.saturating_sub(consumed);
+        if remaining_budget == 0 {
+            break;
+        }
+
+        let deduped = deduplicate_workspace_guidance_content(&raw.content, &mut seen_units);
+        if deduped.is_empty() {
+            continue;
+        }
+
+        let max_chars = raw.kind.max_chars(ctx.prompt_mode);
+        if max_chars == 0 {
+            continue;
+        }
+        let allowed_chars = max_chars.min(remaining_budget);
+        let requires_truncation = deduped.chars().count() > allowed_chars;
+        if allowed_chars < WORKSPACE_GUIDANCE_MIN_SLICE && requires_truncation {
+            continue;
+        }
+
+        let rendered = format!(
+            "## {}\n{}",
+            raw.kind.title(),
+            cap_str(&deduped, allowed_chars)
+        );
+        consumed += rendered.chars().count();
+        accepted.push((raw.kind.render_order(), rendered));
+    }
+
+    accepted.sort_by_key(|(order, _)| *order);
+    accepted.into_iter().map(|(_, rendered)| rendered).collect()
+}
+
+fn sanitize_workspace_guidance_section(
+    kind: WorkspaceGuidanceKind,
+    content: Option<&str>,
+) -> Option<String> {
+    match kind {
+        WorkspaceGuidanceKind::Soul => {
+            let soul = content?.trim();
+            if soul.is_empty() {
+                return None;
+            }
+            let sanitized = sanitize_workspace_file(kind.file_name(), soul);
+            if sanitized.is_empty() {
+                None
+            } else {
+                Some(sanitized)
+            }
+        }
+        WorkspaceGuidanceKind::Identity => {
+            let identity = content?.trim();
+            if identity.is_empty() {
+                return None;
+            }
+            let parsed = parse_identity_md(identity);
+            let mut parts = Vec::new();
+
+            if !parsed.body.is_empty() {
+                parts.push(parsed.body);
+            }
+
+            if !parsed.metadata.is_empty() {
+                parts.push(format!("Identity traits: {}.", parsed.metadata.join(", ")));
+            }
+
+            let joined = parts.join("\n").trim().to_string();
+            if joined.is_empty() {
+                None
+            } else {
+                Some(joined)
+            }
+        }
+        _ => {
+            let content = content?.trim();
+            if content.is_empty() {
+                return None;
+            }
+            let sanitized = sanitize_workspace_file(kind.file_name(), content);
+            if sanitized.is_empty()
+                || is_placeholder_workspace_file(kind.file_name(), &sanitized)
+            {
+                None
+            } else {
+                Some(sanitized)
+            }
+        }
+    }
+}
+
+fn deduplicate_workspace_guidance_content(
+    content: &str,
+    seen_units: &mut HashSet<String>,
+) -> String {
+    let mut out = Vec::new();
+    let mut pending_headings = Vec::new();
+    let mut has_body = false;
+
+    for raw_line in content.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            if !out.last().is_some_and(|line: &String| line.is_empty()) {
+                out.push(String::new());
+            }
+            continue;
+        }
+
+        if trimmed.starts_with('#') {
+            pending_headings.push(trimmed.to_string());
+            continue;
+        }
+
+        let normalized = normalize_workspace_guidance_unit(trimmed);
+        if normalized.is_empty() || !seen_units.insert(normalized) {
+            continue;
+        }
+
+        if !pending_headings.is_empty() {
+            if !out.is_empty() && !out.last().is_some_and(|line| line.is_empty()) {
+                out.push(String::new());
+            }
+            out.append(&mut pending_headings);
+        }
+
+        out.push(trimmed.to_string());
+        has_body = true;
+    }
+
+    if !has_body {
+        return String::new();
+    }
+
+    while out.first().is_some_and(|line| line.is_empty()) {
+        out.remove(0);
+    }
+    while out.last().is_some_and(|line| line.is_empty()) {
+        out.pop();
+    }
+
+    let mut collapsed = Vec::new();
+    for line in out {
+        if line.is_empty() && collapsed.last().is_some_and(|prev: &String| prev.is_empty()) {
+            continue;
+        }
+        collapsed.push(line);
+    }
+
+    collapsed.join("\n")
+}
+
+fn normalize_workspace_guidance_unit(line: &str) -> String {
+    trim_markdown_list_marker(line)
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn trim_markdown_list_marker(line: &str) -> &str {
+    let trimmed = line.trim();
+    if let Some(rest) = trimmed.strip_prefix("- ") {
+        return rest.trim();
+    }
+    if let Some(rest) = trimmed.strip_prefix("* ") {
+        return rest.trim();
+    }
+
+    let mut digits_end = 0usize;
+    for (idx, ch) in trimmed.char_indices() {
+        if ch.is_ascii_digit() {
+            digits_end = idx + ch.len_utf8();
+            continue;
+        }
+        if (ch == '.' || ch == ')') && digits_end > 0 {
+            let rest = trimmed[idx + ch.len_utf8()..].trim_start();
+            if !rest.is_empty() {
+                return rest;
+            }
+        }
+        break;
+    }
+
+    trimmed
+}
+
+#[cfg(test)]
 fn build_workspace_file_section(
     section_title: &str,
     name: &str,
@@ -461,6 +762,7 @@ fn build_workspace_file_section(
     ))
 }
 
+#[cfg(test)]
 fn build_soul_section(soul_md: Option<&str>) -> Option<String> {
     let soul = soul_md?.trim();
     if soul.is_empty() {
@@ -474,6 +776,7 @@ fn build_soul_section(soul_md: Option<&str>) -> Option<String> {
     }
 }
 
+#[cfg(test)]
 fn build_identity_md_section(identity_md: Option<&str>) -> Option<String> {
     let identity = identity_md?.trim();
     if identity.is_empty() {
@@ -1028,17 +1331,100 @@ mod tests {
 
         let prompt = build_system_prompt(&ctx);
         let agents_pos = prompt.find("## Guidelines").unwrap();
-        let soul_pos = prompt.find("## Tone").unwrap();
         let tools_pos = prompt.find("## Local Environment").unwrap();
-        let identity_pos = prompt.find("## Identity").unwrap();
         let user_pos = prompt.find("## User Preferences").unwrap();
         let memory_pos = prompt.find("## Long-Term Memory").unwrap();
+        let soul_pos = prompt.find("## Tone").unwrap();
+        let identity_pos = prompt.find("## Identity").unwrap();
 
-        assert!(agents_pos < soul_pos);
-        assert!(soul_pos < tools_pos);
-        assert!(tools_pos < identity_pos);
-        assert!(identity_pos < user_pos);
+        assert!(agents_pos < tools_pos);
+        assert!(tools_pos < user_pos);
         assert!(user_pos < memory_pos);
+        assert!(memory_pos < soul_pos);
+        assert!(soul_pos < identity_pos);
+    }
+
+    #[test]
+    fn test_prompt_priorities_section_present() {
+        let prompt = build_system_prompt(&basic_ctx());
+        assert!(prompt.contains("## Prompt Priorities"));
+        assert!(prompt.contains("`AGENTS.md` for operating rules"));
+        assert!(prompt.contains("`USER.md` for standing user preferences"));
+    }
+
+    #[test]
+    fn test_workspace_guidance_deduplicates_lower_priority_content() {
+        let mut ctx = basic_ctx();
+        ctx.user_md = Some(
+            "# User\n\
+             - Keep replies concise.\n\
+             - Prefer bullet lists.\n"
+                .to_string(),
+        );
+        ctx.memory_md = Some(
+            "# Long-Term Memory\n\
+             - Prefer bullet lists.\n\
+             - Remember the alpha blocker is QA signoff.\n"
+                .to_string(),
+        );
+
+        let prompt = build_system_prompt(&ctx);
+        let bullet_count = prompt.matches("Prefer bullet lists.").count();
+
+        assert_eq!(bullet_count, 1);
+        assert!(prompt.contains("Keep replies concise."));
+        assert!(prompt.contains("Remember the alpha blocker is QA signoff."));
+    }
+
+    #[test]
+    fn test_workspace_guidance_budget_favors_higher_priority_sections() {
+        let mut ctx = basic_ctx();
+        ctx.agents_md = Some(
+            format!(
+                "# AGENTS.md\n{}\n",
+                (0..150)
+                    .map(|idx| format!("- Follow repo constraint {idx}."))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+        );
+        ctx.tools_md = Some(
+            format!(
+                "# TOOLS.md - Local Environment Notes\n{}\n",
+                (0..90)
+                    .map(|idx| format!("- Use local debug daemon profile {idx}."))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+        );
+        ctx.user_md = Some(
+            format!(
+                "# User\n{}\n",
+                (0..120)
+                    .map(|idx| format!("- Standing preference {idx}."))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+        );
+        ctx.memory_md = Some(
+            format!(
+                "# Long-Term Memory\n{}\n",
+                (0..220)
+                    .map(|idx| format!("- Historical project note {idx}."))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+        );
+        ctx.soul_md = Some("# SOUL.md\nStay warm and witty.\n".to_string());
+        ctx.identity_md = Some("# Identity\n- Role: helper\n".to_string());
+
+        let prompt = build_system_prompt(&ctx);
+
+        assert!(prompt.contains("Follow repo constraint 0."));
+        assert!(prompt.contains("Use local debug daemon profile 0."));
+        assert!(prompt.contains("Standing preference 0."));
+        assert!(!prompt.contains("Stay warm and witty."));
+        assert!(!prompt.contains("Role: helper"));
     }
 
     #[test]
@@ -1536,6 +1922,17 @@ mod tests {
         assert!(prompt.contains("Identity traits: archetype assistant, greeting style blunt."));
         assert!(!prompt.contains("vibe "));
         assert!(!prompt.contains("emoji"));
+    }
+
+    #[test]
+    fn test_identity_section_helper_builds_sanitized_content() {
+        let section = build_identity_md_section(Some(
+            "---\narchetype: assistant\nvibe: sharp\n---\n# Identity\n- Role: helper\n",
+        ))
+        .unwrap();
+        assert!(section.contains("## Identity"));
+        assert!(section.contains("Role: helper"));
+        assert!(section.contains("Identity traits: archetype assistant, vibe sharp."));
     }
 
     #[test]

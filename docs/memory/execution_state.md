@@ -9,7 +9,7 @@
 
 ## 当前阶段
 
-- `phase-2-embedding-hybrid-retrieval (completed)`
+- `phase-3-prompt-architecture (completed)`
 
 ## 基线分支
 
@@ -17,11 +17,11 @@
 
 ## 当前工作分支
 
-- `phase2-embedding-hybrid-retrieval`
+- `phase3-prompt-architecture`
 
 ## 当前 worktree 路径
 
-- `/Users/huangjiahao/workspace/openfang-0.1.0/phase2-embedding-hybrid-retrieval`
+- `/Users/huangjiahao/workspace/openfang-0.1.0/phase3-prompt-architecture`
 
 ## 设计文档
 
@@ -30,7 +30,7 @@
 
 ## 当前目标
 
-- 完成 `phase-2-embedding-hybrid-retrieval` 收口，并为下一阶段 `prompt architecture` 的 attention governance / section arbitration 做切换准备。
+- 完成 `phase-3-prompt-architecture` 收口，并为下一阶段 `assistant memory autoconverge` 做切换准备。
 
 ## 已完成
 
@@ -698,36 +698,58 @@
         证明独立 workspace 路由、导航与 memory inspection surface 已真实进入服务端静态资源输出
       - 隔离 daemon 的 `/api/budget` 中 `daily_spend = 0.005888300000000001`，`/api/budget/agents` 中 `assistant` 的 `daily_cost_usd = 0.005888300000000001`
       - 验证完成后，隔离 daemon 与整个 `/tmp/openfang-memory-trace-workspace-live` home 已清理
-  - 已完成 Phase 2 `embedding-hybrid-retrieval` 收口：
-    - retrieval 主链路已覆盖：
-      - semantic hybrid recall
-      - governed shared memory + semantic fusion
-      - weighted source fusion helper
-      - prompt memory context shared contract
-    - observability / telemetry 已覆盖：
-      - `llm.log` 文本 `*** MEMORY TRACE`
-      - structured tracing telemetry
-      - audit-backed `/api/logs/stream` / `/api/audit/recent`
-    - inspection surface 已覆盖：
-      - Logs/Audit inspection
-      - dedicated `Memory Trace` tab
-      - compare / raw payload / export
-      - shareable inspection URL
-      - persisted pinned trace workspace
-      - independent `Memory Debug` page
-    - Phase 2 当前不再有未收口的 retrieval / trace / inspection 缺口；后续工作转入 Phase 3 `prompt architecture`
+- 已完成 Phase 2 `embedding-hybrid-retrieval` 收口：
+  - retrieval 主链路已覆盖：
+    - semantic hybrid recall
+    - governed shared memory + semantic fusion
+    - weighted source fusion helper
+    - prompt memory context shared contract
+  - observability / telemetry 已覆盖：
+    - `llm.log` 文本 `*** MEMORY TRACE`
+    - structured tracing telemetry
+    - audit-backed `/api/logs/stream` / `/api/audit/recent`
+  - inspection surface 已覆盖：
+    - Logs/Audit inspection
+    - dedicated `Memory Trace` tab
+    - compare / raw payload / export
+    - shareable inspection URL
+    - persisted pinned trace workspace
+    - independent `Memory Debug` page
+  - Phase 2 当前不再有未收口的 retrieval / trace / inspection 缺口；后续工作转入 Phase 3 `prompt architecture`
+- 已完成 Phase 3 `prompt architecture` 收口：
+  - `openfang-runtime::prompt_builder` 已新增显式 `Prompt Priorities` 区段，明确当前请求、workspace guidance、recalled memory、governance signals 与 session summaries 的冲突优先级
+  - workspace guidance 已按职责与权威顺序重排为 `Guidelines` / `Local Environment` / `User Preferences` / `Long-Term Memory` / `Tone` / `Identity`
+  - workspace guidance 现在会跨 section 做行级去重，并应用总预算治理：
+    - `Full` 模式总预算 `6800`
+    - `Minimal` 模式总预算 `4200`
+  - 动态 `[Memory context]` 现在会先注入 priority reminder，再按 recall / governance signals / session summaries 应用 section budget，并对跨 section 重复条目去重
+    - 总预算 `1800`
+    - recall budget `960`
+    - governance signal budget `420`
+    - session summary budget `280`
+  - `USER.md` / `MEMORY.md` / fused recall / governed signals / session summaries 之间的冲突仲裁规则已进入 prompt 文本，不再依赖模型自行猜测优先级
+- 已完成本轮 Phase 3 验证：
+  - `cargo build --workspace --lib`
+  - `cargo test --workspace`
+  - `cargo clippy --workspace --all-targets -- -D warnings`
+  - live prompt-architecture 验证通过：
+    - 使用隔离 `OPENFANG_HOME=/tmp/openfang-phase3-step1-live.FRjY11`，以当前调试二进制启动 daemon 于 `127.0.0.1:4218`
+    - 真实 `/api/agents/{id}/message` 响应返回 `STEP1-ISOLATED-OK`、`STEP1-DEDUP-OK` 与 `STEP2-LIVE-OK`
+    - `llm.log` 中已真实出现 `## Prompt Priorities`
+    - `llm.log` 的 `[Memory context]` 中已真实出现 `Priority reminder: current user request and workspace guidance outrank recalled memory...`
+    - live prompt 中 `Prefer bullet lists.` 跨 `USER.md` / `MEMORY.md` 去重后只保留一次
+    - `/api/budget` 与 `/api/budget/agents` 在隔离 daemon 上均出现真实 spend 增量，证明验证使用的是当前新二进制而不是旧进程
 
 ## 进行中
 
-- Phase 2 已完成。下一步切换到 `prompt architecture` 阶段，重点收口 prompt section 职责去重、attention budget 治理与跨 section 冲突仲裁。
+- Phase 3 已完成。下一步切换到 `assistant memory autoconverge` 阶段，重点收口 assistant 专属 `MEMORY.md` 的生成、更新、晋升与自动收敛策略。
 
 ## 下一步动作
 
-- 切换到 Phase 3 `prompt architecture`：
-  - 继续梳理 `AGENTS.md` / `USER.md` / `TOOLS.md` / `MEMORY.md` 的职责去重与模板收敛
-  - 引入 prompt attention / token budget 治理，减少跨 section 冗余和注意力漂移
-  - 明确 `USER.md` / `MEMORY.md` / KV recall / governed signals 之间的冲突优先级
-- 将 `Memory Debug` workspace 视作 Phase 2 已完成资产；后续若继续增强，只作为 Phase 3+ 的 inspection 优化，例如 timeline/diff、命名 pinned sets 或跨设备同步
+- 切换到 Phase 4 `assistant memory autoconverge`：
+  - 设计 assistant 专属 `MEMORY.md` 的生成、合并、审阅与回写策略
+  - 把 promotion candidates、cleanup / attention signals 与 `MEMORY.md` 维护形成更稳定的闭环
+  - 继续把 `Memory Debug` workspace 视作已完成资产；后续仅在 autoconverge/inspection 需要时补充 timeline/diff、命名 pinned sets 或跨设备同步
 - 在切换电脑或结束一轮实质性工作前，持续更新本文件。
 
 ## 风险与阻塞
@@ -740,6 +762,7 @@
   - dashboard `Logs -> Memory Trace` dedicated tab
   - dashboard `Memory Debug` independent workspace
   当前 retrieval / trace / inspection 链路已经收口；后续如果 trace 密度继续上升，timeline/diff、命名 pinned sets 与跨设备同步更像是 Phase 3+ 的 inspection 增强，而不再是 Phase 2 阻塞项。
+- Phase 3 已完成的 attention governance 仍然以字符预算和显式优先级为主，不是更重型的任务自适应 token allocator；若后续需要更细粒度的 budget/packing，可作为 Phase 4+ 优化，而不阻塞当前收口。
 - 需要避免在 daemon 运行中直接用 sqlite 修改 shared memory sidecar 做复杂 live probe；这类验证更稳妥的做法仍然是 daemon 停止后做 DB 注入，或改造成 API/tool 可达路径。
 - 如果后续启动工作时不先读取本文件，分支纪律和连续性可能重新漂移。
 
