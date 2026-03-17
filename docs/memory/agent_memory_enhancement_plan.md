@@ -2,625 +2,607 @@
 
 ## 1. 文档定位
 
-本文档描述的是当前分支中已经落地的长期记忆增强方案，以及围绕它形成的 prompt 编排与工具接线架构。
+本文档描述的是当前分支里已经落地完成的整套记忆系统，而不再只是早期的 memory enhancement MVP。
 
-它不是最初的 MVP 草案，也不是“未来可能怎么做”的纯设想文档，而是：
+它回答四个问题：
 
-1. 对本分支已实现行为的设计说明。
-2. 对各层职责边界的整理，确保实现保持低耦合、高内聚。
-3. 对当前仍未解决问题的分级说明，作为后续迭代输入。
+1. 这套记忆能力最终给 OpenFang 带来了什么。
+2. 整体技术架构是怎么分层的。
+3. 关键技术点分别采用了什么方案。
+4. 现在代码里的主要入口和职责边界在哪里。
 
-对应分支中的核心实现提交包括：
+本文档覆盖的能力范围包括：
 
-- `e3dae5b Refactor agent prompt assembly and scaffold-based templates`
-- `b12d27d feat: implement progressive tool discovery and expansion`
-- `022d623 feat: strengthen memory prompt orchestration`
+- shared KV memory governance
+- governed retrieval 与 hybrid recall
+- prompt architecture 与 memory context arbitration
+- memory trace / dashboard inspection
+- `MEMORY.md` autoconverge review / apply 闭环
 
-其中，本文档重点覆盖的是 `022d623` 所代表的 memory enhancement，以及它依赖的 prompt builder / scaffold / tool exposure 基础设施。
+治理细节的补充说明仍保留在：
 
-## 2. 问题定义
+- `docs/memory/memory_governance_plan.md`
 
-OpenFang 在改造前已经存在多种与记忆相关的载体：
+## 2. 这套记忆系统最终解决了什么问题
 
-1. 共享 KV 长期记忆：`memory_store` / `memory_recall`
-2. agent workspace 中的长期约束文件：`MEMORY.md`
-3. 工作区沉淀文件：`memory/*.md`
-4. 共享 KV 中的 `session_*` 摘要条目
+OpenFang 原本已经有多种和“记忆”相关的组件：
 
-但在真实运行链路里，这些能力没有形成稳定闭环，主要断点有四类：
+1. shared KV：`memory_store` / `memory_recall`
+2. agent workspace 里的 `MEMORY.md`
+3. `memory/*.md` 一类工作区文件
+4. `session_*` 摘要和会话历史
+5. semantic memory / embedding substrate
 
-1. agent workspace 的 `MEMORY.md` 会被 scaffold 生成，但不会稳定进入每轮 system prompt。
-2. prompt 对 memory 的使用协议过弱，模型经常跳过 recall/store。
-3. 只有精确 key 的 `memory_recall`，模型不知道 key 时只能盲猜。
-4. 即使 recall 过，turn 级上下文和历史裁剪也可能让记忆内容在真正请求前失效。
+但这些组件在改造前没有形成稳定闭环，主要问题是：
 
-结果是：系统“拥有记忆组件”，但模型并没有稳定获得“看见记忆、发现记忆、引用记忆”的执行路径。
+1. 记忆能存，但缺少治理，shared KV 很容易变脏。
+2. 记忆能 recall，但排序弱、只靠精确 key 或单一路径。
+3. prompt 里没有稳定的优先级与预算控制，记忆容易被淹没或互相冲突。
+4. `MEMORY.md` 是静态文件，无法和 shared governed memory 形成 write-back 闭环。
+5. 出现召回异常时，缺少可观察性，很难判断问题出在 recall、prompt 还是 tool exposure。
 
-## 3. 本次改造的目标与非目标
+这次落地完成后，系统已经具备：
 
-### 3.1 目标
+1. 可治理的 shared memory 池。
+2. 可混合召回的统一记忆上下文。
+3. 可仲裁的 prompt 记忆编排。
+4. 可检查、可调试、可追踪的 memory trace。
+5. 可 audit / apply 的 `MEMORY.md` managed snapshot。
+6. agent 自己可调用的记忆维护工具链。
 
-本次实现的目标是把长期记忆链路补齐到“在当前架构下可实际工作”的程度：
+一句话总结：记忆现在已经从“分散存在的组件”变成了一条完整工作链路。
 
-1. 让 agent workspace 的 `MEMORY.md` 真正进入 prompt 编排链路。
-2. 在每轮请求前自动提供少量动态记忆上下文，而不是完全依赖模型临场主动 recall。
-3. 提供 `memory_list`，把记忆访问从“猜 key”升级为“先发现、再精确读取”。
-4. 把变更控制在 prompt builder、agent loop、tool runner、kernel bridge、兼容层和 scaffold 边界上，不重做底层 memory substrate。
-5. 保持 system prompt 稳定，避免因为动态上下文频繁变动而破坏 provider prompt caching。
+## 3. 已交付能力总览
 
-### 3.2 非目标
+### 3.1 存储与治理
 
-本次实现明确没有做以下事情：
+shared KV 现在不再只是松散的 key/value 存储，而是具备了：
 
-1. 不自动把整个 `memory/` 目录塞进 prompt。
-2. 不重建底层 memory substrate，也不引入新的独立存储系统。
-3. 不在本次实现中引入完整的语义检索、标签索引或混合检索。
-4. 不在本次实现中完成全部 prompt architecture 去重与注意力治理。
-5. 不在本次实现中定义完整 memory lifecycle，例如 TTL、冲突合并、写入准入和清理策略。
+- canonical namespacing
+- metadata sidecar
+- `kind` / `tags` / `freshness` / `source` / `updated_at`
+- lifecycle snapshot：`active` / `stale` / `expired`
+- promotion candidate 标记
+- cleanup audit / apply
 
-因此，当前实现应被理解为“长期记忆可用性增强”，而不是“完整记忆治理系统”。
+### 3.2 检索与召回
 
-## 4. 架构原则
+记忆召回现在覆盖两条来源：
 
-本次改造遵循以下架构原则：
+- semantic memory fragments
+- governed shared memory candidates
 
-### 4.1 Prompt 组装集中化
+并且已经升级为：
 
-静态 prompt 组装集中在 `openfang-runtime::prompt_builder` 中，避免在 kernel、agent loop 和 tool runner 中分散拼接 system prompt。
+- hybrid recall：vector rank + text rank + RRF
+- query-aware governed candidate ranking
+- shared + semantic prompt-time fusion
 
-### 4.2 动静分层
+### 3.3 Prompt 编排
 
-- 静态、相对稳定的内容进入 system prompt。
-- 动态、turn-specific 的内容以独立消息注入，不污染 system prompt 稳定性。
+prompt 现在不再只是把“能拿到的记忆”直接塞进去，而是具备了：
 
-这保证了 memory enhancement 不会和 provider cache 策略直接冲突。
-
-### 4.3 通过接口解耦 runtime 与 kernel
-
-- prompt 数据通过 `PromptContext` 传入 runtime。
-- memory capability 通过 `KernelHandle` trait 暴露给 runtime。
-
-这样 memory 相关增强不需要让 runtime 直接依赖 kernel 内部实现细节。
-
-### 4.4 边缘适配而非核心重写
-
-兼容层、tool profile、wizard、migrate 只负责暴露新能力和保持旧配置可运行，不把业务规则散落到多个入口。
-
-## 5. 当前实现的架构分层
-
-### 5.1 工作区身份文件层
-
-本分支已经把 agent 的 workspace identity files 规范化为一组稳定入口，由 kernel scaffold 负责首次生成：
-
-- `SOUL.md`
-- `USER.md`
-- `TOOLS.md`
-- `MEMORY.md`
-- `AGENTS.md`
-- `BOOTSTRAP.md`
-- `IDENTITY.md`
-- `HEARTBEAT.md`（仅 autonomous agent）
-
-实现位置：
-
-- `crates/openfang-kernel/src/kernel.rs`
-
-关键点：
-
-1. `generate_identity_files()` 使用 `create_new(true)`，默认不覆盖用户已编辑文件。
-2. agent workspace 的 `MEMORY.md` 默认模板只提供占位说明，不主动灌入高噪声内容。
-3. memory enhancement 复用这个身份文件体系，不单独引入新的“长期记忆文件类型”。
-
-这一层的价值是把长期约束、用户偏好、本地环境说明、长期记忆协议等内容留在 workspace 边界，而不是散落进 manifest 或运行时代码里。
-
-## 6. Prompt 组装层
-
-### 6.1 `PromptContext` 承接静态上下文
-
-当前 system prompt 的输入已经集中到 `PromptContext`：
-
-- base manifest system prompt
-- granted tools
-- visible skills / MCP summary
-- workspace identity files
-- canonical context 摘要
-- `MEMORY.md`
-- channel / date / runtime context
-
-实现位置：
-
-- `crates/openfang-runtime/src/prompt_builder.rs`
-- `crates/openfang-kernel/src/kernel.rs`
-
-本次 memory enhancement 的直接结构性改动是：
-
-1. `PromptContext` 新增 `memory_md: Option<String>`。
-2. kernel 在两条主要 prompt 构建路径中都通过 `read_identity_file(..., "MEMORY.md")` 注入该字段。
-3. runtime 统一通过 `build_system_prompt(&PromptContext)` 输出最终 system prompt。
-
-这样，agent workspace 的 `MEMORY.md` 注入不再依赖某一条特定执行链路，而是成为 prompt builder 的正式输入。
-
-### 6.2 System prompt 的当前分层顺序
-
-当前 `build_system_prompt()` 的顺序大致为：
-
-1. Agent Identity
-2. Current Date
-3. Tool Use Strategy
-4. Immediate Tools
-5. Skills
-6. Tool Discovery
-7. MCP summary
-8. Workspace runtime context
-9. Channel
-10. Safety
-11. Operational Guidelines
-12. Workspace guidance sections
-13. Memory Recall protocol
-14. Heartbeat / Bootstrap（按条件）
-
-其中，workspace guidance sections 在 `Full` 模式下包含：
-
-- `AGENTS.md`
-- `SOUL.md`
-- `TOOLS.md`
-- `IDENTITY.md`
-- `USER.md`
-- `MEMORY.md`
-
-在 `Minimal` 模式下，仅保留：
-
-- `AGENTS.md`
-- `SOUL.md`
-- `TOOLS.md`
-- `MEMORY.md`
-
-这保证 subagent 不会携带过量人物设定和辅助上下文。
-
-### 6.3 `MEMORY.md` 的静态注入
-
-agent workspace 的 `MEMORY.md` 当前作为 `Long-Term Memory` section 进入 system prompt。
-
-实现位置：
-
-- `crates/openfang-runtime/src/prompt_builder.rs`
-
-关键行为：
-
-1. `Full` 模式下 `MEMORY.md` 上限为 2400 chars。
-2. `Minimal` 模式下 `MEMORY.md` 上限为 1600 chars。
-3. 注入发生在 workspace guidance sections 内，而不是零散拼接到别的位置。
-
-这使得 agent workspace 的 `MEMORY.md` 职责明确为：长期协议、长期偏好、稳定约束、长期项目上下文。
-
-### 6.4 占位文件过滤
-
-为了避免 scaffold 默认模板污染 prompt，`prompt_builder` 对部分 workspace 文件做了占位识别：
-
-- `USER.md`
-- `TOOLS.md`
-- `MEMORY.md`
-
-其中，只有当 agent workspace 的 `MEMORY.md` 内容不等于默认模板时，它才会被注入。
-
-价值是：
-
-1. 默认 scaffold 能直接生成文件，但不会自动浪费上下文。
-2. 用户一旦填入真实内容，就能立即进入 prompt 编排链路。
-
-### 6.5 动态上下文不进入 system prompt
-
-当前分支已经明确把两个高变化度上下文从 system prompt 中拆出：
-
-1. canonical context
-2. dynamic memory context
-
-原因是它们会频繁变化，如果放进 system prompt，会显著破坏 provider prompt caching。
-
-因此：
-
-- `build_canonical_context_message()` 生成独立 user message。
-- `build_memory_context_message()` 生成独立 user message。
-
-这一步不是附带优化，而是 memory enhancement 能稳定工作的前提之一：
-
-- 静态长期协议留在 system prompt。
-- 动态 turn 级记忆留在消息层。
-
-## 7. Agent Loop 层：动态记忆上下文
-
-### 7.1 动态记忆来源
-
-在真正发起 LLM 请求前，agent loop 会组装动态记忆上下文，来源包括：
-
-1. `_memories` 中的 recalled memory fragments
-2. 共享 KV 中最近的 `session_*` 摘要
-
-实现位置：
-
-- `crates/openfang-runtime/src/agent_loop.rs`
-- `crates/openfang-runtime/src/prompt_builder.rs`
-
-具体函数：
-
-- `format_recalled_memory_fragments()`
-- `load_recent_session_summaries()`
-- `build_memory_context_message()`
-
-### 7.2 recalled fragments 的格式化策略
-
-`format_recalled_memory_fragments()` 负责对 recall 结果做轻量整理：
-
-1. 去掉空内容。
-2. 优先使用 metadata 中的 `key` 作为 label。
-3. 如果没有 key，则退化为使用 scope。
-4. 对渲染后的片段做去重。
-5. 最多保留 5 条。
-
-这样动态记忆上下文不是原始 recall dump，而是更适合直接给模型阅读的短片段列表。
-
-### 7.3 `session_*` 摘要的注入策略
-
-`load_recent_session_summaries()` 从共享 KV 中枚举当前 agent 的 KV：
-
-1. 只保留 key 以 `session_` 开头的条目。
-2. 把 value 统一转成文本表示。
-3. 进行非空过滤与短截断。
-4. 按 key 倒序排序。
-5. 默认只取最近 3 条。
-
-这个策略本质上是时间邻近型动态摘要注入，不是语义检索。
-
-### 7.4 独立消息注入路径
-
-agent loop 在构造最终 `messages` 时，会：
-
-1. 从 manifest metadata 中拿 `canonical_context_msg`
-2. 构造 `memory_context_msg`
-3. 把这两条消息 prepend 到消息列表前部
-4. 然后再进入模型调用循环
-
-这一点非常关键：
-
-- agent workspace 的 `MEMORY.md` 是静态长期约束
-- `memory_context_msg` 是 turn 级动态历史
-
-两者职责不同，当前实现已经在结构上分离。
-
-## 8. 历史裁剪与上下文保留
-
-### 8.1 发现的问题
-
-在 live 验证中，出现过一个真实回归：
-
-1. dynamic memory context 虽然被 prepend 到消息前面
-2. 但长会话下历史裁剪从前向后截断
-3. 刚插进去的 context message 反而最先被裁掉
-
-这会让 memory enhancement 看似“已经注入”，但在真正发给模型时失效。
-
-### 8.2 修复方式
-
-为了解决这个问题，agent loop 新增：
-
-- `trim_messages_for_prepended_context(messages, reserved_slots)`
-
-含义是：
-
-1. 先为 prepend 的上下文消息预留槽位
-2. 再对普通历史消息做裁剪
-3. 保证 canonical context 和 memory context 不会被本轮自己的裁剪逻辑先吞掉
-
-当前非 streaming 和 streaming 两条主路径都已接入该修复。
-
-## 9. Memory Tool 层：从精确 recall 到发现再 recall
-
-### 9.1 新能力：`memory_list`
-
-本次新增的核心 memory tool 是 `memory_list`。
-
-用途：
-
-1. 列出共享 memory 中已有的 key
-2. 可按 prefix 过滤
-3. 可限制返回条数
-4. 可选择是否返回 value
-5. 支持把 `query` 作为 `prefix` 的兼容输入
-
-实现位置：
-
-- `crates/openfang-runtime/src/tool_runner.rs`
-- `crates/openfang-runtime/src/kernel_handle.rs`
-- `crates/openfang-kernel/src/kernel.rs`
-
-### 9.2 当前实现形态
-
-当前 `memory_list` 的行为是典型 KV list：
-
-1. kernel 通过 `memory.list_kv(agent_id)` 取回当前共享 memory agent 下的全部 KV。
-2. 可选地按 `starts_with(prefix)` 过滤。
-3. 按 key 升序排序。
-4. 可选地按 `limit` 截断。
-5. tool runner 将结果序列化为 JSON 数组返回给模型。
-
-这意味着当前 `memory_list` 是“key discovery tool”，不是“语义搜索引擎”。
-
-### 9.3 Prompt 协议同步
-
-新增 tool 后，prompt 中的 memory guidance 也同步更新：
-
-- key 明确时优先 `memory_recall`
-- key 不明确时先 `memory_list`
-- 长期稳定信息需要时使用 `memory_store`
-
-这使 memory protocol 从“可能有 recall 能力”变成了明确的两段式调用协议。
-
-## 10. Kernel Bridge 与共享存储边界
-
-### 10.1 `KernelHandle` 扩展
-
-为了让 runtime 侧能够调用新的 memory discovery 能力，`KernelHandle` trait 增加了：
-
-- `memory_list(prefix, limit) -> Vec<(String, Value)>`
-
-这保持了 runtime 与 kernel 的依赖方向不变：
-
-- runtime 只依赖 trait
-- kernel 提供具体实现
-
-### 10.2 当前共享 memory 的边界
-
-当前 `memory_store` / `memory_recall` / `memory_list` 都通过 `shared_memory_agent_id()` 落到同一个共享 memory agent 空间上。
-
-这与本次目标一致：
-
-1. 不重做存储层。
-2. 先在既有共享 KV substrate 上补齐发现与注入链路。
-
-但这也意味着，后续若要继续演进 memory governance，需要在此边界之上继续加 namespace、隔离和生命周期规则，而不是继续把规则散到 runtime prompt 层。
-
-## 11. 兼容层与暴露面修正
-
-### 11.1 工具兼容映射
-
-为了兼容旧配置和迁移输入，`tool_compat` 中加入了：
-
-- `memory_search -> memory_list`
-
-这保证老数据不会因为新能力命名调整而直接失效。
-
-### 11.2 Agent 模式与 ToolProfile 暴露面
-
-`memory_list` 已进入以下暴露面：
-
-1. `AgentMode::Assist` 的只读工具集合
-2. `ToolProfile::Messaging`
-3. `ToolProfile::Automation`
-
-这保证 memory discovery 在受限模式下也可用，而不仅限于 Full agent。
-
-### 11.3 Wizard / Scaffold 更新
-
-setup wizard 已同步更新 memory 提示：
-
-1. 当 agent 具有 memory capability 时，会授予 `memory_store` / `memory_recall` / `memory_list`
-2. tool hint 明确说明“精确访问用 recall，不知道 key 时先 list”
-
-这样 memory 协议不会只存在于 runtime，而是从 agent 创建入口就开始显式传达。
-
-### 11.4 迁移测试更新
-
-OpenClaw 迁移测试已更新为断言：
-
-- `memory_search -> memory_list`
-
-这一步虽然小，但很重要：它保证了 memory enhancement 不是“新 agent 有、旧 agent 坏掉”的单向增强。
-
-## 12. 当前端到端执行链路
-
-当前记忆链路的端到端行为可概括为：
-
-1. kernel 为 agent workspace 生成并保留 identity files。
-2. kernel 构建 `PromptContext`，把 agent workspace 的 `MEMORY.md` 与其他 workspace files 读入。
-3. `prompt_builder` 生成稳定的 system prompt，并在其中静态注入 agent workspace 的 `MEMORY.md`。
-4. canonical context 被单独生成成 user message，避免 system prompt 频繁变化。
-5. agent loop 在每轮请求前进行 memory recall，并收集最近的 `session_*` 摘要。
-6. recalled fragments 和 recent session summaries 被组装为 `memory_context_msg`。
-7. `canonical_context_msg` 与 `memory_context_msg` 被 prepend 到本轮消息列表前部。
-8. 若历史过长，先保留 prepended context 再裁剪普通历史。
-9. 模型在工具侧可用 `memory_list -> memory_recall -> memory_store` 形成完整闭环。
-
-## 13. 当前系统行为与使用边界
-
-改造完成后，当前系统的行为边界如下：
-
-1. 每轮请求都会尝试将 agent workspace 的 `MEMORY.md` 注入 system prompt。
-2. 默认占位版的 agent workspace `MEMORY.md` 不会注入。
-3. 每轮请求前都会尝试注入少量动态记忆上下文。
-4. 动态记忆上下文目前由 recalled fragments 与 recent `session_*` 摘要组成。
-5. 模型在 key 不明确时可以先使用 `memory_list` 再 `memory_recall`。
-6. `memory_list` 当前是 prefix/key discovery，不是语义搜索。
-7. `memory/` 目录不会自动进入 prompt。
-8. 用户若询问“昨天/上周某天具体聊了什么”，仍应通过 `file_read` / `file_search` 检查工作区 `memory/` 下的文件。
-
-## 14. `MEMORY.md` 的当前职责定义
-
-在当前实现里，`MEMORY.md` 适合承载：
-
-1. 长期稳定的行为协议
-2. 记忆工具使用规则
-3. 稳定的用户偏好
-4. 项目长期约束、架构边界和固定协作约定
-
-不适合放进去的内容：
-
-1. 高频变化的短期事实
-2. 某一次对话的临时结论
-3. 具体日期定位型历史事件
-4. 会快速过期的操作状态
-
-这些更适合沉淀到：
-
-- KV memory
-- `session_*` 摘要
-- `memory/*.md`
-
-## 15. Prompt Architecture 收口结果与剩余边界
-
-本分支中的 memory enhancement 在后续 Phase 3 中已经把相邻的 prompt architecture 问题一并收口，当前已完成：
-
-1. `AGENTS.md` / `TOOLS.md` / `USER.md` / `MEMORY.md` 的职责去重、authority ordering 和模板占位过滤。
-2. system prompt workspace guidance 的总预算治理与跨 section 去重。
-3. 动态 `[Memory context]` 的优先级提醒、section budget 和跨来源去重。
-4. `USER.md` / `MEMORY.md` / fused recall / governed signals / session summaries 之间的显式冲突仲裁。
-
-当前仍然不在本分支内继续推进的，是更后续的 assistant memory autoconverge 问题：
-
-1. assistant 专属 `MEMORY.md` 的生成质量与维护策略。
-2. promotion candidate 如何更自动地收敛进 `MEMORY.md`。
-3. 更细粒度、任务自适应的 token allocator / prompt packer。
-
-也就是说：
-
-- 当前实现已经解决了 memory visibility、memory discovery、turn-level injection，以及 prompt attention governance 的第一轮收口。
-- 当前未做的是 assistant 级别的长期记忆自动收敛，而不是 prompt architecture 主链路缺失。
-
-## 16. 风险与后续迭代优先级
-
-下面的优先级不是“当前代码出错”，而是“当前设计下一步最应该补齐的缺口”。
-
-### P1：应优先补齐
-
-#### P1.1 Memory lifecycle / governance 缺失
-
-当前设计没有定义：
-
-- 什么内容允许 `memory_store`
-- 如何去重
-- 如何处理冲突写入
-- 如何淘汰过期 memory
-- 哪些信息应晋升到 `MEMORY.md`
-
-如果不补，长期会把共享 KV 池变成高噪声区，直接反噬 `memory_list` 与 recall 质量。
-
-#### P1.2 Retrieval quality 仍偏弱
-
-当前 `memory_list` 只是基于 key/prefix 的发现能力，不是 query-aware retrieval。
-
-这意味着：
-
-- key 命名不规范时，模型仍然可能列出很多结果却找不到真正相关项。
-- “很久以前但高度相关”的信息，仍可能因为不在 recent `session_*` 中而无法被自动带出。
-
-下一阶段应优先考虑 namespace、tag、schema，随后再看是否引入混合检索。
-
-#### P1.3 共享 memory 的隔离与权限边界
-
-当前 `memory_list` 暴露的是共享 memory agent 下的 KV 视图。后续如果系统继续扩张到多 workspace、多 agent、多用户场景，需要进一步定义 namespace 和访问边界，避免 memory discovery 过宽。
-
-#### P1.4 可观测性不足
-
-当前验证证明 wiring 生效，但没有形成完整质量指标，例如：
-
-- recall 命中率
-- `memory_list -> memory_recall` 转化率
-- prompt token 增量
-- 延迟影响
-- 用户纠错率
-- memory 污染率
-
-没有这些指标，后续很难区分“记忆真的有帮助”还是“只是多塞了一些上下文”。
-
-### P2：第二阶段优化
-
-#### P2.1 Assistant 专属 `MEMORY.md` 质量与收敛
-
-Phase 3 已经把 prompt 文档职责、authority ordering 和冲突优先级收口；下一步更值得投入的是 assistant 专属 `MEMORY.md` 的生成质量、维护节奏与晋升策略。
-
-#### P2.2 注意力预算的进一步细化
-
-当前已经具备：
-
+- `Prompt Priorities`
 - workspace guidance authority ordering
-- workspace guidance 跨 section 去重
-- 动态 memory context priority reminder
-- recall / governance / session summary 的分段预算
-- 显式冲突优先级
+- dynamic memory context section budget
+- cross-section deduplication
+- governance attention / maintenance signals
 
-后续若继续增强，重点不再是“有没有 attention governance”，而是：
+### 3.4 写回闭环
 
-- token-aware budget
-- 任务类型驱动的重排
-- 更细粒度的 prompt packing / truncation 策略
+`MEMORY.md` 现在不再只是人工维护的静态文件，而是新增了：
 
-#### P2.3 Assistant 专属 `MEMORY.md` 模板与维护策略
+- autoconverge audit plan
+- managed block render / replace
+- API review / apply
+- runtime tool `memory_autoconverge`
+- dashboard preview / apply
 
-当前实现解决了 `MEMORY.md` 能被消费，但没有完整解决 assistant 的 `MEMORY.md` 如何高质量生成、如何更新、如何收敛。
+### 3.5 可观测性与 inspection
 
-### P3：低优先级改进
+这套链路现在有完整 inspection 面：
 
-#### P3.1 占位文件识别的鲁棒性
+- `llm.log` 中的 `*** MEMORY TRACE`
+- structured telemetry
+- audit events
+- dashboard Logs / Memory Trace
+- standalone `Memory Debug` page
 
-当前 `MEMORY.md` 占位识别仍然是模板匹配型逻辑。它足以过滤默认 scaffold，但不是完整的结构化有效性判断。后续可考虑更显式的 schema 或元数据约束。
+## 4. 逻辑架构图
 
-## 17. 验证状态
+```mermaid
+flowchart LR
+    U["用户 / 外部调用方"] --> API["API / Dashboard / Tool 调用入口"]
+    A["Agent Loop"] --> PB["Prompt Builder"]
+    API --> GOV["Memory Governance"]
+    GOV --> SKV["Shared KV Memory"]
+    GOV --> CLEAN["Cleanup / Lifecycle / Promotion"]
+    CLEAN --> AC["Autoconverge Plan"]
+    SKV --> RET["Governed Retrieval"]
+    SEM["Semantic Memory / Embedding Recall"] --> RET
+    RET --> FUSE["Unified Recall Fusion"]
+    FUSE --> PB
+    CLEAN --> PB
+    AC --> PB
+    PB --> LLM["LLM Request"]
+    LLM --> A
+    AC --> MEM["Agent Workspace MEMORY.md"]
+    MEM --> PB
+    A --> TRACE["Memory Trace / Audit / Logs"]
+    TRACE --> DBG["Dashboard Memory Debug"]
+```
 
-本次实现已经完成以下验证：
+这张图表达的是逻辑职责关系：
 
-- `cargo build --workspace --lib`
-- `cargo test --workspace`
-- `cargo clippy --workspace --all-targets -- -D warnings`
+1. shared KV 先经过 governance，得到 lifecycle、cleanup、promotion 等治理语义。
+2. retrieval 同时消费 semantic memory 和 governed shared memory。
+3. prompt builder 汇总 unified recall、governance signals、`MEMORY.md` managed snapshot。
+4. autoconverge 把 durable long-term facts 写回 agent workspace 的 `MEMORY.md`。
+5. 整个运行链路会把 trace 暴露到日志、audit 和 dashboard inspection。
 
-并做了 live integration 验证：
+## 5. 物理架构图
 
-1. daemon 可启动
-2. `/api/health` 与 `/api/agents` 可返回
-3. `/api/agents/{id}/message` 可进入 runtime 执行链路
-4. 通过 `llm.log` 可确认 `MEMORY.md` 与 `memory_list` 已进入实际 prompt / tool 路径
-5. live 验证中发现并修复了 prepend memory context 被历史裁剪吞掉的问题
+```mermaid
+flowchart TB
+    subgraph Client["Client Surface"]
+        UI["Dashboard UI\nstatic/index_body.html\njs/pages/*.js"]
+        Curl["Scripts / curl / external callers"]
+        AgentTool["Runtime builtin tools\nmemory_list / memory_cleanup / memory_autoconverge"]
+    end
 
-验证时外部 provider completion 仍受地域或鉴权约束，未形成完整成功回答；但这不影响本次对 prompt wiring、tool exposure、消息拼装与裁剪保留逻辑的验证。
+    subgraph API["openfang-api"]
+        Routes["routes.rs\nmemory + autoconverge endpoints"]
+        Server["server.rs\nrouter registration"]
+        AuditAPI["logs / audit / debug surfaces"]
+    end
 
-## 18. 涉及文件
+    subgraph Kernel["openfang-kernel"]
+        KernelCore["kernel.rs\nPromptContext + identity files + capabilities"]
+        Wizard["wizard.rs\nmemory guidance"]
+    end
 
-本次 memory enhancement 及其直接接线涉及以下文件：
+    subgraph Runtime["openfang-runtime"]
+        AgentLoop["agent_loop.rs\nrecall orchestration + MEMORY_TRACE"]
+        PromptBuilder["prompt_builder.rs\nPrompt Priorities + memory context"]
+        ToolRunner["tool_runner.rs\nmemory tools"]
+        Audit["audit.rs"]
+    end
+
+    subgraph Types["openfang-types"]
+        MemoryTypes["memory.rs\ncleanup plan / lifecycle / retrieval helper / autoconverge plan"]
+        AgentTypes["agent.rs\ntool profiles"]
+    end
+
+    subgraph Memory["openfang-memory"]
+        Semantic["semantic.rs\nhybrid recall"]
+        Session["session.rs\nsessions / canonical summaries"]
+    end
+
+    subgraph Storage["Physical Storage"]
+        SQLite["SQLite\nkv_store / memories / sessions / audit"]
+        Workspace["Agent workspace files\nMEMORY.md / USER.md / TOOLS.md"]
+        Logs["Workspace logs\nllm.log"]
+    end
+
+    UI --> Routes
+    Curl --> Routes
+    AgentTool --> ToolRunner
+    Routes --> MemoryTypes
+    Routes --> KernelCore
+    ToolRunner --> MemoryTypes
+    ToolRunner --> KernelCore
+    KernelCore --> PromptBuilder
+    KernelCore --> Wizard
+    AgentLoop --> PromptBuilder
+    AgentLoop --> Semantic
+    AgentLoop --> MemoryTypes
+    AgentLoop --> Session
+    PromptBuilder --> Workspace
+    MemoryTypes --> SQLite
+    Semantic --> SQLite
+    Session --> SQLite
+    Audit --> SQLite
+    AgentLoop --> Logs
+    AuditAPI --> Audit
+```
+
+这张图表达的是代码和存储落点：
+
+1. 规则中心在 `openfang-types::memory`，这里沉淀治理、召回、autoconverge 的共享语义。
+2. 真正执行编排的是 `openfang-runtime`，包括 agent loop、prompt builder、tool runner。
+3. `openfang-kernel` 负责 identity files、capability 和 prompt context 装配。
+4. `openfang-api` 负责 HTTP 路由和 dashboard surface。
+5. 底层物理载体主要是 SQLite、agent workspace 文件和 `llm.log`。
+
+## 6. 总体架构分层
+
+整套实现可以概括成 6 层。
+
+### 6.1 Shared Memory Governance 层
+
+职责：
+
+- 规范 shared KV 的键空间
+- 给用户侧 memory 叠加治理元数据
+- 提供 lifecycle / promotion / cleanup 规则
+
+核心位置：
+
+- `crates/openfang-types/src/memory.rs`
+- `crates/openfang-api/src/routes.rs`
+- `crates/openfang-runtime/src/tool_runner.rs`
+
+这一层的关键原则是：
+
+1. 不重做底层 SQLite schema。
+2. 用 internal sidecar metadata 承载治理信息。
+3. 让 tool / API / prompt / dashboard 复用同一套 helper，而不是各写一份语义。
+
+### 6.2 Retrieval 层
+
+职责：
+
+- 从 semantic memory 和 governed shared memory 中挑出当前 turn 真正有价值的上下文
+
+核心位置：
+
+- `crates/openfang-memory/src/semantic.rs`
+- `crates/openfang-runtime/src/agent_loop.rs`
+- `crates/openfang-types/src/memory.rs`
+
+这一层的关键原则是：
+
+1. semantic recall 不只依赖 embedding，embedding 缺失时也不能丢失 text hit。
+2. shared governed memory 必须进入真实召回链路，而不是只停留在 API 可见。
+3. 最终进入 prompt 的 recall 结果应该是统一排序的，而不是多段互相竞争的上下文。
+
+### 6.3 Prompt Architecture 层
+
+职责：
+
+- 决定哪些记忆应该进入 prompt
+- 决定它们以什么优先级、什么预算、什么形式进入 prompt
+
+核心位置：
 
 - `crates/openfang-runtime/src/prompt_builder.rs`
 - `crates/openfang-runtime/src/agent_loop.rs`
-- `crates/openfang-runtime/src/tool_runner.rs`
-- `crates/openfang-runtime/src/kernel_handle.rs`
 - `crates/openfang-kernel/src/kernel.rs`
-- `crates/openfang-kernel/src/wizard.rs`
+
+这一层的关键原则是：
+
+1. 静态长期信息走 system prompt。
+2. 动态 turn-specific 记忆走独立 message。
+3. 通过 priorities、budget、dedup 控制 prompt 噪音。
+
+### 6.4 Workspace Identity / `MEMORY.md` 层
+
+职责：
+
+- 把 agent 长期约束和稳定上下文落在 workspace identity files 上
+- 让 `MEMORY.md` 成为长期记忆的稳定承载点
+
+核心位置：
+
+- `crates/openfang-kernel/src/kernel.rs`
+- `crates/openfang-runtime/src/prompt_builder.rs`
 - `crates/openfang-types/src/memory.rs`
-- `crates/openfang-types/src/agent.rs`
-- `crates/openfang-types/src/tool_compat.rs`
-- `crates/openfang-migrate/src/openclaw.rs`
-- `docs/agent_memory_enhancement_plan.md`
+- `crates/openfang-api/src/routes.rs`
 
-其中：
+这一层的关键原则是：
 
-- `prompt_builder.rs` 与 `agent_loop.rs` 构成记忆注入主链路。
-- `tool_runner.rs`、`kernel_handle.rs`、`kernel.rs` 构成 `memory_list` 的能力闭环。
-- `wizard.rs`、`agent.rs`、`tool_compat.rs`、`openclaw.rs` 负责暴露面和兼容性。
+1. `MEMORY.md` 是 agent workspace identity file，不是仓库里的任意 Markdown。
+2. managed block 只接管自动收敛区域，不覆盖人工区域。
+3. autoconverge 必须能 audit，不能只能盲写。
 
-## 19. 结论
+### 6.5 Tool / API / Dashboard 接线层
 
-当前分支已经把长期记忆从“存在一些零散能力”提升为“有稳定执行链路的系统能力”，核心落地点包括：
+职责：
 
-1. agent workspace 的 `MEMORY.md` 正式进入集中式 prompt builder。
-2. 占位的 agent workspace `MEMORY.md` 不再污染 prompt。
-3. dynamic memory context 在 agent loop 中以独立消息形式注入。
-4. `memory_list` 补齐了发现 key 的能力。
-5. `memory_search -> memory_list` 的兼容映射、tool profile 暴露和 wizard 提示已同步完成。
-6. 历史裁剪已修复对 prepended memory context 的破坏。
-7. prompt builder 已具备显式 `Prompt Priorities`、workspace guidance authority ordering、跨 section 去重与预算治理。
-8. 动态 memory context 已具备 priority reminder、section budget、跨来源去重与显式冲突仲裁。
+- 把治理、检索和写回能力暴露给 agent、自定义脚本和人工操作界面
 
-因此，当前实现已经完成“长期记忆可用性增强”的主体目标。
+核心位置：
 
-下一阶段不应继续把所有问题都堆进 memory 文档，而应沿两个相对解耦的方向推进：
+- `crates/openfang-runtime/src/tool_runner.rs`
+- `crates/openfang-api/src/routes.rs`
+- `crates/openfang-api/static/index_body.html`
+- `crates/openfang-api/static/js/pages/agents.js`
+- `crates/openfang-api/static/js/pages/sessions.js`
 
-1. memory governance / retrieval quality 的持续优化
-2. assistant memory autoconverge
+这一层提供的核心入口包括：
 
-两者相关，但不应在同一轮改造里混成一个高耦合大改。
+- `memory_list`
+- `memory_cleanup`
+- `memory_autoconverge`
+- `/api/memory/agents/{id}/kv`
+- `/api/memory/agents/{id}/kv/cleanup`
+- `/api/agents/{id}/memory/autoconverge`
+
+### 6.6 Observability 层
+
+职责：
+
+- 让“记忆为什么被召回、为什么没进 prompt、为什么工具不可见”这类问题能被排查
+
+核心位置：
+
+- `crates/openfang-runtime/src/agent_loop.rs`
+- `crates/openfang-runtime/src/audit.rs`
+- `crates/openfang-api/static/js/pages/logs.js`
+
+关键输出包括：
+
+- `*** MEMORY TRACE`
+- structured trace payload
+- dashboard compare / export / pin / share
+
+## 7. 关键技术点与方案
+
+### 5.1 Shared KV 治理为什么用 sidecar metadata
+
+方案：
+
+- 用户主记录保持原 value 格式
+- 治理信息写到 `__openfang_memory_meta.<canonical_key>`
+
+这样做的原因：
+
+1. 不破坏现有 `kv_store` 主数据格式。
+2. 可以逐步 rollout，而不用一次性迁移整库。
+3. API、tool、prompt 读取时再把 sidecar 折叠回主记录响应。
+
+结果：
+
+- 治理语义增强了，但底层存储改动可控。
+
+### 5.2 Lifecycle / Promotion 为什么按读取时动态计算
+
+方案：
+
+- 基于 `freshness` 和 `updated_at` 在读取时计算：
+  - `active`
+  - `stale`
+  - `expired`
+- durable 且特定 kind 的记录标记为 `promotion_candidate`
+
+这样做的原因：
+
+1. 避免再额外持久化一份随时间变化的状态。
+2. tool / API / prompt / dashboard 始终看到同一套即时结果。
+
+结果：
+
+- stale review、promotion 提示和 autoconverge 候选都能复用同一套规则。
+
+### 5.3 Cleanup 为什么要先 audit 再 apply
+
+方案：
+
+- `plan_memory_cleanup()` 先输出 findings
+- API 和 tool 都支持：
+  - `apply=false`
+  - `apply=true`
+
+这样做的原因：
+
+1. cleanup 会改 shared memory，风险比普通 recall 高。
+2. agent 需要先看到 legacy key、orphan sidecar、missing metadata 再决定是否执行。
+
+结果：
+
+- cleanup 从危险的“直接修复”变成可审查的治理动作。
+
+### 5.4 Hybrid Recall 为什么采用 RRF
+
+方案：
+
+- semantic recall 中并行得到 text rank 和 vector rank
+- 用 reciprocal rank fusion 做合并
+
+这样做的原因：
+
+1. embedding 缺失时仍可保留 text-only 命中。
+2. 不需要强依赖单一分数尺度。
+3. 在 vector 和 keyword 各有优点时，RRF 更稳妥。
+
+结果：
+
+- 记忆召回不再因为 `embedding = NULL` 或向量失败直接失明。
+
+### 5.5 Shared + Semantic 为什么在 prompt-time 融合
+
+方案：
+
+- semantic fragments 和 governed shared candidates 先各自排序
+- 再在 prompt-time 融成同一份 recall 列表
+
+这样做的原因：
+
+1. 模型最终需要的是“当前最相关的记忆”，不是“两个来源各一份名单”。
+2. 如果 shared 和 semantic 分开展示，模型需要自己再做一次仲裁，容易漂移。
+
+结果：
+
+- `Relevant recalled memories` 成为统一入口。
+
+### 5.6 Prompt 为什么要加 priorities / budget / dedup
+
+方案：
+
+- system prompt 增加 `Prompt Priorities`
+- workspace guidance 做 authority ordering
+- memory context 做 section budget 和跨段去重
+
+这样做的原因：
+
+1. 长期记忆、shared governed memory、session summaries 都可能同时存在。
+2. 不做仲裁时，很容易出现：
+  - 噪音堆积
+  - 重复表达
+  - 用户当前请求被长期上下文压住
+
+结果：
+
+- prompt 更稳定，也更可解释。
+
+### 5.7 `MEMORY.md` Autoconverge 为什么用 managed block
+
+方案：
+
+- 只维护：
+  - `<!-- OPENFANG_AUTOCONVERGE_BEGIN -->`
+  - `<!-- OPENFANG_AUTOCONVERGE_END -->`
+- 每次 apply 只替换这一段
+
+这样做的原因：
+
+1. `MEMORY.md` 仍然允许人工编辑。
+2. 自动收敛必须可重放，不应该每次都把人工区打乱。
+
+结果：
+
+- 自动写回和人工维护可以共存。
+
+### 5.8 为什么还要单独做 `memory_autoconverge` tool
+
+方案：
+
+- 在 runtime 提供 builtin tool `memory_autoconverge`
+- 支持 `apply` / `limit`
+
+这样做的原因：
+
+1. 只有 API 和 dashboard 还不够，agent 本身也要能维护长期记忆。
+2. stale review、cleanup blockers、promotion candidate 这些都已经在 prompt 里可见，agent 需要一个直接动作入口。
+
+结果：
+
+- assistant 现在能自助审阅和应用 managed snapshot。
+
+### 5.9 为什么要做 `MEMORY TRACE`
+
+方案：
+
+- 每次真正写入 `INPUT` 前，把 memory context trace 写进 `llm.log`
+
+trace 当前显式暴露：
+
+- semantic mode
+- semantic candidates
+- shared candidates
+- maintenance signals
+- attention signals
+- session summaries
+- fused recall rank / source / score
+
+这样做的原因：
+
+1. 只看最终 prompt 很难判断是 recall 没命中，还是排序被压下去。
+2. 真实问题经常出在 source fusion、tool exposure 或 budget 裁剪上。
+
+结果：
+
+- 记忆链路从“黑箱”变成可排查系统。
+
+### 5.10 Tool Exposure 为什么要额外修正 capability 过滤
+
+方案：
+
+- 修复 `available_tools()` 对 unrestricted / profile agent 的 builtin tool 过滤逻辑
+- 同时把 `memory_cleanup` / `memory_autoconverge` 纳入适合的 tool profile
+
+这样做的原因：
+
+1. prompt builder 里写了 tool hint，不代表 agent 真实拿到了 tool。
+2. live 验证中已经真实暴露过“工具提示存在，但工具不可见”的问题。
+
+结果：
+
+- memory maintenance tool 现在不只是“定义存在”，而是真能被 agent 调用。
+
+## 8. 端到端工作流
+
+系统里一次完整的记忆工作流大致如下：
+
+1. 用户或 agent 通过 `memory_store` / API 写入 shared memory。
+2. 治理层为记录建立 canonical key 和 sidecar metadata。
+3. 读取时动态计算 lifecycle / promotion candidate。
+4. recall 阶段从 semantic memory 和 governed shared memory 各自选候选。
+5. agent loop 用融合策略生成统一 recall。
+6. prompt builder 结合 priorities / budget / dedup，把静态与动态记忆分别编排进 prompt。
+7. 运行时把 memory trace 写进 `llm.log` / audit / dashboard。
+8. 对 durable promotion candidate，agent 或用户可通过 autoconverge audit 生成 `MEMORY.md` managed snapshot。
+9. apply 后，稳定长期事实落回 agent workspace 的 `MEMORY.md`。
+
+这条链路打通后，系统就具备了“shared memory -> retrieval -> prompt -> durable write-back”的闭环。
+
+## 9. 主要模块与职责
+
+### 9.1 `openfang-types`
+
+职责：
+
+- 共享记忆语义和纯逻辑 helper
+
+关键内容：
+
+- canonical key / tag filter
+- lifecycle / promotion
+- cleanup plan
+- governed candidate selection
+- prompt memory context contract
+- autoconverge plan
+
+### 9.2 `openfang-memory`
+
+职责：
+
+- semantic memory substrate 与 hybrid recall
+
+### 9.3 `openfang-runtime`
+
+职责：
+
+- agent loop 中的动态记忆编排
+- tool execution
+- prompt builder
+- memory trace 输出
+
+### 9.4 `openfang-kernel`
+
+职责：
+
+- identity files 生成
+- prompt context 装配
+- capability / tool exposure
+- wizard guidance
+
+### 9.5 `openfang-api`
+
+职责：
+
+- memory / autoconverge 的 HTTP 接口
+- dashboard 的 review / cleanup / debug surface
+
+## 10. 当前边界与设计取舍
+
+这套系统已经完成闭环，但仍有明确边界：
+
+1. `memory/*.md` 目录没有被自动纳入统一治理链路。
+2. autoconverge 只接管 `MEMORY.md` managed block，不自动改人工区。
+3. cleanup / autoconverge 默认仍然是显式动作，而不是后台自动执行。
+4. memory governance 和 prompt arbitration 已够用，但还不是更重型的策略引擎。
+
+这些边界是刻意保留的，目的是先把主链路做稳，而不是过早引入更重的自动化机制。
+
+## 11. 当前状态结论
+
+到当前分支为止，OpenFang 的记忆系统已经具备：
+
+1. 可治理的 shared memory。
+2. 可融合的 semantic + shared recall。
+3. 可仲裁的 prompt 记忆编排。
+4. 可观察的 memory trace 与 dashboard inspection。
+5. 可 audit / apply 的 `MEMORY.md` autoconverge 闭环。
+
+因此，这套实现已经不是“记忆增强尝试”，而是一套完整可运行的 agent 长期记忆系统。

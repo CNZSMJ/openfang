@@ -829,6 +829,14 @@
     - tool exposure bug 修复后回归验证
     - spend side effect
   - Phase 4 当前不再有阻塞收口的实现缺口；后续如需增强，只属于 Phase 4 之后的增量优化，而不影响本阶段完成判定。
+- 已完成记忆文档总览收口：
+  - `docs/memory/agent_memory_enhancement_plan.md` 已更新为整套记忆系统总览，覆盖：
+    - 功能介绍
+    - 逻辑架构图与物理架构图
+    - 总体技术架构分层
+    - 关键技术点与方案
+    - 主要代码入口与职责边界
+  - `docs/memory/README.md` 的文件职责已同步更新，明确总览文档与治理专门文档的分工
 
 ## 进行中
 
@@ -864,4 +872,4 @@
 
 ## 最后更新时间
 
-- 2026-03-17 Asia/Shanghai
+- 2026-03-18 Asia/Shanghai

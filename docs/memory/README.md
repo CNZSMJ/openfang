@@ -40,4 +40,5 @@
 ## 文件职责
 
 - `docs/memory/execution_state.md`：执行状态、分支和 worktree 连续性、下一步动作
-- `docs/memory/agent_memory_enhancement_plan.md`：方案设计与阶段性架构说明
+- `docs/memory/agent_memory_enhancement_plan.md`：整套记忆系统的总览文档，覆盖功能介绍、总体技术架构、关键技术方案与主要代码入口
+- `docs/memory/memory_governance_plan.md`：shared KV memory governance 的专门设计文档，补充治理规则、cleanup、lifecycle、promotion 与 orchestration 细节
