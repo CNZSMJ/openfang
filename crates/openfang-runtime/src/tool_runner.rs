@@ -1038,7 +1038,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         // --- Web tools ---
         tool_definition! {
             name: "web_fetch".to_string(),
-            description: "Fetch a URL with SSRF protection. Supports GET/POST/PUT/PATCH/DELETE. For GET, HTML is converted to Markdown. For other methods, returns raw response body.".to_string(),
+            description: "Fetch a specific URL with SSRF protection. Use this when retrieving that URL's contents is itself the task. Supports GET/POST/PUT/PATCH/DELETE. For GET, HTML is converted to Markdown. For other methods, returns raw response body.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1052,7 +1052,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         },
         tool_definition! {
             name: "web_search".to_string(),
-            description: "Search the web using multiple providers (Tavily, Brave, Perplexity, DuckDuckGo) with automatic fallback. Returns structured results with titles, URLs, and snippets.".to_string(),
+            description: "Search public web sources using multiple providers (Tavily, Brave, Perplexity, DuckDuckGo) with automatic fallback. Use this for current or external information that is not already available locally or through specialized tools. Returns structured results with titles, URLs, and snippets.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1346,7 +1346,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         },
         tool_definition! {
             name: "tool_search".to_string(),
-            description: "Search deferred tools available to this agent and expand the relevant ones for later turns. Returns tool-centric matches across the currently enabled deferred sources, including skills and MCP tools participating in the rollout.".to_string(),
+            description: "Discover deferred tools, skills, and manuals relevant to the current task, and expand matching tools so they can be called immediately in the current turn. Use this when a specialized capability may exist but is not currently visible.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {

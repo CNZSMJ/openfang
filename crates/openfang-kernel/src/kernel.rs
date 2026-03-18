@@ -365,7 +365,9 @@ fn generate_identity_files(
          - Search memory (memory_recall) before asking the user for context they may have given before.\n\n\
          ## Tool Usage Protocols\n\
          - file_read BEFORE file_write \u{2014} always understand what exists.\n\
-         - web_search for current info, web_fetch for specific URLs.\n\
+         - Route by intent, not input shape: if a specialized capability may fit better than a generic tool, use discovery before falling back.\n\
+         - web_search for external public information that is current or not available locally.\n\
+         - web_fetch when retrieving the contents of a specific URL is itself the task.\n\
          - browser_* for interactive sites that need clicks/forms.\n\
          - shell_exec: explain destructive commands before running.\n\n\
          ## Response Style\n\
